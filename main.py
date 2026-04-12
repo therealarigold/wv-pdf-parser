@@ -18,17 +18,25 @@ WV_COUNTIES = {
 # Wood County uses its own URL at inquiries.woodcountywv.com
 # PARID format: DD++MMMMPPPP0000000 (district 2dig, map 4dig, parcel 4dig, 7 zeros)
 
-def build_standard_parid(dist, map_num, parcel):
-    dist_str = str(int(dist)).zfill(2) if str(dist).isdigit() else "01"
+def build_parid_variants(dist, map_num, parcel):
+    """Return list of PARID variants to try - different counties use different formats."""
+    dist_int = int(dist) if str(dist).isdigit() else 1
+    dist2 = str(dist_int).zfill(2)
     map_str = str(map_num).zfill(4)
     parcel_str = str(parcel).zfill(4)
-    return f"{dist_str}++{map_str}{parcel_str}0000000"
+    zeros = "0000000"
+    return [
+        f"{dist2}++{map_str}{parcel_str}{zeros}",   # Format A: Wood, Marion, Kanawha
+        f"{dist2}+++{map_str}{parcel_str}{zeros}",  # Format B: Wyoming, Hampshire, Preston
+        f"{dist2}+{map_str}{parcel_str}{zeros}",    # Format C: single plus
+        f"{dist2}  {map_str}{parcel_str}{zeros}",   # Format D: spaces
+    ]
+
+def build_standard_parid(dist, map_num, parcel):
+    return build_parid_variants(dist, map_num, parcel)[0]
 
 def build_wood_parid(dist, map_num, parcel):
-    dist_str = str(int(dist)).zfill(2) if str(dist).isdigit() else "01"
-    map_str = str(map_num).zfill(4)
-    parcel_str = str(parcel).zfill(4)
-    return f"{dist_str}++{map_str}{parcel_str}0000000"
+    return build_parid_variants(dist, map_num, parcel)[0]
 
 # Standard counties — all use COUNTY.wvassessor.com
 STANDARD_CAMA_COUNTIES = [
@@ -241,10 +249,29 @@ def lookup_cama(county_name, dist, map_num, parcel):
     if not has_cama:
         return {"success": False, "error": f"No CAMA system for {county} County"}
     try:
-        parid = build_standard_parid(dist, map_num, parcel)
         cama_url_tmpl = get_cama_url(county)
-        url = cama_url_tmpl.format(parid=parid)
-        html = fetch_url(url)
+        # Try multiple PARID formats until we get real data
+        parids = build_parid_variants(dist, map_num, parcel)
+        html = None
+        parid = parids[0]
+        data = None
+        for p in parids:
+            try:
+                test_url = cama_url_tmpl.format(parid=p)
+                test_html = fetch_url(test_url, timeout=15)
+                # Check if we got real data (not just an empty/error page)
+                if 'CURRENT OWNER' in test_html.upper() or 'DEED BOOK' in test_html.upper() or 'OWNER NAME' in test_html.upper() or 'SALES HISTORY' in test_html.upper():
+                    html = test_html
+                    parid = p
+                    url = test_url
+                    break
+            except:
+                continue
+        if not html:
+            # Fall back to first format even if no data found
+            parid = parids[0]
+            url = cama_url_tmpl.format(parid=parid)
+            html = fetch_url(url, timeout=15)
         parser = CAMAParser()
         parser.feed(html)
         data = parser.extract()
@@ -336,6 +363,93 @@ def call_claude(prompt):
     except Exception as e:
         return {"success": False, "error": f"Claude API error: {str(e)}"}
 
+
+# ── MAPWV PARCEL LOOKUP ───────────────────────────────────────────────────────
+
+class MapWVParser(HTMLParser):
+    """Parse MapWV parcel viewer page to extract owner name and address."""
+    def __init__(self):
+        super().__init__()
+        self._text = []
+        self._in_script = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'script': self._in_script = True
+
+    def handle_endtag(self, tag):
+        if tag == 'script': self._in_script = False
+
+    def handle_data(self, data):
+        if not self._in_script:
+            d = data.strip()
+            if d: self._text.append(d)
+
+    def get_text(self):
+        return ' '.join(self._text)
+
+
+def fetch_mapwv_owner(mapwv_url, county_key, map_num, parcel_num):
+    """
+    Fetch owner info from MapWV using their IAS assessment API.
+    MapWV loads parcel data from: mapwv.gov/parcel/php/getparcelinfo.php
+    with the pid parameter.
+    """
+    try:
+        # Extract pid from URL if present
+        pid = None
+        if 'pid=' in mapwv_url:
+            pid = mapwv_url.split('pid=')[1].split('&')[0]
+
+        if pid:
+            # Use MapWV's internal parcel info API
+            api_url = f'https://mapwv.gov/parcel/php/getparcelinfo.php?pid={pid}'
+            try:
+                html = fetch_url(api_url, timeout=15)
+                # Try to parse JSON response
+                data = json.loads(html)
+                if data:
+                    # MapWV returns parcel attributes
+                    owner = data.get('OwnerName') or data.get('owner') or data.get('OWNERNAME', '')
+                    address = data.get('OwnerAddress') or data.get('address') or data.get('OWNERADDRESS', '')
+                    legal = data.get('LegalDescription') or data.get('legal') or data.get('LEGALDESCRIPTION', '')
+                    if owner:
+                        return {
+                            'success': True, 'owner': owner.strip(),
+                            'address': address.strip(), 'legal': legal.strip(),
+                            'pid': pid, 'source': 'mapwv_api'
+                        }
+            except json.JSONDecodeError:
+                pass  # Not JSON, try HTML parsing below
+            except Exception:
+                pass
+
+            # Try the IAS assessment detail page directly
+            # Format: county code from pid first 2 chars
+            county_code = pid.split('-')[0] if '-' in pid else ''
+            dist_code = pid.split('-')[1] if pid.count('-') >= 1 else ''
+
+        # Fall back: try WV Assessment IAS search by map/parcel
+        # mapwv.gov/assessment uses the IAS which has current data
+        county_name = county_key.replace(' COUNTY', '').strip().title()
+        ias_search = f'https://www.mapwv.gov/assessment/Assessment/Search?county={county_name}&map={map_num}&parcel={parcel_num}'
+        try:
+            html = fetch_url(ias_search, timeout=15)
+            # Look for owner name in the HTML
+            owner_m = re.search(r'(?:Owner|Grantee|Name)[:\s]+([A-Z][A-Z\s,&]+?)(?:<|\n|Deed|Address)', html, re.I)
+            if owner_m:
+                return {
+                    'success': True, 'owner': owner_m.group(1).strip(),
+                    'address': '', 'legal': '',
+                    'pid': pid or '', 'source': 'mapwv_ias'
+                }
+        except Exception:
+            pass
+
+        return {'success': False, 'error': 'Could not retrieve owner from MapWV', 'pid': pid or ''}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
 # ── HTTP HANDLER ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -376,6 +490,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/idx":
                 data = json.loads(body)
                 return self.respond(search_idx(data.get("county",""), data.get("name","")))
+
+            if path == "/mapwv":
+                data = json.loads(body)
+                return self.respond(fetch_mapwv_owner(
+                    data.get("url",""),
+                    data.get("countyKey",""),
+                    data.get("map",""),
+                    data.get("parcel","")
+                ))
 
             if path == "/analyze":
                 data = json.loads(body)
