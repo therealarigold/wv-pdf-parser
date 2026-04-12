@@ -640,54 +640,71 @@ def get_playwright_browser():
     print("[IDX] Browser launched OK", flush=True)
     return p, browser
 
-def idx_search_book_page(page, book, pg, from_date="01/01/1700"):
-    """
-    Search IDX by Book & Page.
-    Based on screenshots: dropdown -> Book & Page -> Book# field, Page# field -> Index Search
-    Returns list of records found.
-    """
-    # Select "Book & Page" from the search type dropdown
-    # The dropdown appears to be the first select element
+def idx_select_search_type(page, search_type):
+    """Select search type from the IDX custom JS dropdown."""
+    print(f"[IDX] Selecting search type: {search_type}", flush=True)
+    # The dropdown is a custom control showing "Individual" by default
+    # Click it to open, then click the option
     try:
-        page.select_option('select', 'Book & Page')
-        page.wait_for_timeout(1000)
-    except:
-        # Try clicking the dropdown text
-        try:
-            page.click('text=Individual')
-            page.wait_for_timeout(500)
-            page.click('text=Book & Page')
-            page.wait_for_timeout(1000)
-        except:
-            pass
+        # Click the dropdown to open it
+        page.click('text=Individual', timeout=5000)
+        page.wait_for_timeout(600)
+        # Now click the target option
+        page.click(f'text={search_type}', timeout=5000)
+        page.wait_for_timeout(800)
+        print(f"[IDX] Selected: {search_type}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[IDX] Dropdown selection failed: {e}", flush=True)
+        return False
 
-    # Fill Book number
+
+def idx_fill_and_search(page, fields):
+    """Fill form fields and click Index Search."""
+    for label, value in fields.items():
+        filled = False
+        for sel in [f'input[placeholder="{label}"]', f'input[placeholder*="{label}"]']:
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    el.triple_click()
+                    el.fill(str(value))
+                    filled = True
+                    print(f"[IDX] Filled {label}={value}", flush=True)
+                    break
+            except: continue
+        if not filled:
+            print(f"[IDX] Could not fill: {label}", flush=True)
     try:
-        book_input = page.query_selector('input[placeholder="Book #"]') or                      page.query_selector('input[placeholder*="Book"]') or                      page.query_selector('input[aria-label*="Book"]')
-        if book_input:
-            book_input.fill(str(book))
+        page.click('text=Index Search', timeout=5000)
+        page.wait_for_timeout(5000)
+        print("[IDX] Index Search clicked", flush=True)
+    except Exception as e:
+        print(f"[IDX] Index Search click failed: {e}", flush=True)
+
+
+def idx_search_book_page(page, book, pg):
+    """Search IDX by Book & Page number."""
+    print(f"[IDX] Searching Book={book} Page={pg}", flush=True)
+    try:
+        page.screenshot(path="/tmp/idx_before.png")
     except: pass
-
-    # Fill Page number  
+    idx_select_search_type(page, "Book & Page")
+    page.wait_for_timeout(800)
     try:
-        page_input = page.query_selector('input[placeholder="Page #"]') or                      page.query_selector('input[placeholder*="Page"]') or                      page.query_selector('input[aria-label*="Page"]')
-        if page_input:
-            page_input.fill(str(pg))
+        page.screenshot(path="/tmp/idx_after_dropdown.png")
     except: pass
-
-    # Set date range from 1700 to today
+    idx_fill_and_search(page, {"Book #": book, "Page #": pg})
     try:
-        page.fill('input[aria-label*="From"]', from_date)
-        page.fill('input[aria-label*="Thru"]', datetime.now().strftime('%m/%d/%Y'))
-    except: pass
+        page.screenshot(path="/tmp/idx_results.png")
+        text = page.inner_text('body')
+        print(f"[IDX] Page text preview: {text[:800]}", flush=True)
+    except Exception as e:
+        print(f"[IDX] Page content error: {e}", flush=True)
+    results = parse_idx_results(page)
+    print(f"[IDX] Results: {len(results)} records", flush=True)
+    return results
 
-    # Click Index Search button
-    try:
-        page.click('text=Index Search')
-        page.wait_for_timeout(4000)
-    except: pass
-
-    return parse_idx_results(page)
 
 def idx_search_name(page, last_name, first_name="", from_year=None):
     """
