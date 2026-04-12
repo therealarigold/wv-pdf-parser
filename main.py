@@ -642,119 +642,147 @@ def get_playwright_browser():
 
 def idx_select_search_type(page, search_type):
     """
-    Select Book & Page from the DevExpress ComboBox.
-    The combobox is invisible - we use JavaScript to set it directly
-    and trigger the ASP.NET postback that switches the form fields.
+    Select search type using cboKey input - the actual dropdown control.
+    Step 1: Click cboKey to open the dropdown list
+    Step 2: Wait for list to appear
+    Step 3: Click the option
+    Step 4: Confirm the form fields changed
     """
-    print(f"[IDX] Selecting: {search_type}", flush=True)
-
-    # Map search types to their index values (0=Individual, 1=Firm, 2=Book & Page, etc.)
-    type_map = {
-        "Individual": "0",
-        "Firm": "1",
-        "Book & Page": "2",
-        "Instrument": "3",
-        "Description": "4",
-        "Date Range": "5",
-        "Name": "6",
-    }
-    type_index = type_map.get(search_type, "2")
+    print(f"[IDX] Step: Select '{search_type}' from cboKey dropdown", flush=True)
 
     try:
-        # Step 1: Set the hidden value index input
-        result = page.evaluate(f"""() => {{
-            var vi = document.querySelector('input[name*="T3G0I0_CMB_VI"]');
-            if (vi) {{
-                vi.value = "{type_index}";
-                console.log("Set VI to {type_index}");
-            }}
-            // Also set the visible text input
-            var cmb = document.querySelector('input[name*="T3G0I0_CMB"]:not([name*="State"]):not([name*="DDD"]):not([name*="_VI"])');
-            if (cmb) {{
-                cmb.value = "{search_type}";
-            }}
-            return vi ? "VI found and set" : "VI not found";
-        }}""")
-        print(f"[IDX] JS Step 1: {result}", flush=True)
+        # Find cboKey - the actual dropdown input
+        cbo = page.query_selector('input[name*="cboKey"]')
+        if not cbo:
+            print("[IDX] cboKey not found!", flush=True)
+            return False
 
-        # Step 2: Trigger the ASP.NET postback that the combobox fires on change
-        # The combobox name is T3G0I0_CMB, postback target is the full panel path
-        page.evaluate("""() => {
-            // Trigger __doPostBack which is how ASP.NET WebForms handle events
-            if (typeof __doPostBack !== 'undefined') {
-                __doPostBack('CallFormPanel$contentSplitter$CallToolPanel$rc$T3G0I0_CMB', '');
-            }
-        }""")
-        print("[IDX] Postback triggered", flush=True)
-        page.wait_for_timeout(4000)  # Wait for page to update
+        print(f"[IDX] Found cboKey, current value: {cbo.input_value()}", flush=True)
 
-        # Step 3: Check what visible inputs exist now
+        # Click it to open the dropdown list
+        cbo.click()
+        page.wait_for_timeout(1500)
+        print("[IDX] Clicked cboKey", flush=True)
+
+        # Look for the dropdown list items that appeared
+        # DevExpress renders list items as table rows or divs
+        # Try multiple selectors
+        list_appeared = False
+        for sel in [
+            '.dxeListBoxItem',
+            '[class*="ListBox"] td',
+            '[class*="listItem"]',
+            'table[class*="dxe"] td',
+            '.dxeListBoxItemRow',
+        ]:
+            items = page.query_selector_all(sel)
+            if items:
+                print(f"[IDX] Found {len(items)} list items via {sel}", flush=True)
+                for item in items:
+                    txt = item.inner_text().strip()
+                    print(f"[IDX] List item: '{txt}'", flush=True)
+                    if txt == search_type:
+                        item.click()
+                        page.wait_for_timeout(2000)
+                        print(f"[IDX] Clicked '{search_type}'", flush=True)
+                        list_appeared = True
+                        break
+                if list_appeared:
+                    break
+
+        if not list_appeared:
+            # List didn't appear with those selectors - try clicking visible text
+            print("[IDX] List items not found, trying text click", flush=True)
+            try:
+                page.click(f'text="{search_type}"', timeout=3000)
+                page.wait_for_timeout(2000)
+                list_appeared = True
+            except:
+                pass
+
+        # Confirm: check cboKey value now
+        new_val = cbo.input_value()
+        print(f"[IDX] cboKey value after selection: '{new_val}'", flush=True)
+
+        # Check what fields are visible now
         inputs = page.query_selector_all('input[type="text"]')
-        visible = [(inp.get_attribute('name') or '', inp.is_visible()) for inp in inputs]
-        visible_names = [n for n, v in visible if v]
-        print(f"[IDX] Visible inputs after postback: {visible_names}", flush=True)
+        visible_names = []
+        for inp in inputs:
+            if inp.is_visible():
+                nm = inp.get_attribute('name') or ''
+                val = inp.input_value() or ''
+                visible_names.append(f"{nm}={val}")
+        print(f"[IDX] Visible inputs now: {visible_names}", flush=True)
 
         return True
 
     except Exception as e:
-        print(f"[IDX] Select failed: {e}", flush=True)
+        print(f"[IDX] idx_select_search_type error: {e}", flush=True)
         return False
 
 
 def idx_fill_and_search(page, fields):
     """
-    Fill Book # and Page # fields after dropdown has switched.
-    DevExpress inputs have no placeholders - they appear/disappear based on mode.
-    After switching to Book & Page, two visible text inputs appear for book and page.
+    Fill Book # and Page # after dropdown switched.
+    After selecting Book & Page, the inputs are named txtBook and txtPage.
     """
-    page.wait_for_timeout(2000)
-    print(f"[IDX] Filling fields: {list(fields.keys())}", flush=True)
+    page.wait_for_timeout(1000)
+    print(f"[IDX] Filling: {fields}", flush=True)
 
-    # Get all currently visible text inputs
-    try:
-        all_inputs = page.query_selector_all('input[type="text"]')
-        visible = [inp for inp in all_inputs if inp.is_visible()]
-        print(f"[IDX] Visible text inputs: {len(visible)}", flush=True)
-        for i, inp in enumerate(visible):
-            nm = inp.get_attribute('name') or ''
-            val = inp.input_value() or ''
-            print(f"[IDX] Visible input {i}: name={nm} value={val}", flush=True)
-    except Exception as e:
-        print(f"[IDX] Input scan failed: {e}", flush=True)
+    field_names = {
+        "Book #": ["txtBook", "txtbk", "Book"],
+        "Page #": ["txtPage", "txtpg", "Page"],
+    }
 
-    # After switching to Book & Page, the two new fields appear
-    # They have names containing T3G0I0 but different indices
-    # Try to find inputs that appeared after the dropdown switch
-    # Strategy: get visible inputs, skip date fields (FromDate/ThruDate) and CMB
-    # The book and page inputs should be the remaining visible ones
-    try:
-        all_inputs = page.query_selector_all('input[type="text"]')
-        visible_non_date = []
-        for inp in all_inputs:
-            if not inp.is_visible():
-                continue
-            nm = inp.get_attribute('name') or ''
-            # Skip date fields and the combobox itself
-            if any(skip in nm for skip in ['FromDate', 'ThruDate', 'T3G0I0_CMB']):
-                continue
-            visible_non_date.append(inp)
-        
-        print(f"[IDX] Non-date visible inputs: {len(visible_non_date)}", flush=True)
-        for i, inp in enumerate(visible_non_date):
-            nm = inp.get_attribute('name') or ''
-            print(f"[IDX] Non-date input {i}: name={nm}", flush=True)
+    for label, value in fields.items():
+        filled = False
+        # Try known field name patterns
+        for name_part in field_names.get(label, [label]):
+            for sel in [
+                f'input[name*="{name_part}"]',
+                f'input[id*="{name_part}"]',
+            ]:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.click()
+                        el.fill(str(value))
+                        page.wait_for_timeout(200)
+                        filled = True
+                        print(f"[IDX] Filled {label}={value} via {sel}", flush=True)
+                        break
+                except: continue
+            if filled: break
 
-        # Fill first with Book, second with Page
-        field_values = list(fields.values())
-        for i, inp in enumerate(visible_non_date[:2]):
-            val = field_values[i] if i < len(field_values) else ''
-            nm = inp.get_attribute('name') or ''
-            inp.triple_click()
-            inp.type(str(val), delay=80)
-            page.wait_for_timeout(300)
-            print(f"[IDX] Filled input {i} (name={nm}) with {val}", flush=True)
-    except Exception as e:
-        print(f"[IDX] Fill strategy failed: {e}", flush=True)
+        if not filled:
+            # Fall back: find visible non-date inputs in order
+            print(f"[IDX] Named fill failed for {label}, trying positional", flush=True)
+            try:
+                inputs = page.query_selector_all('input[type="text"]')
+                visible_book_page = []
+                for inp in inputs:
+                    if not inp.is_visible(): continue
+                    nm = inp.get_attribute('name') or ''
+                    if any(skip in nm for skip in ['FromDate', 'ThruDate', 'cboKey']):
+                        continue
+                    visible_book_page.append(inp)
+
+                print(f"[IDX] Positional candidates: {len(visible_book_page)}", flush=True)
+                for i, inp in enumerate(visible_book_page):
+                    nm = inp.get_attribute('name') or ''
+                    print(f"[IDX] Candidate {i}: name={nm}", flush=True)
+
+                # Fill first=Book, second=Page
+                field_list = list(fields.items())
+                for i, (lbl, val) in enumerate(field_list):
+                    if i < len(visible_book_page):
+                        visible_book_page[i].click()
+                        visible_book_page[i].fill(str(val))
+                        page.wait_for_timeout(200)
+                        print(f"[IDX] Positional fill {i}: {lbl}={val}", flush=True)
+                filled = True
+            except Exception as e:
+                print(f"[IDX] Positional fill error: {e}", flush=True)
 
     # Click Index Search
     try:
