@@ -468,11 +468,25 @@ def fetch_assessment_detail(map_pid):
         text = re.sub(r'<[^>]+>', ' ', clean_html)
         # Collapse whitespace
         text = re.sub(r'\s+', ' ', text).strip()
-        result['raw'] = text[:2000]  # Keep first 2000 chars for debugging
+        result['raw'] = text[:3000]  # Keep for debugging
 
         # Owner name
-        m = re.search(r'Owner\s*(?:Name)?[:\s]+([A-Z][A-Z\s,&.]+?)(?:Mailing|Address|Deed|Tax|Class)', text, re.I)
-        if m: result['owner'] = m.group(1).strip()
+        # Try multiple owner name patterns on cleaned text
+        owner_found = False
+        for pat in [
+            r'Owner\s*Name\s*[:\s]+([A-Z][A-Z ,&.\-]{4,}?)(?:\s{2,}|Mailing|Address|Deed)',
+            r'Owner[:\s]+([A-Z][A-Z ,&.\-]{4,}?)(?:\s{2,}|Mailing|Address|Deed|Tax)',
+            r'Grantee[:\s]+([A-Z][A-Z ,&.\-]{4,}?)(?:\s{2,}|Grantor|Deed|Date)',
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                candidate = m.group(1).strip().rstrip('.,- ')
+                skip_words = {'OWNER','NAME','ADDRESS','DEED','BOOK','PAGE','CLASS','VALUE','SALE','DATE','MAILING','PHYSICAL'}
+                words = [w.upper() for w in candidate.split()]
+                if len(candidate) >= 5 and not all(w in skip_words for w in words):
+                    result['owner'] = candidate
+                    owner_found = True
+                    break
 
         # Mailing address
         m = re.search(r'Mailing[^:]*:[^A-Z]*([A-Za-z0-9 ,.-]+)', text, re.I)
