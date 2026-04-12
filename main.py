@@ -610,6 +610,14 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 return self.respond(fetch_assessment_detail(data.get("pid","")))
 
+            if path == "/idx-search":
+                data = json.loads(body)
+                return self.respond(search_idx_playwright(
+                    data.get("county",""),
+                    data.get("name",""),
+                    int(data.get("years_back", 25))
+                ))
+
             if path == "/analyze":
                 data = json.loads(body)
                 return self.respond(call_claude(data.get("prompt","")))

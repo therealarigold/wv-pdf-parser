@@ -1,7 +1,9 @@
 services:
   - type: web
-    name: wv-tax-lien-pdf-parser
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    plan: free
+    name: wv-pdf-parser
+    runtime: python
+    buildCommand: "pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium"
+    startCommand: "python main.py"
+    envVars:
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright
