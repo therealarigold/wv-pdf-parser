@@ -419,6 +419,102 @@ def fetch_mapwv_owner(mapwv_url, county_key, map_num, parcel_num):
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
+
+# ── MAPWV ASSESSMENT DETAIL LOOKUP ───────────────────────────────────────────
+
+def fetch_assessment_detail(map_pid):
+    """
+    Fetch the MapWV Assessment Detail page.
+    map_pid is the pid from the MapWV URL e.g. "22-01-0011-0010-0005"
+    Assessment URL: https://mapwv.gov/Assessment/Detail/?PID=22010011001000050000
+    """
+    try:
+        # Convert pid to assessment PID: remove dashes, pad to 20 chars with zeros
+        clean = map_pid.replace('-', '')
+        assessment_pid = clean.ljust(20, '0')
+        url = f'https://mapwv.gov/Assessment/Detail/?PID={assessment_pid}'
+
+        html = fetch_url(url, timeout=20)
+        if not html:
+            return {'success': False, 'error': 'Empty response'}
+
+        result = {
+            'success': True,
+            'assessment_url': url,
+            'pid': map_pid,
+            'assessment_pid': assessment_pid,
+            'owner': '',
+            'mailing_address': '',
+            'deed_book': '',
+            'deed_page': '',
+            'last_sale_date': '',
+            'last_sale_price': '',
+            'tax_class': '',
+            'land_use': '',
+            'appraised_value': '',
+            'assessed_value': '',
+            'improvements': '',
+            'raw': ''
+        }
+
+        # Parse the HTML
+        # This is an ASP.NET page with labeled fields
+        # Look for patterns like: Owner Name: VALUE, Deed Book: VALUE etc.
+
+        # Strip scripts and styles for cleaner text
+        clean_html = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL|re.I)
+        clean_html = re.sub(r'<style[^>]*>.*?</style>', ' ', clean_html, flags=re.DOTALL|re.I)
+        # Remove HTML tags
+        text = re.sub(r'<[^>]+>', ' ', clean_html)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        result['raw'] = text[:2000]  # Keep first 2000 chars for debugging
+
+        # Owner name
+        m = re.search(r'Owner\s*(?:Name)?[:\s]+([A-Z][A-Z\s,&.]+?)(?:Mailing|Address|Deed|Tax|Class)', text, re.I)
+        if m: result['owner'] = m.group(1).strip()
+
+        # Mailing address
+        m = re.search(r'Mailing[^:]*:[^A-Z]*([A-Za-z0-9 ,.-]+)', text, re.I)
+        if m: result['mailing_address'] = m.group(1).strip()
+
+        # Deed book and page
+        m = re.search(r'Deed\s*Book[:\s/]+(\d+)\s*[/\s,]+\s*(?:Page[:\s]+)?(\d+)', text, re.I)
+        if m: result['deed_book'] = m.group(1); result['deed_page'] = m.group(2)
+
+        # Last sale date
+        m = re.search(r'(?:Last\s*Sale|Sale\s*Date|Date\s*of\s*Sale)[:\s]+(\d{1,2}/\d{1,2}/\d{4})', text, re.I)
+        if m: result['last_sale_date'] = m.group(1)
+
+        # Last sale price
+        m = re.search(r'(?:Last\s*Sale|Sale\s*Price|Amount)[:\s]+\$?([\d,]+)', text, re.I)
+        if m: result['last_sale_price'] = '$'+m.group(1)
+
+        # Tax class
+        m = re.search(r'(?:Tax\s*)?Class[:\s]+([12IViv]+)', text, re.I)
+        if m: result['tax_class'] = m.group(1).strip()
+
+        # Land use / property type
+        m = re.search(r'(?:Land\s*Use|Property\s*(?:Type|Class|Use))[:\s]+([A-Z][A-Za-z\s]+?)(?:\s{2,}|Tax|Class|$)', text, re.I)
+        if m: result['land_use'] = m.group(1).strip()
+
+        # Appraised value
+        m = re.search(r'(?:Total\s*)?Appraised[:\s]+\$?([\d,]+)', text, re.I)
+        if m: result['appraised_value'] = '$'+m.group(1)
+
+        # Assessed value
+        m = re.search(r'(?:Total\s*)?Assessed[:\s]+\$?([\d,]+)', text, re.I)
+        if m: result['assessed_value'] = '$'+m.group(1)
+
+        # Improvements (building type)
+        m = re.search(r'(?:Improvement|Building|Structure)[:\s]+([A-Za-z\s]+?)(?:\s{2,}|Year|Value|$)', text, re.I)
+        if m: result['improvements'] = m.group(1).strip()
+
+        return result
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
 # ── HTTP HANDLER ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -468,6 +564,10 @@ class Handler(BaseHTTPRequestHandler):
                     data.get("map",""),
                     data.get("parcel","")
                 ))
+
+            if path == "/assessment":
+                data = json.loads(body)
+                return self.respond(fetch_assessment_detail(data.get("pid","")))
 
             if path == "/analyze":
                 data = json.loads(body)
