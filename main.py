@@ -366,86 +366,55 @@ def call_claude(prompt):
 
 # ── MAPWV PARCEL LOOKUP ───────────────────────────────────────────────────────
 
-class MapWVParser(HTMLParser):
-    """Parse MapWV parcel viewer page to extract owner name and address."""
-    def __init__(self):
-        super().__init__()
-        self._text = []
-        self._in_script = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag == 'script': self._in_script = True
-
-    def handle_endtag(self, tag):
-        if tag == 'script': self._in_script = False
-
-    def handle_data(self, data):
-        if not self._in_script:
-            d = data.strip()
-            if d: self._text.append(d)
-
-    def get_text(self):
-        return ' '.join(self._text)
-
-
 def fetch_mapwv_owner(mapwv_url, county_key, map_num, parcel_num):
     """
-    Fetch owner info from MapWV using their IAS assessment API.
-    MapWV loads parcel data from: mapwv.gov/parcel/php/getparcelinfo.php
-    with the pid parameter.
+    Fetch the current owner from MapWV by hitting their parcel data API.
+    The pid is in the URL we already build correctly in the app.
+    MapWV loads data via: /parcel/php/getparceldata.php?pid=XX-XX-XXXX-XXXX-XXXX
     """
     try:
-        # Extract pid from URL if present
         pid = None
         if 'pid=' in mapwv_url:
             pid = mapwv_url.split('pid=')[1].split('&')[0]
 
-        if pid:
-            # Use MapWV's internal parcel info API
-            api_url = f'https://mapwv.gov/parcel/php/getparcelinfo.php?pid={pid}'
+        if not pid:
+            return {'success': False, 'error': 'No pid in URL'}
+
+        # Try MapWV internal data endpoints
+        endpoints = [
+            f'https://mapwv.gov/parcel/php/getparceldata.php?pid={pid}',
+            f'https://mapwv.gov/parcel/php/getparcelinfo.php?pid={pid}',
+            f'https://mapwv.gov/parcel/php/parcelinfo.php?pid={pid}',
+        ]
+
+        for endpoint in endpoints:
             try:
-                html = fetch_url(api_url, timeout=15)
-                # Try to parse JSON response
-                data = json.loads(html)
-                if data:
-                    # MapWV returns parcel attributes
-                    owner = data.get('OwnerName') or data.get('owner') or data.get('OWNERNAME', '')
-                    address = data.get('OwnerAddress') or data.get('address') or data.get('OWNERADDRESS', '')
-                    legal = data.get('LegalDescription') or data.get('legal') or data.get('LEGALDESCRIPTION', '')
-                    if owner:
-                        return {
-                            'success': True, 'owner': owner.strip(),
-                            'address': address.strip(), 'legal': legal.strip(),
-                            'pid': pid, 'source': 'mapwv_api'
-                        }
-            except json.JSONDecodeError:
-                pass  # Not JSON, try HTML parsing below
+                html = fetch_url(endpoint, timeout=12)
+                if not html or len(html) < 10:
+                    continue
+                # Try JSON first
+                try:
+                    data = json.loads(html)
+                    # Look for owner in various key names
+                    for key in ['OwnerName','owner','OWNERNAME','Owner','fullownername','FullOwnerName']:
+                        if key in data and data[key]:
+                            addr = data.get('OwnerAddress','') or data.get('address','') or data.get('OWNERADDRESS','')
+                            return {'success':True,'owner':str(data[key]).strip(),'address':str(addr).strip(),'pid':pid}
+                    # If it's a list
+                    if isinstance(data, list) and len(data) > 0:
+                        item = data[0]
+                        for key in ['OwnerName','owner','OWNERNAME','Owner']:
+                            if key in item and item[key]:
+                                return {'success':True,'owner':str(item[key]).strip(),'address':'','pid':pid}
+                except (json.JSONDecodeError, TypeError):
+                    # Try regex on raw HTML/text
+                    m = re.search(r'[Oo]wner[^:]*:[\s"]*([A-Z][A-Z ,&.]+)', html)
+                    if m:
+                        return {'success':True,'owner':m.group(1).strip(),'address':'','pid':pid}
             except Exception:
-                pass
+                continue
 
-            # Try the IAS assessment detail page directly
-            # Format: county code from pid first 2 chars
-            county_code = pid.split('-')[0] if '-' in pid else ''
-            dist_code = pid.split('-')[1] if pid.count('-') >= 1 else ''
-
-        # Fall back: try WV Assessment IAS search by map/parcel
-        # mapwv.gov/assessment uses the IAS which has current data
-        county_name = county_key.replace(' COUNTY', '').strip().title()
-        ias_search = f'https://www.mapwv.gov/assessment/Assessment/Search?county={county_name}&map={map_num}&parcel={parcel_num}'
-        try:
-            html = fetch_url(ias_search, timeout=15)
-            # Look for owner name in the HTML
-            owner_m = re.search(r'(?:Owner|Grantee|Name)[:\s]+([A-Z][A-Z\s,&]+?)(?:<|\n|Deed|Address)', html, re.I)
-            if owner_m:
-                return {
-                    'success': True, 'owner': owner_m.group(1).strip(),
-                    'address': '', 'legal': '',
-                    'pid': pid or '', 'source': 'mapwv_ias'
-                }
-        except Exception:
-            pass
-
-        return {'success': False, 'error': 'Could not retrieve owner from MapWV', 'pid': pid or ''}
+        return {'success': False, 'error': 'MapWV API did not return owner data', 'pid': pid}
 
     except Exception as e:
         return {'success': False, 'error': str(e)}
