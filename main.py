@@ -302,6 +302,40 @@ def search_idx(county_name, grantor_name):
                 "county_has_idx": True, "idx_url": idx_url}
 
 
+
+# ── CLAUDE AI PROXY ───────────────────────────────────────────────────────────
+
+def call_claude(prompt):
+    """Call Anthropic Claude API server-side and return the analysis text."""
+    if not prompt:
+        return {"success": False, "error": "No prompt provided"}
+    try:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return {"success": False, "error": "ANTHROPIC_API_KEY not set on server"}
+
+        payload = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1200,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode())
+            text = result.get("content", [{}])[0].get("text", "")
+            return {"success": True, "text": text}
+    except Exception as e:
+        return {"success": False, "error": f"Claude API error: {str(e)}"}
+
 # ── HTTP HANDLER ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -342,6 +376,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/idx":
                 data = json.loads(body)
                 return self.respond(search_idx(data.get("county",""), data.get("name","")))
+
+            if path == "/analyze":
+                data = json.loads(body)
+                return self.respond(call_claude(data.get("prompt","")))
 
             if 'multipart/form-data' not in ct:
                 return self.respond({'success':False,'error':'Expected multipart/form-data'})
