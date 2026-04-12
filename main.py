@@ -642,82 +642,116 @@ def get_playwright_browser():
 
 def idx_select_search_type(page, search_type):
     """
-    Select search type using cboKey input - the actual dropdown control.
-    Step 1: Click cboKey to open the dropdown list
-    Step 2: Wait for list to appear
-    Step 3: Click the option
-    Step 4: Confirm the form fields changed
+    Switch the IDX search type dropdown to Book & Page.
+    cboKey is invisible - use JS to set it and trigger the change event
+    which causes the ASP.NET UpdatePanel to re-render the form fields.
     """
-    print(f"[IDX] Step: Select '{search_type}' from cboKey dropdown", flush=True)
+    print(f"[IDX] Switching to: {search_type}", flush=True)
 
     try:
-        # Find cboKey - the actual dropdown input
-        cbo = page.query_selector('input[name*="cboKey"]')
-        if not cbo:
-            print("[IDX] cboKey not found!", flush=True)
-            return False
+        # Use JS to set the cboKey value and trigger the change event
+        # This mimics what happens when a user visually selects from the dropdown
+        result = page.evaluate(f"""() => {{
+            // Find cboKey input
+            var inputs = document.querySelectorAll('input');
+            var cbo = null;
+            for (var inp of inputs) {{
+                if (inp.name && inp.name.includes('cboKey')) {{
+                    cbo = inp;
+                    break;
+                }}
+            }}
+            if (!cbo) return 'cboKey not found';
 
-        print(f"[IDX] Found cboKey, current value: {cbo.input_value()}", flush=True)
+            // Set the value
+            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(cbo, '{search_type}');
 
-        # Click it to open the dropdown list
-        cbo.click()
-        page.wait_for_timeout(1500)
-        print("[IDX] Clicked cboKey", flush=True)
+            // Trigger events that ASP.NET/DevExpress listens to
+            cbo.dispatchEvent(new Event('change', {{bubbles: true}}));
+            cbo.dispatchEvent(new Event('input', {{bubbles: true}}));
+            cbo.dispatchEvent(new Event('blur', {{bubbles: true}}));
 
-        # Look for the dropdown list items that appeared
-        # DevExpress renders list items as table rows or divs
-        # Try multiple selectors
-        list_appeared = False
-        for sel in [
-            '.dxeListBoxItem',
-            '[class*="ListBox"] td',
-            '[class*="listItem"]',
-            'table[class*="dxe"] td',
-            '.dxeListBoxItemRow',
-        ]:
-            items = page.query_selector_all(sel)
-            if items:
-                print(f"[IDX] Found {len(items)} list items via {sel}", flush=True)
-                for item in items:
-                    txt = item.inner_text().strip()
-                    print(f"[IDX] List item: '{txt}'", flush=True)
-                    if txt == search_type:
-                        item.click()
-                        page.wait_for_timeout(2000)
-                        print(f"[IDX] Clicked '{search_type}'", flush=True)
-                        list_appeared = True
-                        break
-                if list_appeared:
-                    break
+            return 'cboKey set to: ' + cbo.value;
+        }}""")
+        print(f"[IDX] JS result: {result}", flush=True)
+        page.wait_for_timeout(2000)
 
-        if not list_appeared:
-            # List didn't appear with those selectors - try clicking visible text
-            print("[IDX] List items not found, trying text click", flush=True)
-            try:
-                page.click(f'text="{search_type}"', timeout=3000)
-                page.wait_for_timeout(2000)
-                list_appeared = True
-            except:
-                pass
-
-        # Confirm: check cboKey value now
-        new_val = cbo.input_value()
-        print(f"[IDX] cboKey value after selection: '{new_val}'", flush=True)
-
-        # Check what fields are visible now
+        # Check if the page updated - look for new fields
         inputs = page.query_selector_all('input[type="text"]')
-        visible_names = []
-        for inp in inputs:
-            if inp.is_visible():
-                nm = inp.get_attribute('name') or ''
-                val = inp.input_value() or ''
-                visible_names.append(f"{nm}={val}")
-        print(f"[IDX] Visible inputs now: {visible_names}", flush=True)
+        visible = [(inp.get_attribute('name') or '', inp.input_value()) for inp in inputs if inp.is_visible()]
+        print(f"[IDX] Visible inputs after JS: {visible}", flush=True)
 
+        # If still showing txtLname, try clicking the visible dropdown widget directly
+        names = [n for n, v in visible]
+        if any('txtLname' in n for n in names):
+            print("[IDX] Still on Individual mode, trying click on dropdown widget", flush=True)
+            # The visual dropdown is likely a div/span/table rendered by DevExpress
+            # Try clicking any element near the cboKey that IS visible
+            result2 = page.evaluate("""() => {
+                var inputs = document.querySelectorAll('input');
+                for (var inp of inputs) {
+                    if (inp.name && inp.name.includes('cboKey')) {
+                        // Walk up the DOM to find the clickable parent
+                        var el = inp.parentElement;
+                        for (var i = 0; i < 5; i++) {
+                            if (el) {
+                                var rect = el.getBoundingClientRect();
+                                if (rect.width > 0 && rect.height > 0) {
+                                    return JSON.stringify({
+                                        tag: el.tagName,
+                                        class: el.className,
+                                        id: el.id,
+                                        x: rect.x,
+                                        y: rect.y,
+                                        w: rect.width,
+                                        h: rect.height
+                                    });
+                                }
+                                el = el.parentElement;
+                            }
+                        }
+                    }
+                }
+                return 'not found';
+            }""")
+            print(f"[IDX] cboKey parent info: {result2}", flush=True)
+
+            # Try clicking at the coordinates of the dropdown
+            try:
+                import json
+                info = json.loads(result2)
+                x = info['x'] + info['w'] / 2
+                y = info['y'] + info['h'] / 2
+                print(f"[IDX] Clicking at coordinates ({x}, {y})", flush=True)
+                page.mouse.click(x, y)
+                page.wait_for_timeout(1500)
+
+                # Look for dropdown options that appeared
+                for sel in ['.dxeListBoxItem_Default', '[class*="ListBox"]', 'td[onclick]']:
+                    items = page.query_selector_all(sel)
+                    if items:
+                        print(f"[IDX] Found {len(items)} items via {sel}", flush=True)
+                        for item in items:
+                            txt = item.inner_text().strip()
+                            print(f"[IDX] Item: {txt}", flush=True)
+                            if search_type in txt:
+                                item.click()
+                                page.wait_for_timeout(2000)
+                                print(f"[IDX] Clicked {search_type}", flush=True)
+                                break
+            except Exception as e:
+                print(f"[IDX] Coordinate click failed: {e}", flush=True)
+
+        # Final check
+        inputs2 = page.query_selector_all('input[type="text"]')
+        visible2 = [(inp.get_attribute('name') or '', inp.input_value()) for inp in inputs2 if inp.is_visible()]
+        print(f"[IDX] Final visible inputs: {visible2}", flush=True)
         return True
 
     except Exception as e:
-        print(f"[IDX] idx_select_search_type error: {e}", flush=True)
+        print(f"[IDX] Error: {e}", flush=True)
         return False
 
 
