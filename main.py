@@ -948,57 +948,92 @@ def idx_post_search(url, viewstate_fields, search_type, search_params, from_date
         return None
 
 def idx_parse_results(html):
-    """Parse IDX search results from HTML into structured records."""
+    """Parse IDX search results from the results grid, skipping UI chrome."""
     if not html:
         return []
-    
-    records = []
+
     import re
+    records = []
+
+    # Save HTML for debugging
+    try:
+        with open('/tmp/idx_response.html', 'w') as f:
+            f.write(html)
+        print(f"[IDX] HTML saved to /tmp/idx_response.html ({len(html)} chars)", flush=True)
+    except: pass
+
+    # The IDX results grid has specific class names - find the right table
+    # Skip calendar tables (they contain Sun/Mon/Tue headers)
+    # Skip navigation tables
+    # The results table contains instrument/deed data
+
+    # First try to find a table that has deed-related content
+    # Look for the section after "Names" heading which contains the results
     
-    # IDX results are in a table - find rows with deed data
-    # Look for table rows containing dates, book/page info
+    # Split on common result markers
+    results_section = html
     
-    # Extract all table cells grouped by row
+    # Try to find the results grid specifically
+    # IDX uses a div/table structure for results
+    for marker in ['dxgvDataRow', 'GridView', 'gvResults', 'searchResults']:
+        if marker in html:
+            print(f"[IDX] Found results marker: {marker}", flush=True)
+            break
+
     rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
-    
+    print(f"[IDX] Total TR rows in HTML: {len(rows)}", flush=True)
+
     header_row = []
+    found_results = False
+
+    CALENDAR_DAYS = {'SUN','MON','TUE','WED','THU','FRI','SAT'}
+    SKIP_KEYWORDS = {'SEARCH','SELECTIONS','ADVANCED','VIEW','DATES','RESULTS',
+                     'TOOLS','ACCOUNT','LOGIN','HELP','ABOUT','EXPORT'}
+
     for row in rows:
         cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL | re.IGNORECASE)
         cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
         cells = [html_module.unescape(c) for c in cells]
-        cells = [' '.join(c.split()) for c in cells]  # normalize whitespace
-        
-        if not any(cells): continue
-        
-        # Detect header row
+        cells = [' '.join(c.split()) for c in cells]
+        cells = [c for c in cells if c]  # remove empty
+
+        if not cells: continue
+
+        # Skip calendar rows
+        if set(c.upper() for c in cells) & CALENDAR_DAYS: continue
+
+        # Skip pure number calendar rows (1-31)
+        if all(c.isdigit() and int(c) <= 31 for c in cells): continue
+
+        # Skip UI navigation rows
         row_text = ' '.join(cells).upper()
-        if any(h in row_text for h in ['INSTRUMENT','RECORDED','GRANTOR','GRANTEE','BOOK','TYPE']):
-            if len(cells) >= 3:
-                header_row = cells
-                continue
-        
-        # Skip rows that are too short or look like UI chrome
-        if len([c for c in cells if c]) < 3: continue
-        
+        if sum(1 for k in SKIP_KEYWORDS if k in row_text) >= 3: continue
+
+        # Detect header row - contains deed field names
+        if any(h in row_text for h in ['INSTRUMENT TYPE','RECORDED','GRANTOR','GRANTEE','BOOK NO','BOOK #']):
+            header_row = cells
+            found_results = True
+            print(f"[IDX] Found header row: {cells}", flush=True)
+            continue
+
+        # Only process rows after we found the header
+        if not found_results: continue
+
+        # Skip pagination and control rows
+        if len(cells) == 1 and not re.search(r'\d{1,2}/\d{1,2}/\d{4}', cells[0]): continue
+
         # Build record
         if header_row and len(header_row) == len(cells):
-            record = {header_row[i].lower().replace(' ','_'): cells[i] 
-                     for i in range(len(cells))}
+            record = {}
+            for i, h in enumerate(header_row):
+                record[h.lower().strip().replace(' ','_')] = cells[i]
         else:
             record = {'raw': cells}
-            # Try to identify fields
-            for c in cells:
-                if re.match(r'\d{1,2}/\d{1,2}/\d{4}', c):
-                    record['date'] = c
-                m = re.match(r'(\d+)\s*/\s*(\d+)', c)
-                if m:
-                    record['book'] = m.group(1)
-                    record['page'] = m.group(2)
-        
-        if record:
-            records.append(record)
-    
-    print(f"[IDX] Parsed {len(records)} records from HTML", flush=True)
+
+        records.append(record)
+        print(f"[IDX] Result row: {cells}", flush=True)
+
+    print(f"[IDX] Parsed {len(records)} deed records", flush=True)
     return records
 
 def do_title_search(county_name, deed_book, deed_page, current_owner_name, years_back=25):
