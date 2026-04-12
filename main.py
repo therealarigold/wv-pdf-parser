@@ -424,19 +424,19 @@ def fetch_mapwv_owner(mapwv_url, county_key, map_num, parcel_num):
 
 def fetch_assessment_detail(map_pid):
     """
-    Fetch the MapWV Assessment Detail page.
-    map_pid is the pid from the MapWV URL e.g. "22-01-0011-0010-0005"
+    Fetch MapWV Assessment Detail page and parse all fields.
+    map_pid example: "22-01-0011-0010-0005"
     Assessment URL: https://mapwv.gov/Assessment/Detail/?PID=22010011001000050000
     """
     try:
-        # Convert pid to assessment PID: remove dashes, pad to 20 chars with zeros
+        # Build assessment PID: remove dashes, pad to 20 chars with zeros
         clean = map_pid.replace('-', '')
         assessment_pid = clean.ljust(20, '0')
         url = f'https://mapwv.gov/Assessment/Detail/?PID={assessment_pid}'
 
-        html = fetch_url(url, timeout=20)
-        if not html:
-            return {'success': False, 'error': 'Empty response'}
+        html = fetch_url(url, timeout=25)
+        if not html or len(html) < 500:
+            return {'success': False, 'error': 'Empty or invalid response from assessment page', 'assessment_url': url}
 
         result = {
             'success': True,
@@ -445,91 +445,118 @@ def fetch_assessment_detail(map_pid):
             'assessment_pid': assessment_pid,
             'owner': '',
             'mailing_address': '',
+            'tax_class': '',
             'deed_book': '',
             'deed_page': '',
-            'last_sale_date': '',
-            'last_sale_price': '',
-            'tax_class': '',
+            'legal_description': '',
+            'property_class': '',
             'land_use': '',
-            'appraised_value': '',
-            'assessed_value': '',
-            'improvements': '',
-            'raw': ''
+            'total_appraisal': '',
+            'sales_history': [],
+            'parcel_history': [],
         }
 
-        # Parse the HTML
-        # This is an ASP.NET page with labeled fields
-        # Look for patterns like: Owner Name: VALUE, Deed Book: VALUE etc.
-
-        # Strip scripts and styles for cleaner text
+        # ── Strip scripts/styles, get clean text ──────────────────
         clean_html = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL|re.I)
         clean_html = re.sub(r'<style[^>]*>.*?</style>', ' ', clean_html, flags=re.DOTALL|re.I)
-        # Remove HTML tags
-        text = re.sub(r'<[^>]+>', ' ', clean_html)
-        # Collapse whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
-        result['raw'] = text[:3000]  # Keep for debugging
 
-        # Owner name
-        # Try multiple owner name patterns on cleaned text
-        owner_found = False
-        for pat in [
-            r'Owner\s*Name\s*[:\s]+([A-Z][A-Z ,&.\-]{4,}?)(?:\s{2,}|Mailing|Address|Deed)',
-            r'Owner[:\s]+([A-Z][A-Z ,&.\-]{4,}?)(?:\s{2,}|Mailing|Address|Deed|Tax)',
-            r'Grantee[:\s]+([A-Z][A-Z ,&.\-]{4,}?)(?:\s{2,}|Grantor|Deed|Date)',
-        ]:
-            m = re.search(pat, text, re.I)
-            if m:
-                candidate = m.group(1).strip().rstrip('.,- ')
-                skip_words = {'OWNER','NAME','ADDRESS','DEED','BOOK','PAGE','CLASS','VALUE','SALE','DATE','MAILING','PHYSICAL'}
-                words = [w.upper() for w in candidate.split()]
-                if len(candidate) >= 5 and not all(w in skip_words for w in words):
-                    result['owner'] = candidate
-                    owner_found = True
-                    break
+        # ── Owner name ─────────────────────────────────────────────
+        # The page has: <td>Owner(s)</td><td>KEENEY DON</td>
+        m = re.search(r'Owner[(]s[)]\s*</td>\s*<td[^>]*>\s*([^<]+)', clean_html, re.I)
+        if not m:
+            m = re.search(r'Owner[(]s[)][^<]*<[^>]+>\s*([A-Z][A-Z\s,&.\-]+)', clean_html, re.I)
+        if m:
+            result['owner'] = m.group(1).strip()
 
-        # Mailing address
-        m = re.search(r'Mailing[^:]*:[^A-Z]*([A-Za-z0-9 ,.-]+)', text, re.I)
-        if m: result['mailing_address'] = m.group(1).strip()
+        # ── Mailing address ────────────────────────────────────────
+        m = re.search(r'Mailing\s*Address\s*</td>\s*<td[^>]*>\s*([^<]+)', clean_html, re.I)
+        if not m:
+            m = re.search(r'Mailing\s*Address[^<]*<[^>]+>\s*([A-Z0-9][^<]{5,})', clean_html, re.I)
+        if m:
+            result['mailing_address'] = m.group(1).strip()
 
-        # Deed book and page
-        m = re.search(r'Deed\s*Book[:\s/]+(\d+)\s*[/\s,]+\s*(?:Page[:\s]+)?(\d+)', text, re.I)
-        if m: result['deed_book'] = m.group(1); result['deed_page'] = m.group(2)
+        # ── Tax class ──────────────────────────────────────────────
+        # "Tax Class" header then value in next cell
+        m = re.search(r'Tax\s*Class\s*</th>.*?<td[^>]*>\s*(\d+)', clean_html, re.I|re.DOTALL)
+        if not m:
+            m = re.search(r'Tax\s*Class[^<]*</td>\s*<td[^>]*>\s*(\d+)', clean_html, re.I)
+        if m:
+            result['tax_class'] = m.group(1).strip()
 
-        # Last sale date
-        m = re.search(r'(?:Last\s*Sale|Sale\s*Date|Date\s*of\s*Sale)[:\s]+(\d{1,2}/\d{1,2}/\d{4})', text, re.I)
-        if m: result['last_sale_date'] = m.group(1)
+        # ── Book / Page ────────────────────────────────────────────
+        m = re.search(r'Book\s*/\s*Page\s*</th>.*?<td[^>]*>\s*(\d+)\s*/\s*(\d+)', clean_html, re.I|re.DOTALL)
+        if not m:
+            m = re.search(r'>(\d{3,})\s*/\s*(\d{2,})<', clean_html)
+        if m:
+            result['deed_book'] = m.group(1).strip()
+            result['deed_page'] = m.group(2).strip()
 
-        # Last sale price
-        m = re.search(r'(?:Last\s*Sale|Sale\s*Price|Amount)[:\s]+\$?([\d,]+)', text, re.I)
-        if m: result['last_sale_price'] = '$'+m.group(1)
+        # ── Legal description ──────────────────────────────────────
+        m = re.search(r'Legal\s*Description\s*</th>.*?<td[^>]*>\s*([^<]{5,})', clean_html, re.I|re.DOTALL)
+        if not m:
+            m = re.search(r'Legal\s*Description[^<]*</td>\s*<td[^>]*>([^<]{5,})', clean_html, re.I)
+        if m:
+            result['legal_description'] = m.group(1).strip()
 
-        # Tax class
-        m = re.search(r'(?:Tax\s*)?Class[:\s]+([12IViv]+)', text, re.I)
-        if m: result['tax_class'] = m.group(1).strip()
+        # ── Property class ─────────────────────────────────────────
+        m = re.search(r'Property\s*Class\s*</td>\s*<td[^>]*>\s*([^<]+)', clean_html, re.I)
+        if m:
+            result['property_class'] = m.group(1).strip()
 
-        # Land use / property type
-        m = re.search(r'(?:Land\s*Use|Property\s*(?:Type|Class|Use))[:\s]+([A-Z][A-Za-z\s]+?)(?:\s{2,}|Tax|Class|$)', text, re.I)
-        if m: result['land_use'] = m.group(1).strip()
+        # ── Land use ───────────────────────────────────────────────
+        m = re.search(r'Land\s*Use\s*</td>\s*<td[^>]*>\s*([^<]+)', clean_html, re.I)
+        if m:
+            result['land_use'] = m.group(1).strip()
 
-        # Appraised value
-        m = re.search(r'(?:Total\s*)?Appraised[:\s]+\$?([\d,]+)', text, re.I)
-        if m: result['appraised_value'] = '$'+m.group(1)
+        # ── Total appraisal ────────────────────────────────────────
+        m = re.search(r'Total\s*Appraisal\s*</td>\s*<td[^>]*>\s*\$?([\d,]+)', clean_html, re.I)
+        if m:
+            result['total_appraisal'] = '$' + m.group(1).strip()
 
-        # Assessed value
-        m = re.search(r'(?:Total\s*)?Assessed[:\s]+\$?([\d,]+)', text, re.I)
-        if m: result['assessed_value'] = '$'+m.group(1)
+        # ── Sales history ──────────────────────────────────────────
+        # Find the Sales History section
+        sales_section = re.search(r'Sales\s*History(.*?)(?:Parcel\s*History|</table>.*?<table)', clean_html, re.I|re.DOTALL)
+        if sales_section:
+            section = sales_section.group(1)
+            # Each row: date, price, sale type, source code, validity code, book, page
+            rows = re.findall(r'(\d{1,2}/\d{1,2}/\d{4})\s*</td>.*?\$([\d,]+).*?</td>.*?([^<]{3,})</td>.*?(\d+)</td>.*?(\d+)</td>.*?(\d+)</td>.*?(\d+)</td>', section, re.DOTALL)
+            for r in rows[:5]:
+                result['sales_history'].append({
+                    'date': r[0],
+                    'price': '$'+r[1],
+                    'type': r[2].strip(),
+                    'book': r[5],
+                    'page': r[6],
+                })
+            # Simpler fallback if above doesn't work
+            if not result['sales_history']:
+                dates = re.findall(r'(\d{1,2}/\d{1,2}/\d{4})', section)
+                prices = re.findall(r'\$([\d,]+)', section)
+                books = re.findall(r'(\d{3,})</td>\s*<td[^>]*>(\d{2,})</td>', section)
+                for i in range(min(len(dates), len(prices), 5)):
+                    entry = {'date': dates[i], 'price': '$'+prices[i], 'type': '', 'book': '', 'page': ''}
+                    if i < len(books):
+                        entry['book'] = books[i][0]
+                        entry['page'] = books[i][1]
+                    result['sales_history'].append(entry)
 
-        # Improvements (building type)
-        m = re.search(r'(?:Improvement|Building|Structure)[:\s]+([A-Za-z\s]+?)(?:\s{2,}|Year|Value|$)', text, re.I)
-        if m: result['improvements'] = m.group(1).strip()
+        # ── Parcel history (owner per year) ────────────────────────
+        parcel_section = re.search(r'Parcel\s*History(.*?)$', clean_html, re.I|re.DOTALL)
+        if parcel_section:
+            section = parcel_section.group(1)
+            rows = re.findall(r'(20\d\d)\s*</td>.*?(\d+)\s*</td>.*?([A-Z][A-Z\s,&.]+)\s*</td>', section, re.DOTALL)
+            for r in rows[:6]:
+                result['parcel_history'].append({
+                    'year': r[0],
+                    'tax_class': r[1],
+                    'owner': r[2].strip(),
+                })
 
         return result
 
     except Exception as e:
-        return {'success': False, 'error': str(e)}
+        return {'success': False, 'error': str(e), 'assessment_url': url if 'url' in dir() else ''}
 
-# ── HTTP HANDLER ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
