@@ -612,20 +612,32 @@ DEED_TYPES = [
 ]
 
 def get_playwright_browser():
-    """Launch a headless Chromium browser."""
+    """Launch a headless Chromium browser with minimal memory footprint."""
     from playwright.sync_api import sync_playwright
+    print("[IDX] Launching Chromium browser...", flush=True)
     p = sync_playwright().start()
     browser = p.chromium.launch(
         headless=True,
         args=[
             "--no-sandbox",
-            "--disable-setuid-sandbox", 
+            "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--single-process",
             "--no-zygote",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=TranslateUI",
+            "--disable-ipc-flooding-protection",
+            "--memory-pressure-off",
+            "--max_old_space_size=512",
+            "--js-flags=--max-old-space-size=256",
         ]
     )
+    print("[IDX] Browser launched OK", flush=True)
     return p, browser
 
 def idx_search_book_page(page, book, pg, from_date="01/01/1700"):
@@ -818,13 +830,20 @@ def do_title_search(county_name, deed_book, deed_page, current_owner_name, years
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
         )
         page = context.new_page()
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(3000)
+        page.set_default_timeout(20000)
+        page.set_default_navigation_timeout(25000)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        except Exception as nav_err:
+            title_report["errors"].append(f"Navigation warning: {str(nav_err)}")
+        page.wait_for_timeout(4000)
 
         cutoff_year = datetime.now().year - years_back
 
         # ── Step 1: Search by Book/Page to get current deed ──────────
+        print(f"[IDX] Step 1: Searching Book {deed_book} / Page {deed_page}", flush=True)
         step1_records = idx_search_book_page(page, deed_book, deed_page)
+        print(f"[IDX] Step 1 complete: {len(step1_records)} records found", flush=True)
         
         current_deed = None
         grantors_to_search = []
@@ -860,6 +879,7 @@ def do_title_search(county_name, deed_book, deed_page, current_owner_name, years
         })
 
         # ── Step 2: Search current owner for liens/mortgages ─────────
+        print(f"[IDX] Step 2: Searching name {current_owner_name}", flush=True)
         owner_parts = current_owner_name.strip().split()
         if owner_parts:
             last = owner_parts[-1] if len(owner_parts) > 1 else owner_parts[0]
@@ -909,12 +929,17 @@ def do_title_search(county_name, deed_book, deed_page, current_owner_name, years
                         "details": lien
                     })
 
+        print("[IDX] Closing browser", flush=True)
         browser.close()
         p.stop()
+        print("[IDX] Browser closed OK", flush=True)
 
         return title_report
 
     except Exception as e:
+        print(f"[IDX] ERROR: {str(e)}", flush=True)
+        import traceback
+        traceback.print_exc()
         return {"success": False, "error": str(e), "county": county}
 
 
