@@ -663,14 +663,9 @@ def idx_select_search_type(page, search_type):
         print(f"[IDX] JS result: {result}", flush=True)
         page.wait_for_timeout(500)
 
-        # Trigger ASP.NET postback using the exact control name
-        page.evaluate("""() => {
-            if (typeof __doPostBack !== 'undefined') {
-                __doPostBack('CallFormPanel$contentSplitter$CallToolPanel$cboKey', '');
-            }
-        }""")
-        print("[IDX] Postback triggered", flush=True)
-        page.wait_for_timeout(4000)
+        # The change event already triggered the form switch - just wait
+        print("[IDX] Waiting for form to re-render...", flush=True)
+        page.wait_for_timeout(3000)
 
         # Check what fields are visible now
         inputs = page.query_selector_all('input[type="text"]')
@@ -798,6 +793,12 @@ def idx_search_name(page, last_name, first_name="", from_year=None):
     return parse_idx_results(page)
 
 def parse_idx_results(page):
+    """Parse results from IDX results grid."""
+    print("[IDX] Parsing results...", flush=True)
+    try:
+        text = page.inner_text('body')
+        print(f"[IDX] Page text (500 chars): {text[:500]}", flush=True)
+    except: pass
     """
     Parse results from the IDX results grid.
     The results appear in a table in the main area.
