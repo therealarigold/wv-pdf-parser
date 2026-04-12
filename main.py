@@ -642,77 +642,63 @@ def get_playwright_browser():
 
 def idx_select_search_type(page, search_type):
     """
-    Select search type from the DevExpress ComboBox.
-    Input name contains T3G0I0_CMB. Index 2 = Book & Page.
+    Select Book & Page from the DevExpress ComboBox.
+    The combobox is invisible - we use JavaScript to set it directly
+    and trigger the ASP.NET postback that switches the form fields.
     """
     print(f"[IDX] Selecting: {search_type}", flush=True)
 
-    # Strategy 1: Click CMB input to open dropdown, then click option
-    try:
-        cmb = page.query_selector('input[name*="T3G0I0_CMB"]:not([name*="State"]):not([name*="DDD"]):not([name*="_VI"])')
-        if cmb:
-            print("[IDX] Found CMB input, clicking", flush=True)
-            cmb.click()
-            page.wait_for_timeout(1000)
-            options = page.query_selector_all('.dxeListBoxItem, [class*="ListBoxItem"]')
-            print(f"[IDX] Found {len(options)} options", flush=True)
-            for opt in options:
-                txt = opt.inner_text().strip()
-                print(f"[IDX] Option: {txt}", flush=True)
-                if txt == search_type:
-                    opt.click()
-                    page.wait_for_timeout(1500)
-                    print(f"[IDX] Selected: {search_type}", flush=True)
-                    return True
-    except Exception as e:
-        print(f"[IDX] Strategy 1 failed: {e}", flush=True)
+    # Map search types to their index values (0=Individual, 1=Firm, 2=Book & Page, etc.)
+    type_map = {
+        "Individual": "0",
+        "Firm": "1",
+        "Book & Page": "2",
+        "Instrument": "3",
+        "Description": "4",
+        "Date Range": "5",
+        "Name": "6",
+    }
+    type_index = type_map.get(search_type, "2")
 
-    # Strategy 2: DevExpress dropdown button
     try:
-        btn = page.query_selector('[class*="DropDownButton"],[class*="dropDownButton"],[class*="dxeDropDown"]')
-        if btn:
-            btn.click()
-            page.wait_for_timeout(1000)
-            opts = page.query_selector_all('.dxeListBoxItem,[class*="ListBoxItem"]')
-            for opt in opts:
-                if opt.inner_text().strip() == search_type:
-                    opt.click()
-                    page.wait_for_timeout(1500)
-                    return True
-    except Exception as e:
-        print(f"[IDX] Strategy 2 failed: {e}", flush=True)
-
-    # Strategy 3: ASPx client-side API + postback
-    try:
-        page.evaluate("""(searchType) => {
+        # Step 1: Set the hidden value index input
+        result = page.evaluate(f"""() => {{
             var vi = document.querySelector('input[name*="T3G0I0_CMB_VI"]');
-            if (vi) { vi.value = "2"; }
+            if (vi) {{
+                vi.value = "{type_index}";
+                console.log("Set VI to {type_index}");
+            }}
+            // Also set the visible text input
             var cmb = document.querySelector('input[name*="T3G0I0_CMB"]:not([name*="State"]):not([name*="DDD"]):not([name*="_VI"])');
-            if (cmb) {
-                cmb.value = searchType;
-                cmb.dispatchEvent(new Event('change', {bubbles:true}));
-                cmb.dispatchEvent(new Event('input', {bubbles:true}));
-            }
-            if (typeof ASPxClientEdit !== 'undefined') {
-                var c = ASPxClientEdit.GetInputElement ? ASPxClientEdit : null;
-            }
-        }""", search_type)
-        page.wait_for_timeout(2000)
-        print("[IDX] JS set attempted", flush=True)
-    except Exception as e:
-        print(f"[IDX] Strategy 3 failed: {e}", flush=True)
+            if (cmb) {{
+                cmb.value = "{search_type}";
+            }}
+            return vi ? "VI found and set" : "VI not found";
+        }}""")
+        print(f"[IDX] JS Step 1: {result}", flush=True)
 
-    # Strategy 4: Trigger postback directly like the form does
-    try:
+        # Step 2: Trigger the ASP.NET postback that the combobox fires on change
+        # The combobox name is T3G0I0_CMB, postback target is the full panel path
         page.evaluate("""() => {
-            __doPostBack('CallFormPanel$contentSplitter$CallToolPanel$rc$T3G0I0_CMB', '');
+            // Trigger __doPostBack which is how ASP.NET WebForms handle events
+            if (typeof __doPostBack !== 'undefined') {
+                __doPostBack('CallFormPanel$contentSplitter$CallToolPanel$rc$T3G0I0_CMB', '');
+            }
         }""")
-        page.wait_for_timeout(3000)
         print("[IDX] Postback triggered", flush=True)
-    except Exception as e:
-        print(f"[IDX] Strategy 4 failed: {e}", flush=True)
+        page.wait_for_timeout(4000)  # Wait for page to update
 
-    return False
+        # Step 3: Check what visible inputs exist now
+        inputs = page.query_selector_all('input[type="text"]')
+        visible = [(inp.get_attribute('name') or '', inp.is_visible()) for inp in inputs]
+        visible_names = [n for n, v in visible if v]
+        print(f"[IDX] Visible inputs after postback: {visible_names}", flush=True)
+
+        return True
+
+    except Exception as e:
+        print(f"[IDX] Select failed: {e}", flush=True)
+        return False
 
 
 def idx_fill_and_search(page, fields):
