@@ -640,217 +640,8 @@ def get_playwright_browser():
     print("[IDX] Browser launched OK", flush=True)
     return p, browser
 
-def idx_select_search_type(page, search_type):
-    """Set cboKey and submit form via JS to switch search type."""
-    print(f"[IDX] Setting search type to: {search_type}", flush=True)
-    try:
-        result = page.evaluate(f"""() => {{
-            var inputs = document.querySelectorAll('input[type="text"]');
-            for (var inp of inputs) {{
-                if (inp.name && inp.name.endsWith('cboKey')) {{
-                    inp.value = '{search_type}';
-                    return 'found: ' + inp.name;
-                }}
-            }}
-            return 'not found';
-        }}""")
-        print(f"[IDX] cboKey set: {result}", flush=True)
-        page.wait_for_timeout(3000)
-        return True
-    except Exception as e:
-        print(f"[IDX] Error: {e}", flush=True)
-        return False
 
-def idx_fill_and_search(page, fields):
-    """Fill fields and submit via JS form manipulation."""
-    page.wait_for_timeout(1000)
-    print(f"[IDX] Filling: {fields}", flush=True)
-
-    inputs = page.query_selector_all('input[type="text"]')
-    candidates = []
-    for inp in inputs:
-        if not inp.is_visible(): continue
-        nm = inp.get_attribute('name') or ''
-        if any(skip in nm for skip in ['FromDate', 'ThruDate', 'cboKey']): continue
-        if nm == '': continue
-        candidates.append((nm, inp))
-        print(f"[IDX] Candidate: {nm}", flush=True)
-
-    field_values = list(fields.values())
-    for i, (nm, inp) in enumerate(candidates[:2]):
-        val = field_values[i] if i < len(field_values) else ''
-        try:
-            inp.click()
-            page.wait_for_timeout(100)
-            inp.fill('')
-            inp.type(str(val), delay=50)
-            print(f"[IDX] Filled {nm}={val}", flush=True)
-        except Exception as e:
-            print(f"[IDX] Fill error {nm}: {e}", flush=True)
-
-    # Submit via JavaScript - set hidden fields and submit form directly
-    # This bypasses the button click which might reset the form state
-    print("[IDX] Submitting form via JS", flush=True)
-    try:
-        page.evaluate("""() => {
-            var et = document.getElementById('__EVENTTARGET');
-            var ea = document.getElementById('__EVENTARGUMENT');
-            if (et) et.value = '';
-            if (ea) ea.value = '';
-            var form = document.getElementById('Search');
-            if (form) {
-                form.submit();
-            }
-        }""")
-        page.wait_for_timeout(6000)
-        print("[IDX] Form submitted", flush=True)
-    except Exception as e:
-        print(f"[IDX] JS submit failed: {e}, trying button click", flush=True)
-        try:
-            page.click('text=Index Search', timeout=5000)
-            page.wait_for_timeout(6000)
-        except Exception as e2:
-            print(f"[IDX] Button click also failed: {e2}", flush=True)
-
-def idx_search_book_page(page, book, pg):
-    """Search IDX by Book & Page number."""
-    print(f"[IDX] Searching Book={book} Page={pg}", flush=True)
-    # Extra wait to ensure JS is fully rendered
-    page.wait_for_timeout(3000)
-    try:
-        page.screenshot(path="/tmp/idx_before.png")
-    except: pass
-    idx_select_search_type(page, "Book & Page")
-    page.wait_for_timeout(800)
-    try:
-        page.screenshot(path="/tmp/idx_after_dropdown.png")
-    except: pass
-    idx_fill_and_search(page, {"Book #": book, "Page #": pg})
-    try:
-        page.screenshot(path="/tmp/idx_results.png")
-        text = page.inner_text('body')
-        print(f"[IDX] Page text preview: {text[:800]}", flush=True)
-    except Exception as e:
-        print(f"[IDX] Page content error: {e}", flush=True)
-    results = parse_idx_results(page)
-    print(f"[IDX] Results: {len(results)} records", flush=True)
-    return results
-
-
-def idx_search_name(page, last_name, first_name="", from_year=None):
-    """
-    Search IDX by Individual name.
-    Based on screenshots: dropdown -> Individual -> Last, First, Middle fields -> Index Search
-    """
-    from_date = f"01/01/{from_year}" if from_year else "01/01/1700"
-    
-    try:
-        page.select_option('select', 'Individual')
-        page.wait_for_timeout(1000)
-    except:
-        try:
-            page.click('text=Book & Page')
-            page.wait_for_timeout(300)
-            page.click('text=Individual')
-            page.wait_for_timeout(1000)
-        except: pass
-
-    try:
-        last_input = page.query_selector('input[placeholder="Last"]') or                      page.query_selector('input[aria-label*="Last"]')
-        if last_input:
-            last_input.fill(last_name)
-    except: pass
-
-    if first_name:
-        try:
-            first_input = page.query_selector('input[placeholder="First"]') or                           page.query_selector('input[aria-label*="First"]')
-            if first_input:
-                first_input.fill(first_name)
-        except: pass
-
-    try:
-        page.fill('input[aria-label*="From"]', from_date)
-        page.fill('input[aria-label*="Thru"]', datetime.now().strftime('%m/%d/%Y'))
-    except: pass
-
-    try:
-        page.click('text=Index Search')
-        page.wait_for_timeout(10000)  # Wait longer for JS to fully render
-    except: pass
-
-    return parse_idx_results(page)
-
-def parse_idx_results(page):
-    """Parse results from IDX results grid."""
-    print("[IDX] Parsing results...", flush=True)
-    try:
-        text = page.inner_text('body')
-        print(f"[IDX] Page text (500 chars): {text[:500]}", flush=True)
-    except: pass
-    """
-    Parse results from the IDX results grid.
-    The results appear in a table in the main area.
-    Bottom panels show Names, Description, Cross References.
-    """
-    records = []
-    try:
-        # Wait for results to load
-        page.wait_for_timeout(2000)
-        
-        # Get all rows from the results table
-        rows = page.query_selector_all('tr')
-        headers = []
-        
-        for row in rows:
-            cells = row.query_selector_all('td, th')
-            cell_texts = [c.inner_text().strip() for c in cells]
-            
-            if not any(cell_texts): continue
-            
-            # Detect header row
-            row_text = ' '.join(cell_texts).upper()
-            if any(h in row_text for h in ['INSTRUMENT', 'RECORDED', 'BOOK', 'GRANTOR', 'TYPE', 'DATE']):
-                headers = cell_texts
-                continue
-            
-            # Skip empty rows
-            if len([t for t in cell_texts if t]) < 2: continue
-            
-            # Build record
-            record = {}
-            if headers and len(headers) == len(cell_texts):
-                for i, h in enumerate(headers):
-                    record[h.lower().strip()] = cell_texts[i]
-            else:
-                # Try to identify fields by position/content
-                record['raw'] = cell_texts
-                # Try to extract date
-                for t in cell_texts:
-                    if re.match(r'\d{1,2}/\d{1,2}/\d{4}', t):
-                        record['date'] = t
-                        break
-                # Try to extract book/page (format like "434/138" or separate cells)
-                for t in cell_texts:
-                    m = re.match(r'(\d+)/(\d+)', t)
-                    if m:
-                        record['book'] = m.group(1)
-                        record['page'] = m.group(2)
-                        break
-            
-            if record:
-                records.append(record)
-                
-    except Exception as e:
-        records.append({"error": str(e)})
-    
-    return records
-
-
-# ── IDX TITLE SEARCH VIA HTTP POST ────────────────────────────────────────────
-import urllib.request
-import urllib.parse
-import urllib.error
-import html as html_module
+# ── IDX TITLE SEARCH VIA PLAYWRIGHT ───────────────────────────────────────────
 
 IDX_COUNTY_URLS = {
     "LINCOLN":    "http://129.71.206.62/Default.aspx",
@@ -873,322 +664,232 @@ IDX_COUNTY_URLS = {
 
 LIEN_TYPES = ["DEED OF TRUST","TRUST DEED","MORTGAGE","LIEN","JUDGMENT",
                "MECHANIC","UCC","TAX LIEN","FEDERAL","IRS","ATTACHMENT"]
-RELEASE_TYPES = ["RELEASE","SATISFACTION","DISCHARGE","RECONVEYANCE","PARTIAL RELEASE"]
+RELEASE_TYPES = ["RELEASE","SATISFACTION","DISCHARGE","RECONVEYANCE"]
 DEED_TYPES = ["DEED","WARRANTY","QUITCLAIM","EXECUTOR","ADMINISTRATOR","COMMISSIONER"]
 
-def idx_get_viewstate(url):
-    """Fetch the IDX page and extract ASP.NET hidden fields needed for POST."""
-    print(f"[IDX] Fetching initial page: {url}", flush=True)
-    try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        })
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode('utf-8', errors='replace')
-            
-        # Extract hidden fields
-        fields = {}
-        for field in ['__VIEWSTATE','__VIEWSTATEGENERATOR','__EVENTVALIDATION',
-                      '__EVENTTARGET','__EVENTARGUMENT','FirstLoad',
-                      'CallFormPanel$contentSplitter',
-                      'CallFormPanel$contentSplitter$CallToolPanel$rc',
-                      'CallFormPanel$contentSplitter$CallToolPanel$rc$TC']:
-            import re
-            m = re.search(r'name="'+re.escape(field)+r'"[^>]*value="([^"]*)"', html)
-            if m:
-                fields[field] = m.group(1)
-            else:
-                fields[field] = ''
-        
-        print(f"[IDX] Got viewstate: {len(fields['__VIEWSTATE'])} chars", flush=True)
-        return fields, html
-    except Exception as e:
-        print(f"[IDX] Initial fetch failed: {e}", flush=True)
-        return None, None
+def get_playwright_browser():
+    from playwright.sync_api import sync_playwright
+    print("[IDX] Launching browser...", flush=True)
+    p = sync_playwright().start()
+    browser = p.chromium.launch(headless=True, args=[
+        "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
+        "--disable-gpu","--single-process","--no-zygote",
+    ])
+    print("[IDX] Browser ready", flush=True)
+    return p, browser
 
-def idx_extract_viewstate(html):
-    """Extract all ASP.NET hidden fields from HTML."""
-    import re
-    fields = {}
-    # Extract all hidden inputs
-    for m in re.finditer(r'<input[^>]+type="hidden"[^>]*>', html, re.IGNORECASE):
-        tag = m.group(0)
-        name_m = re.search(r'name="([^"]+)"', tag)
-        val_m = re.search(r'value="([^"]*)"', tag)
-        if name_m:
-            fields[name_m.group(1)] = val_m.group(1) if val_m else ''
-    return fields
+def idx_search(page, search_type, fields, from_date="01/01/1700"):
+    """
+    Search IDX using Playwright.
+    Key insight: set cboKey via JS, fill fields, then submit via JS
+    without triggering a full postback that resets cboKey.
+    """
+    today = datetime.now().strftime("%m/%d/%Y")
+    print(f"[IDX] Searching {search_type}: {fields}", flush=True)
 
-def idx_do_post(url, data, session_headers=None):
-    """Make a POST request to IDX."""
-    encoded = urllib.parse.urlencode(data).encode('utf-8')
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': url,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    # Step 1: Set cboKey via JS
+    page.evaluate(f"""() => {{
+        var inputs = document.querySelectorAll('input[type="text"]');
+        for (var inp of inputs) {{
+            if (inp.name && inp.name.endsWith('cboKey')) {{
+                inp.value = '{search_type}';
+                inp.dispatchEvent(new Event('change', {{bubbles:true}}));
+            }}
+        }}
+    }}""")
+    page.wait_for_timeout(3000)
+
+    # Step 2: Verify fields appeared and fill them
+    inputs = page.query_selector_all('input[type="text"]')
+    visible = [(inp.get_attribute('name') or '', inp) for inp in inputs if inp.is_visible()]
+    skip = ['FromDate','ThruDate','cboKey']
+    fillable = [(nm, el) for nm, el in visible if not any(s in nm for s in skip) and nm]
+    print(f"[IDX] Fillable fields: {[nm for nm,_ in fillable]}", flush=True)
+
+    # Fill fields by matching name endings
+    field_map = {
+        # Book & Page
+        'txtBook': fields.get('book',''),
+        'txtPage': fields.get('page',''),
+        # Individual
+        'txtLname': fields.get('last',''),
+        'txtFname': fields.get('first',''),
+        'txtMname': '',
+        # Instrument
+        'txtInstrument': fields.get('instrument',''),
     }
-    if session_headers:
-        headers.update(session_headers)
+
+    for nm, el in fillable:
+        for key, val in field_map.items():
+            if nm.endswith(key) and val:
+                try:
+                    el.click()
+                    el.fill('')
+                    el.type(str(val), delay=50)
+                    print(f"[IDX] Filled {key}={val}", flush=True)
+                except Exception as e:
+                    print(f"[IDX] Fill error {key}: {e}", flush=True)
+
+    # Set date range
     try:
-        req = urllib.request.Request(url, data=encoded, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return resp.read().decode('utf-8', errors='replace')
-    except Exception as e:
-        print(f"[IDX] POST failed: {e}", flush=True)
-        return None
-
-def idx_post_search(url, viewstate_fields, search_type, search_params, from_date="01/01/1700"):
-    """
-    Submit IDX search via two-step POST:
-    Step 1: POST to switch search type (get new ViewState with correct mode)
-    Step 2: POST the actual search with new ViewState
-    """
-    today = datetime.now().strftime('%m/%d/%Y')
-
-    # Step 1: Switch search type by POSTing cboKey change
-    # This triggers the UpdatePanel to re-render with the right fields
-    print(f"[IDX] Step 1: Switching to {search_type}", flush=True)
-    step1_data = {}
-    step1_data.update(viewstate_fields)
-    step1_data.update({
-        '__EVENTTARGET': 'CallFormPanel$contentSplitter$CallToolPanel$cboKey',
-        '__EVENTARGUMENT': '',
-        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$FromDate': from_date,
-        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$ThruDate': today,
-        'CallFormPanel$contentSplitter$CallToolPanel$cboKey': search_type,
-    })
-
-    step1_html = idx_do_post(url, step1_data)
-    if not step1_html:
-        print("[IDX] Step 1 failed", flush=True)
-        return None
-    print(f"[IDX] Step 1 response: {len(step1_html)} chars", flush=True)
-
-    # Extract new ViewState from step 1 response
-    new_viewstate = idx_extract_viewstate(step1_html)
-    print(f"[IDX] New viewstate: {len(new_viewstate.get('__VIEWSTATE',''))} chars", flush=True)
-
-    # Use new viewstate if we got one, otherwise fall back
-    vs = new_viewstate if new_viewstate.get('__VIEWSTATE') else viewstate_fields
-
-    # Step 2: Submit actual search with correct ViewState
-    print(f"[IDX] Step 2: Submitting search", flush=True)
-    step2_data = {}
-    step2_data.update(vs)
-    step2_data.update({
-        '__EVENTTARGET': '',
-        '__EVENTARGUMENT': '',
-        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$FromDate': from_date,
-        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$ThruDate': today,
-        'CallFormPanel$contentSplitter$CallToolPanel$cboKey': search_type,
-        'CallFormPanel$contentSplitter$CallToolPanel$btnIndex.x': '10',
-        'CallFormPanel$contentSplitter$CallToolPanel$btnIndex.y': '10',
-    })
-    step2_data.update(search_params)
-
-    step2_html = idx_do_post(url, step2_data)
-    print(f"[IDX] Step 2 response: {len(step2_html) if step2_html else 0} chars", flush=True)
-    return step2_html
-
-def idx_parse_results(html):
-    """Parse IDX search results from the results grid, skipping UI chrome."""
-    if not html:
-        return []
-
-    import re
-    records = []
-
-    # Save HTML for debugging
-    try:
-        with open('/tmp/idx_response.html', 'w') as f:
-            f.write(html)
-        print(f"[IDX] HTML saved to /tmp/idx_response.html ({len(html)} chars)", flush=True)
+        for nm, el in visible:
+            if 'FromDate' in nm:
+                el.fill(from_date)
+            elif 'ThruDate' in nm:
+                el.fill(today)
     except: pass
 
-    # The IDX results grid has specific class names - find the right table
-    # Skip calendar tables (they contain Sun/Mon/Tue headers)
-    # Skip navigation tables
-    # The results table contains instrument/deed data
+    # Step 3: Submit via JS - set hidden fields then submit form
+    # This keeps our cboKey value intact
+    print("[IDX] Submitting form via JS...", flush=True)
+    page.evaluate(f"""() => {{
+        // Make sure cboKey is still set
+        var inputs = document.querySelectorAll('input[type="text"]');
+        for (var inp of inputs) {{
+            if (inp.name && inp.name.endsWith('cboKey')) {{
+                inp.value = '{search_type}';
+            }}
+        }}
+        // Set event target to empty so it's a normal submit
+        var et = document.getElementById('__EVENTTARGET');
+        if (et) et.value = '';
+        var ea = document.getElementById('__EVENTARGUMENT');
+        if (ea) ea.value = '';
+        // Submit the form
+        document.getElementById('Search').submit();
+    }}""")
 
-    # First try to find a table that has deed-related content
-    # Look for the section after "Names" heading which contains the results
-    
-    # Split on common result markers
-    results_section = html
-    
-    # Try to find the results grid specifically
-    # IDX uses a div/table structure for results
-    for marker in ['dxgvDataRow', 'GridView', 'gvResults', 'searchResults']:
-        if marker in html:
-            print(f"[IDX] Found results marker: {marker}", flush=True)
-            break
+    # Wait for results to load
+    page.wait_for_load_state('domcontentloaded', timeout=15000)
+    page.wait_for_timeout(3000)
 
-    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
-    print(f"[IDX] Total TR rows in HTML: {len(rows)}", flush=True)
+    # Get results
+    text = page.inner_text('body')
+    print(f"[IDX] Page after submit (500 chars): {text[:500]}", flush=True)
 
-    header_row = []
-    found_results = False
+    return parse_idx_results(page.content())
 
-    CALENDAR_DAYS = {'SUN','MON','TUE','WED','THU','FRI','SAT'}
-    SKIP_KEYWORDS = {'SEARCH','SELECTIONS','ADVANCED','VIEW','DATES','RESULTS',
-                     'TOOLS','ACCOUNT','LOGIN','HELP','ABOUT','EXPORT'}
+def parse_idx_results(html):
+    """Parse IDX results grid."""
+    import re, html as html_mod
+    records = []
+
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL|re.IGNORECASE)
+    SKIP = {'SUN','MON','TUE','WED','THU','FRI','SAT'}
+    UICHROME = {'SEARCH','SELECTIONS','ADVANCED','VIEW','RESULTS','TOOLS','ACCOUNT'}
+    header = []
+    found = False
 
     for row in rows:
-        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL | re.IGNORECASE)
-        cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
-        cells = [html_module.unescape(c) for c in cells]
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL|re.IGNORECASE)
+        cells = [re.sub(r'<[^>]+>','',c).strip() for c in cells]
+        cells = [html_mod.unescape(c) for c in cells]
         cells = [' '.join(c.split()) for c in cells]
-        cells = [c for c in cells if c]  # remove empty
-
+        cells = [c for c in cells if c]
         if not cells: continue
 
-        # Skip calendar rows
-        if set(c.upper() for c in cells) & CALENDAR_DAYS: continue
+        # Skip calendar
+        if set(c.upper() for c in cells) & SKIP: continue
+        if all(c.isdigit() and int(c)<=31 for c in cells): continue
 
-        # Skip pure number calendar rows (1-31)
-        if all(c.isdigit() and int(c) <= 31 for c in cells): continue
+        row_up = ' '.join(cells).upper()
 
-        # Skip UI navigation rows
-        row_text = ' '.join(cells).upper()
-        if sum(1 for k in SKIP_KEYWORDS if k in row_text) >= 3: continue
-
-        # Detect header row - contains deed field names
-        if any(h in row_text for h in ['INSTRUMENT TYPE','RECORDED','GRANTOR','GRANTEE','BOOK NO','BOOK #']):
-            header_row = cells
-            found_results = True
-            print(f"[IDX] Found header row: {cells}", flush=True)
+        # Find header
+        if any(h in row_up for h in ['INSTRUMENT TYPE','RECORDED DATE','GRANTOR NAME','BOOK NO','PAGE NO','GRANTEE NAME']):
+            header = cells
+            found = True
+            print(f"[IDX] Header: {cells}", flush=True)
             continue
 
-        # Only process rows after we found the header
-        if not found_results: continue
+        if not found: continue
+        if len(cells) < 2: continue
 
-        # Skip pagination and control rows
-        if len(cells) == 1 and not re.search(r'\d{1,2}/\d{1,2}/\d{4}', cells[0]): continue
-
-        # Build record
-        if header_row and len(header_row) == len(cells):
-            record = {}
-            for i, h in enumerate(header_row):
-                record[h.lower().strip().replace(' ','_')] = cells[i]
+        if header and len(header) == len(cells):
+            rec = {header[i].lower().replace(' ','_'): cells[i] for i in range(len(cells))}
         else:
-            record = {'raw': cells}
+            rec = {'raw': cells}
+        records.append(rec)
+        print(f"[IDX] Row: {cells}", flush=True)
 
-        records.append(record)
-        print(f"[IDX] Result row: {cells}", flush=True)
-
-    print(f"[IDX] Parsed {len(records)} deed records", flush=True)
     return records
 
 def do_title_search(county_name, deed_book, deed_page, current_owner_name, years_back=25):
-    """
-    Full title search via HTTP POST to IDX system.
-    Fast, lightweight, no browser needed.
-    """
+    """Full title search using Playwright."""
     county = county_name.upper().replace(" COUNTY","").strip()
     url = IDX_COUNTY_URLS.get(county)
     if not url:
-        return {"success": False, "error": f"No IDX configured for {county} County"}
-
+        return {"success": False, "error": f"No IDX configured for {county}"}
     if not deed_book or not deed_page:
-        return {"success": False, "error": "Deed book and page required for title search"}
+        return {"success": False, "error": "Deed book and page required"}
 
-    print(f"[IDX] Starting title search: {county} Book {deed_book} / Page {deed_page}", flush=True)
+    print(f"[IDX] Title search: {county} Book {deed_book} Page {deed_page}", flush=True)
     cutoff_year = datetime.now().year - years_back
 
-    title_report = {
-        "success": True,
-        "county": county,
-        "starting_book": deed_book,
-        "starting_page": deed_page,
+    report = {
+        "success": True, "county": county,
+        "starting_book": deed_book, "starting_page": deed_page,
         "current_owner": current_owner_name,
-        "chain_of_title": [],
-        "open_liens": [],
-        "released_liens": [],
-        "all_instruments": [],
-        "errors": []
+        "chain_of_title": [], "open_liens": [],
+        "released_liens": [], "all_instruments": [], "errors": []
     }
 
     try:
-        # Step 1: Get ViewState from initial page load
-        viewstate, initial_html = idx_get_viewstate(url)
-        if not viewstate:
-            return {"success": False, "error": "Could not load IDX page"}
+        p, browser = get_playwright_browser()
+        ctx = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        page = ctx.new_page()
+        page.set_default_timeout(20000)
 
-        # Step 2: Search by Book & Page
-        print(f"[IDX] Searching Book {deed_book} / Page {deed_page}", flush=True)
-        results_html = idx_post_search(url, viewstate, "Book & Page", {
-            'CallFormPanel$contentSplitter$CallToolPanel$txtBook': str(deed_book),
-            'CallFormPanel$contentSplitter$CallToolPanel$txtPage': str(deed_page),
+        # Load page
+        print(f"[IDX] Loading {url}", flush=True)
+        page.goto(url, wait_until='domcontentloaded', timeout=25000)
+        page.wait_for_timeout(8000)  # Wait for JS to fully initialize
+
+        # Search by Book & Page
+        book_records = idx_search(page, "Book & Page", {
+            'book': deed_book, 'page': deed_page
         })
-        
-        step1_records = idx_parse_results(results_html)
-        print(f"[IDX] Book/Page search: {len(step1_records)} records", flush=True)
-        
-        # Log first few records for debugging
-        for r in step1_records[:3]:
-            print(f"[IDX] Record: {r}", flush=True)
-
-        title_report["chain_of_title"].append({
+        print(f"[IDX] Book/Page results: {len(book_records)}", flush=True)
+        report['chain_of_title'].append({
             "owner": current_owner_name,
-            "deed_book": deed_book,
-            "deed_page": deed_page,
-            "instruments": step1_records
+            "deed_book": deed_book, "deed_page": deed_page,
+            "instruments": book_records
         })
-        title_report["all_instruments"].extend(step1_records)
+        report['all_instruments'].extend(book_records)
 
-        # Step 3: Get fresh viewstate for name search
-        viewstate2, _ = idx_get_viewstate(url)
-        if not viewstate2:
-            viewstate2 = viewstate
+        # Reload page for name search
+        print("[IDX] Reloading for name search...", flush=True)
+        page.goto(url, wait_until='domcontentloaded', timeout=25000)
+        page.wait_for_timeout(5000)
 
-        # Step 4: Search owner name for liens/mortgages
-        owner_parts = current_owner_name.strip().split()
-        last = owner_parts[-1] if len(owner_parts) > 1 else owner_parts[0]
-        first = owner_parts[0] if len(owner_parts) > 1 else ""
-        
-        print(f"[IDX] Searching name: {last}, {first}", flush=True)
-        name_html = idx_post_search(url, viewstate2, "Individual", {
-            'CallFormPanel$contentSplitter$CallToolPanel$txtLname': last,
-            'CallFormPanel$contentSplitter$CallToolPanel$txtFname': first,
-            'CallFormPanel$contentSplitter$CallToolPanel$txtMname': '',
+        # Search by name
+        parts = current_owner_name.strip().split()
+        last = parts[-1] if len(parts) > 1 else parts[0]
+        first = parts[0] if len(parts) > 1 else ""
+        name_records = idx_search(page, "Individual", {
+            'last': last, 'first': first
         }, from_date=f"01/01/{cutoff_year}")
-        
-        name_records = idx_parse_results(name_html)
-        print(f"[IDX] Name search: {len(name_records)} records", flush=True)
+        print(f"[IDX] Name results: {len(name_records)}", flush=True)
 
-        # Categorize liens and releases
         for rec in name_records:
-            raw = rec.get('raw', [])
             rec_text = ' '.join(str(v) for v in rec.values()).upper()
             is_lien = any(lt in rec_text for lt in LIEN_TYPES)
             is_release = any(rt in rec_text for rt in RELEASE_TYPES)
-            
             if is_lien or is_release:
-                title_report["all_instruments"].append(rec)
+                report['all_instruments'].append(rec)
                 if is_release:
-                    title_report["released_liens"].append(rec)
+                    report['released_liens'].append(rec)
                 elif is_lien:
-                    # Check if released
-                    rec_book = rec.get('book','')
-                    released = any(
-                        rec_book and rec_book in ' '.join(str(v) for v in r.values())
-                        for r in title_report["released_liens"]
-                    )
-                    if not released:
-                        title_report["open_liens"].append({
-                            "status": "POSSIBLY OPEN - verify release",
-                            "details": rec
-                        })
+                    report['open_liens'].append({"status":"POSSIBLY OPEN","details":rec})
 
-        return title_report
+        browser.close()
+        p.stop()
+        return report
 
     except Exception as e:
         import traceback
         print(f"[IDX] Error: {e}", flush=True)
         traceback.print_exc()
-        return {"success": False, "error": str(e), "county": county}
+        return {"success": False, "error": str(e)}
 
 
 class Handler(BaseHTTPRequestHandler):
