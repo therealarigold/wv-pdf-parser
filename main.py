@@ -641,101 +641,140 @@ def get_playwright_browser():
     return p, browser
 
 def idx_select_search_type(page, search_type):
-    """Select search type from the IDX custom JS dropdown."""
-    print(f"[IDX] Selecting search type: {search_type}", flush=True)
+    """
+    Select search type from the DevExpress ComboBox.
+    Input name contains T3G0I0_CMB. Index 2 = Book & Page.
+    """
+    print(f"[IDX] Selecting: {search_type}", flush=True)
 
-    # Dump HTML for debugging
+    # Strategy 1: Click CMB input to open dropdown, then click option
     try:
-        html = page.content()
-        print(f"[IDX] Full HTML length: {len(html)}", flush=True)
-        print(f"[IDX] HTML SAMPLE:\n{html[:3000]}", flush=True)
+        cmb = page.query_selector('input[name*="T3G0I0_CMB"]:not([name*="State"]):not([name*="DDD"]):not([name*="_VI"])')
+        if cmb:
+            print("[IDX] Found CMB input, clicking", flush=True)
+            cmb.click()
+            page.wait_for_timeout(1000)
+            options = page.query_selector_all('.dxeListBoxItem, [class*="ListBoxItem"]')
+            print(f"[IDX] Found {len(options)} options", flush=True)
+            for opt in options:
+                txt = opt.inner_text().strip()
+                print(f"[IDX] Option: {txt}", flush=True)
+                if txt == search_type:
+                    opt.click()
+                    page.wait_for_timeout(1500)
+                    print(f"[IDX] Selected: {search_type}", flush=True)
+                    return True
     except Exception as e:
-        print(f"[IDX] HTML dump failed: {e}", flush=True)
+        print(f"[IDX] Strategy 1 failed: {e}", flush=True)
 
-    # List all select elements
+    # Strategy 2: DevExpress dropdown button
     try:
-        selects = page.query_selector_all('select')
-        print(f"[IDX] Found {len(selects)} select elements", flush=True)
-        for i, sel in enumerate(selects):
-            opts = [o.inner_text().strip() for o in sel.query_selector_all('option')]
-            print(f"[IDX] Select {i}: options={opts}", flush=True)
-            if any('Book' in o for o in opts):
-                print(f"[IDX] This is our dropdown! Selecting Book & Page", flush=True)
-                sel.select_option(label=search_type)
-                page.wait_for_timeout(2000)
-                return True
+        btn = page.query_selector('[class*="DropDownButton"],[class*="dropDownButton"],[class*="dxeDropDown"]')
+        if btn:
+            btn.click()
+            page.wait_for_timeout(1000)
+            opts = page.query_selector_all('.dxeListBoxItem,[class*="ListBoxItem"]')
+            for opt in opts:
+                if opt.inner_text().strip() == search_type:
+                    opt.click()
+                    page.wait_for_timeout(1500)
+                    return True
     except Exception as e:
-        print(f"[IDX] Select check failed: {e}", flush=True)
+        print(f"[IDX] Strategy 2 failed: {e}", flush=True)
 
-    # List all inputs
+    # Strategy 3: ASPx client-side API + postback
     try:
-        inputs = page.query_selector_all('input')
-        print(f"[IDX] Found {len(inputs)} inputs", flush=True)
-        for i, inp in enumerate(inputs[:20]):
-            ph = inp.get_attribute('placeholder') or ''
-            tp = inp.get_attribute('type') or ''
-            nm = inp.get_attribute('name') or ''
-            vis = inp.is_visible()
-            print(f"[IDX] Input {i}: type={tp} name={nm} placeholder={ph} visible={vis}", flush=True)
+        page.evaluate("""(searchType) => {
+            var vi = document.querySelector('input[name*="T3G0I0_CMB_VI"]');
+            if (vi) { vi.value = "2"; }
+            var cmb = document.querySelector('input[name*="T3G0I0_CMB"]:not([name*="State"]):not([name*="DDD"]):not([name*="_VI"])');
+            if (cmb) {
+                cmb.value = searchType;
+                cmb.dispatchEvent(new Event('change', {bubbles:true}));
+                cmb.dispatchEvent(new Event('input', {bubbles:true}));
+            }
+            if (typeof ASPxClientEdit !== 'undefined') {
+                var c = ASPxClientEdit.GetInputElement ? ASPxClientEdit : null;
+            }
+        }""", search_type)
+        page.wait_for_timeout(2000)
+        print("[IDX] JS set attempted", flush=True)
     except Exception as e:
-        print(f"[IDX] Input dump failed: {e}", flush=True)
+        print(f"[IDX] Strategy 3 failed: {e}", flush=True)
 
-    # List ALL clickable elements with text
+    # Strategy 4: Trigger postback directly like the form does
     try:
-        all_els = page.query_selector_all('div, span, button, a, td, li')
-        print(f"[IDX] Scanning {len(all_els)} elements for Individual text", flush=True)
-        for el in all_els[:500]:
-            try:
-                txt = el.inner_text().strip()
-                if txt in ['Individual', 'Book & Page']:
-                    tag = el.evaluate('e => e.tagName')
-                    cls = el.get_attribute('class') or ''
-                    iid = el.get_attribute('id') or ''
-                    vis = el.is_visible()
-                    print(f"[IDX] FOUND '{txt}': tag={tag} class={cls} id={iid} visible={vis}", flush=True)
-            except: continue
+        page.evaluate("""() => {
+            __doPostBack('CallFormPanel$contentSplitter$CallToolPanel$rc$T3G0I0_CMB', '');
+        }""")
+        page.wait_for_timeout(3000)
+        print("[IDX] Postback triggered", flush=True)
     except Exception as e:
-        print(f"[IDX] Element scan failed: {e}", flush=True)
+        print(f"[IDX] Strategy 4 failed: {e}", flush=True)
 
     return False
 
 
 def idx_fill_and_search(page, fields):
-    """Fill form fields and click Index Search."""
-    # Wait for form fields to appear after dropdown change
+    """
+    Fill Book # and Page # fields after dropdown has switched.
+    DevExpress inputs have no placeholders - they appear/disappear based on mode.
+    After switching to Book & Page, two visible text inputs appear for book and page.
+    """
     page.wait_for_timeout(2000)
     print(f"[IDX] Filling fields: {list(fields.keys())}", flush=True)
-    for label, value in fields.items():
-        filled = False
-        # Wait for the field to appear
-        for sel in [
-            f'input[placeholder="{label}"]',
-            f'input[placeholder*="{label}"]',
-            f'input[aria-label*="{label}"]',
-        ]:
-            try:
-                el = page.wait_for_selector(sel, timeout=5000)
-                if el and el.is_visible():
-                    el.triple_click()
-                    el.type(str(value), delay=100)
-                    page.wait_for_timeout(300)
-                    filled = True
-                    print(f"[IDX] Filled {label}={value}", flush=True)
-                    break
-            except: continue
-        if not filled:
-            print(f"[IDX] Could not fill: {label}", flush=True)
-            # Dump inputs again to see what's available
-            try:
-                inputs = page.query_selector_all('input')
-                for i, inp in enumerate(inputs[:10]):
-                    ph = inp.get_attribute('placeholder') or ''
-                    print(f"[IDX] Available input {i}: placeholder={ph}", flush=True)
-            except: pass
+
+    # Get all currently visible text inputs
+    try:
+        all_inputs = page.query_selector_all('input[type="text"]')
+        visible = [inp for inp in all_inputs if inp.is_visible()]
+        print(f"[IDX] Visible text inputs: {len(visible)}", flush=True)
+        for i, inp in enumerate(visible):
+            nm = inp.get_attribute('name') or ''
+            val = inp.input_value() or ''
+            print(f"[IDX] Visible input {i}: name={nm} value={val}", flush=True)
+    except Exception as e:
+        print(f"[IDX] Input scan failed: {e}", flush=True)
+
+    # After switching to Book & Page, the two new fields appear
+    # They have names containing T3G0I0 but different indices
+    # Try to find inputs that appeared after the dropdown switch
+    # Strategy: get visible inputs, skip date fields (FromDate/ThruDate) and CMB
+    # The book and page inputs should be the remaining visible ones
+    try:
+        all_inputs = page.query_selector_all('input[type="text"]')
+        visible_non_date = []
+        for inp in all_inputs:
+            if not inp.is_visible():
+                continue
+            nm = inp.get_attribute('name') or ''
+            # Skip date fields and the combobox itself
+            if any(skip in nm for skip in ['FromDate', 'ThruDate', 'T3G0I0_CMB']):
+                continue
+            visible_non_date.append(inp)
+        
+        print(f"[IDX] Non-date visible inputs: {len(visible_non_date)}", flush=True)
+        for i, inp in enumerate(visible_non_date):
+            nm = inp.get_attribute('name') or ''
+            print(f"[IDX] Non-date input {i}: name={nm}", flush=True)
+
+        # Fill first with Book, second with Page
+        field_values = list(fields.values())
+        for i, inp in enumerate(visible_non_date[:2]):
+            val = field_values[i] if i < len(field_values) else ''
+            nm = inp.get_attribute('name') or ''
+            inp.triple_click()
+            inp.type(str(val), delay=80)
+            page.wait_for_timeout(300)
+            print(f"[IDX] Filled input {i} (name={nm}) with {val}", flush=True)
+    except Exception as e:
+        print(f"[IDX] Fill strategy failed: {e}", flush=True)
+
+    # Click Index Search
     try:
         page.click('text=Index Search', timeout=5000)
         page.wait_for_timeout(6000)
-        print("[IDX] Index Search clicked, waiting for results", flush=True)
+        print("[IDX] Index Search clicked", flush=True)
     except Exception as e:
         print(f"[IDX] Index Search click failed: {e}", flush=True)
 
