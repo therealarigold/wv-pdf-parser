@@ -907,45 +907,90 @@ def idx_get_viewstate(url):
         print(f"[IDX] Initial fetch failed: {e}", flush=True)
         return None, None
 
-def idx_post_search(url, viewstate_fields, search_type, search_params, from_date="01/01/1700"):
-    """Submit IDX search via HTTP POST and return results HTML."""
-    today = datetime.now().strftime('%m/%d/%Y')
-    
-    # Build the POST data matching what the form submits
-    data = {
-        '__EVENTTARGET': '',
-        '__EVENTARGUMENT': '',
-        '__VIEWSTATE': viewstate_fields.get('__VIEWSTATE',''),
-        '__VIEWSTATEGENERATOR': viewstate_fields.get('__VIEWSTATEGENERATOR',''),
-        '__EVENTVALIDATION': viewstate_fields.get('__EVENTVALIDATION',''),
-        'FirstLoad': viewstate_fields.get('FirstLoad',''),
-        'CallFormPanel$contentSplitter': viewstate_fields.get('CallFormPanel$contentSplitter',''),
-        'CallFormPanel$contentSplitter$CallToolPanel$rc': viewstate_fields.get('CallFormPanel$contentSplitter$CallToolPanel$rc',''),
-        'CallFormPanel$contentSplitter$CallToolPanel$rc$TC': viewstate_fields.get('CallFormPanel$contentSplitter$CallToolPanel$rc$TC',''),
-        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$FromDate': from_date,
-        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$ThruDate': today,
-        'CallFormPanel$contentSplitter$CallToolPanel$cboKey': search_type,
-        'CallFormPanel$contentSplitter$CallToolPanel$btnIndex.x': '10',
-        'CallFormPanel$contentSplitter$CallToolPanel$btnIndex.y': '10',
-    }
-    
-    # Add search-type specific fields
-    data.update(search_params)
-    
+def idx_extract_viewstate(html):
+    """Extract all ASP.NET hidden fields from HTML."""
+    import re
+    fields = {}
+    # Extract all hidden inputs
+    for m in re.finditer(r'<input[^>]+type="hidden"[^>]*>', html, re.IGNORECASE):
+        tag = m.group(0)
+        name_m = re.search(r'name="([^"]+)"', tag)
+        val_m = re.search(r'value="([^"]*)"', tag)
+        if name_m:
+            fields[name_m.group(1)] = val_m.group(1) if val_m else ''
+    return fields
+
+def idx_do_post(url, data, session_headers=None):
+    """Make a POST request to IDX."""
     encoded = urllib.parse.urlencode(data).encode('utf-8')
-    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': url,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+    if session_headers:
+        headers.update(session_headers)
     try:
-        req = urllib.request.Request(url, data=encoded, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': url,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        })
+        req = urllib.request.Request(url, data=encoded, headers=headers)
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.read().decode('utf-8', errors='replace')
     except Exception as e:
         print(f"[IDX] POST failed: {e}", flush=True)
         return None
+
+def idx_post_search(url, viewstate_fields, search_type, search_params, from_date="01/01/1700"):
+    """
+    Submit IDX search via two-step POST:
+    Step 1: POST to switch search type (get new ViewState with correct mode)
+    Step 2: POST the actual search with new ViewState
+    """
+    today = datetime.now().strftime('%m/%d/%Y')
+
+    # Step 1: Switch search type by POSTing cboKey change
+    # This triggers the UpdatePanel to re-render with the right fields
+    print(f"[IDX] Step 1: Switching to {search_type}", flush=True)
+    step1_data = {}
+    step1_data.update(viewstate_fields)
+    step1_data.update({
+        '__EVENTTARGET': 'CallFormPanel$contentSplitter$CallToolPanel$cboKey',
+        '__EVENTARGUMENT': '',
+        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$FromDate': from_date,
+        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$ThruDate': today,
+        'CallFormPanel$contentSplitter$CallToolPanel$cboKey': search_type,
+    })
+
+    step1_html = idx_do_post(url, step1_data)
+    if not step1_html:
+        print("[IDX] Step 1 failed", flush=True)
+        return None
+    print(f"[IDX] Step 1 response: {len(step1_html)} chars", flush=True)
+
+    # Extract new ViewState from step 1 response
+    new_viewstate = idx_extract_viewstate(step1_html)
+    print(f"[IDX] New viewstate: {len(new_viewstate.get('__VIEWSTATE',''))} chars", flush=True)
+
+    # Use new viewstate if we got one, otherwise fall back
+    vs = new_viewstate if new_viewstate.get('__VIEWSTATE') else viewstate_fields
+
+    # Step 2: Submit actual search with correct ViewState
+    print(f"[IDX] Step 2: Submitting search", flush=True)
+    step2_data = {}
+    step2_data.update(vs)
+    step2_data.update({
+        '__EVENTTARGET': '',
+        '__EVENTARGUMENT': '',
+        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$FromDate': from_date,
+        'CallFormPanel$contentSplitter$CallToolPanel$rc$T0G0I0_ITC$DateLayout$ThruDate': today,
+        'CallFormPanel$contentSplitter$CallToolPanel$cboKey': search_type,
+        'CallFormPanel$contentSplitter$CallToolPanel$btnIndex.x': '10',
+        'CallFormPanel$contentSplitter$CallToolPanel$btnIndex.y': '10',
+    })
+    step2_data.update(search_params)
+
+    step2_html = idx_do_post(url, step2_data)
+    print(f"[IDX] Step 2 response: {len(step2_html) if step2_html else 0} chars", flush=True)
+    return step2_html
 
 def idx_parse_results(html):
     """Parse IDX search results from the results grid, skipping UI chrome."""
