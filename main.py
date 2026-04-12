@@ -1,4 +1,16 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import subprocess, sys
+
+def ensure_chromium():
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=300
+        )
+        print("Chromium ready:", result.returncode)
+    except Exception as e:
+        print(f"Chromium install warning: {e}")
+
 import json, io, re, pdfplumber, os, urllib.request, urllib.parse
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -558,6 +570,354 @@ def fetch_assessment_detail(map_pid):
         return {'success': False, 'error': str(e), 'assessment_url': url if 'url' in dir() else ''}
 
 
+
+# ── TITLE SEARCH VIA PLAYWRIGHT ───────────────────────────────────────────────
+
+IDX_COUNTY_URLS = {
+    "LINCOLN":    "http://129.71.206.62/Default.aspx",
+    "LOGAN":      "https://loganwv.compiled-technologies.com",
+    "NICHOLAS":   "http://129.71.205.250/Default.aspx",
+    "GILMER":     "http://www.gilmercountywv.gov/idxsearch/",
+    "HARRISON":   "http://lookup.harrisoncountywv.com/",
+    "LEWIS":      "http://inquiry.lewiscountywv.org/",
+    "MARSHALL":   "http://129.71.117.225/",
+    "BARBOUR":    "http://129.71.117.241/WEBInquiry/Default.aspx",
+    "GRANT":      "http://129.71.112.124/",
+    "GREENBRIER": "http://129.71.205.208/",
+    "HAMPSHIRE":  "http://129.71.205.207/idxsearch",
+    "FAYETTE":    "http://129.71.202.7/",
+    "DODDRIDGE":  "http://129.71.205.241/",
+    "CABELL":     "http://www.recordscabellcountyclerk.org/Default.aspx",
+    "JEFFERSON":  "http://documents.jeffersoncountywv.org/",
+    "WIRT":       "http://records.wirtcountywv.net/",
+}
+
+# Instrument types that indicate debt/encumbrance
+LIEN_TYPES = [
+    "DEED OF TRUST", "TRUST DEED", "MORTGAGE", "LIEN",
+    "JUDGMENT", "MECHANIC", "UCC", "TAX LIEN", "FEDERAL",
+    "STATE TAX", "IRS", "ATTACHMENT"
+]
+
+# Instrument types that indicate release/satisfaction
+RELEASE_TYPES = [
+    "RELEASE", "SATISFACTION", "DISCHARGE", "RECONVEYANCE",
+    "PARTIAL RELEASE", "FULL RELEASE"
+]
+
+# Instrument types that indicate deed/ownership transfer
+DEED_TYPES = [
+    "DEED", "SPECIAL WARRANTY", "GENERAL WARRANTY", "QUITCLAIM",
+    "EXECUTOR", "ADMINISTRATOR", "TRUSTEE DEED", "COMMISSIONER"
+]
+
+def get_playwright_browser():
+    """Launch a headless Chromium browser."""
+    from playwright.sync_api import sync_playwright
+    p = sync_playwright().start()
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox", 
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--single-process",
+            "--no-zygote",
+        ]
+    )
+    return p, browser
+
+def idx_search_book_page(page, book, pg, from_date="01/01/1700"):
+    """
+    Search IDX by Book & Page.
+    Based on screenshots: dropdown -> Book & Page -> Book# field, Page# field -> Index Search
+    Returns list of records found.
+    """
+    # Select "Book & Page" from the search type dropdown
+    # The dropdown appears to be the first select element
+    try:
+        page.select_option('select', 'Book & Page')
+        page.wait_for_timeout(1000)
+    except:
+        # Try clicking the dropdown text
+        try:
+            page.click('text=Individual')
+            page.wait_for_timeout(500)
+            page.click('text=Book & Page')
+            page.wait_for_timeout(1000)
+        except:
+            pass
+
+    # Fill Book number
+    try:
+        book_input = page.query_selector('input[placeholder="Book #"]') or                      page.query_selector('input[placeholder*="Book"]') or                      page.query_selector('input[aria-label*="Book"]')
+        if book_input:
+            book_input.fill(str(book))
+    except: pass
+
+    # Fill Page number  
+    try:
+        page_input = page.query_selector('input[placeholder="Page #"]') or                      page.query_selector('input[placeholder*="Page"]') or                      page.query_selector('input[aria-label*="Page"]')
+        if page_input:
+            page_input.fill(str(pg))
+    except: pass
+
+    # Set date range from 1700 to today
+    try:
+        page.fill('input[aria-label*="From"]', from_date)
+        page.fill('input[aria-label*="Thru"]', datetime.now().strftime('%m/%d/%Y'))
+    except: pass
+
+    # Click Index Search button
+    try:
+        page.click('text=Index Search')
+        page.wait_for_timeout(4000)
+    except: pass
+
+    return parse_idx_results(page)
+
+def idx_search_name(page, last_name, first_name="", from_year=None):
+    """
+    Search IDX by Individual name.
+    Based on screenshots: dropdown -> Individual -> Last, First, Middle fields -> Index Search
+    """
+    from_date = f"01/01/{from_year}" if from_year else "01/01/1700"
+    
+    try:
+        page.select_option('select', 'Individual')
+        page.wait_for_timeout(1000)
+    except:
+        try:
+            page.click('text=Book & Page')
+            page.wait_for_timeout(300)
+            page.click('text=Individual')
+            page.wait_for_timeout(1000)
+        except: pass
+
+    try:
+        last_input = page.query_selector('input[placeholder="Last"]') or                      page.query_selector('input[aria-label*="Last"]')
+        if last_input:
+            last_input.fill(last_name)
+    except: pass
+
+    if first_name:
+        try:
+            first_input = page.query_selector('input[placeholder="First"]') or                           page.query_selector('input[aria-label*="First"]')
+            if first_input:
+                first_input.fill(first_name)
+        except: pass
+
+    try:
+        page.fill('input[aria-label*="From"]', from_date)
+        page.fill('input[aria-label*="Thru"]', datetime.now().strftime('%m/%d/%Y'))
+    except: pass
+
+    try:
+        page.click('text=Index Search')
+        page.wait_for_timeout(4000)
+    except: pass
+
+    return parse_idx_results(page)
+
+def parse_idx_results(page):
+    """
+    Parse results from the IDX results grid.
+    The results appear in a table in the main area.
+    Bottom panels show Names, Description, Cross References.
+    """
+    records = []
+    try:
+        # Wait for results to load
+        page.wait_for_timeout(2000)
+        
+        # Get all rows from the results table
+        rows = page.query_selector_all('tr')
+        headers = []
+        
+        for row in rows:
+            cells = row.query_selector_all('td, th')
+            cell_texts = [c.inner_text().strip() for c in cells]
+            
+            if not any(cell_texts): continue
+            
+            # Detect header row
+            row_text = ' '.join(cell_texts).upper()
+            if any(h in row_text for h in ['INSTRUMENT', 'RECORDED', 'BOOK', 'GRANTOR', 'TYPE', 'DATE']):
+                headers = cell_texts
+                continue
+            
+            # Skip empty rows
+            if len([t for t in cell_texts if t]) < 2: continue
+            
+            # Build record
+            record = {}
+            if headers and len(headers) == len(cell_texts):
+                for i, h in enumerate(headers):
+                    record[h.lower().strip()] = cell_texts[i]
+            else:
+                # Try to identify fields by position/content
+                record['raw'] = cell_texts
+                # Try to extract date
+                for t in cell_texts:
+                    if re.match(r'\d{1,2}/\d{1,2}/\d{4}', t):
+                        record['date'] = t
+                        break
+                # Try to extract book/page (format like "434/138" or separate cells)
+                for t in cell_texts:
+                    m = re.match(r'(\d+)/(\d+)', t)
+                    if m:
+                        record['book'] = m.group(1)
+                        record['page'] = m.group(2)
+                        break
+            
+            if record:
+                records.append(record)
+                
+    except Exception as e:
+        records.append({"error": str(e)})
+    
+    return records
+
+def do_title_search(county_name, deed_book, deed_page, current_owner_name, years_back=25):
+    """
+    Full title search workflow:
+    1. Search by Book/Page to get the current deed
+    2. Extract grantor (seller) from that deed
+    3. Search grantor name for their deed (chain backwards)
+    4. For each owner: search for mortgages, liens, deeds of trust
+    5. Match with releases
+    6. Return full title report
+    """
+    county = county_name.upper().replace(" COUNTY", "").strip()
+    url = IDX_COUNTY_URLS.get(county)
+    if not url:
+        return {"success": False, "error": f"No IDX configured for {county} County"}
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {"success": False, "error": "Playwright not installed"}
+
+    title_report = {
+        "success": True,
+        "county": county,
+        "starting_book": deed_book,
+        "starting_page": deed_page,
+        "current_owner": current_owner_name,
+        "chain_of_title": [],
+        "open_liens": [],
+        "released_liens": [],
+        "all_instruments": [],
+        "errors": []
+    }
+
+    try:
+        p, browser = get_playwright_browser()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.wait_for_timeout(3000)
+
+        cutoff_year = datetime.now().year - years_back
+
+        # ── Step 1: Search by Book/Page to get current deed ──────────
+        step1_records = idx_search_book_page(page, deed_book, deed_page)
+        
+        current_deed = None
+        grantors_to_search = []
+        
+        for rec in step1_records:
+            raw = rec.get('raw', [])
+            rec_text = ' '.join(raw).upper() if raw else ' '.join(str(v) for v in rec.values()).upper()
+            
+            # Identify as deed
+            is_deed = any(dt in rec_text for dt in ['DEED', 'CONVEYANCE', 'GRANT'])
+            if is_deed or not step1_records:
+                current_deed = rec
+                # Extract grantor (seller) - usually the party who conveyed to current owner
+                for r in raw:
+                    r_up = r.upper()
+                    if r_up and r_up != current_owner_name.upper() and len(r_up) > 3:
+                        if not any(skip in r_up for skip in ['DEED', 'BOOK', 'PAGE', 'DATE', '/']):
+                            grantors_to_search.append(r)
+                            break
+            
+            title_report["all_instruments"].append({
+                "type": "DEED (current)",
+                "book": rec.get('book', deed_book),
+                "page": rec.get('page', deed_page),
+                "details": rec
+            })
+
+        title_report["chain_of_title"].append({
+            "owner": current_owner_name,
+            "deed_book": deed_book,
+            "deed_page": deed_page,
+            "records_from_book_page_search": step1_records
+        })
+
+        # ── Step 2: Search current owner for liens/mortgages ─────────
+        owner_parts = current_owner_name.strip().split()
+        if owner_parts:
+            last = owner_parts[-1] if len(owner_parts) > 1 else owner_parts[0]
+            first = owner_parts[0] if len(owner_parts) > 1 else ""
+            
+            owner_records = idx_search_name(page, last, first, cutoff_year)
+            
+            liens = []
+            releases = []
+            
+            for rec in owner_records:
+                raw = rec.get('raw', [])
+                rec_text = ' '.join(raw).upper() if raw else ' '.join(str(v) for v in rec.values()).upper()
+                
+                is_lien = any(lt in rec_text for lt in LIEN_TYPES)
+                is_release = any(rt in rec_text for rt in RELEASE_TYPES)
+                
+                if is_release:
+                    releases.append(rec)
+                    title_report["released_liens"].append(rec)
+                elif is_lien:
+                    liens.append(rec)
+                
+                title_report["all_instruments"].append({
+                    "type": "LIEN/RELEASE" if is_lien or is_release else "OTHER",
+                    "is_lien": is_lien,
+                    "is_release": is_release,
+                    "details": rec
+                })
+            
+            # Find unreleased liens
+            for lien in liens:
+                lien_text = ' '.join(str(v) for v in lien.values()).upper()
+                # Check if there's a matching release
+                released = False
+                for rel in releases:
+                    rel_text = ' '.join(str(v) for v in rel.values()).upper()
+                    # Match by book/page reference or name
+                    lien_book = lien.get('book', '')
+                    if lien_book and lien_book in rel_text:
+                        released = True
+                        break
+                
+                if not released:
+                    title_report["open_liens"].append({
+                        "status": "OPEN - NO RELEASE FOUND",
+                        "details": lien
+                    })
+
+        browser.close()
+        p.stop()
+
+        return title_report
+
+    except Exception as e:
+        return {"success": False, "error": str(e), "county": county}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
@@ -612,9 +972,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/idx-search":
                 data = json.loads(body)
-                return self.respond(search_idx_playwright(
+                return self.respond(do_title_search(
                     data.get("county",""),
-                    data.get("name",""),
+                    data.get("deed_book",""),
+                    data.get("deed_page",""),
+                    data.get("owner_name",""),
                     int(data.get("years_back", 25))
                 ))
 
@@ -709,4 +1071,5 @@ def parse_pdf(pdf_bytes):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     print(f'WV Tax Lien API running on port {port} — 55 counties CAMA enabled')
+    ensure_chromium()
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
