@@ -680,92 +680,75 @@ def get_playwright_browser():
 
 def idx_search(page, search_type, fields, from_date="01/01/1700"):
     """
-    Search IDX using Playwright.
-    Key insight: set cboKey via JS, fill fields, then submit via JS
-    without triggering a full postback that resets cboKey.
+    Search IDX by mimicking keyboard navigation exactly as a human would:
+    Tab 3 times to reach the search type dropdown, type to select,
+    Tab to next field, type value, Tab again, type value, Enter to search.
     """
-    today = datetime.now().strftime("%m/%d/%Y")
-    print(f"[IDX] Searching {search_type}: {fields}", flush=True)
+    print(f"[IDX] Keyboard search: {search_type} {fields}", flush=True)
 
-    # Step 1: Set cboKey via JS
-    page.evaluate(f"""() => {{
-        var inputs = document.querySelectorAll('input[type="text"]');
-        for (var inp of inputs) {{
-            if (inp.name && inp.name.endsWith('cboKey')) {{
-                inp.value = '{search_type}';
-                inp.dispatchEvent(new Event('change', {{bubbles:true}}));
-            }}
-        }}
-    }}""")
-    page.wait_for_timeout(3000)
+    # Click on the page body first to ensure focus
+    page.keyboard.press('Tab')
+    page.wait_for_timeout(300)
+    page.keyboard.press('Tab')
+    page.wait_for_timeout(300)
+    page.keyboard.press('Tab')
+    page.wait_for_timeout(300)
 
-    # Step 2: Verify fields appeared and fill them
-    inputs = page.query_selector_all('input[type="text"]')
-    visible = [(inp.get_attribute('name') or '', inp) for inp in inputs if inp.is_visible()]
-    skip = ['FromDate','ThruDate','cboKey']
-    fillable = [(nm, el) for nm, el in visible if not any(s in nm for s in skip) and nm]
-    print(f"[IDX] Fillable fields: {[nm for nm,_ in fillable]}", flush=True)
+    # Now type the search type - this selects from the dropdown
+    # e.g. type "book" to get "Book & Page"
+    type_prefix = {
+        "Book & Page": "book",
+        "Individual": "indiv",
+        "Firm": "firm",
+        "Instrument": "inst",
+        "Description": "desc",
+        "Date Range": "date",
+        "Name": "name",
+    }.get(search_type, search_type.lower()[:4])
 
-    # Fill fields by matching name endings
-    field_map = {
-        # Book & Page
-        'txtBook': fields.get('book',''),
-        'txtPage': fields.get('page',''),
-        # Individual
-        'txtLname': fields.get('last',''),
-        'txtFname': fields.get('first',''),
-        'txtMname': '',
-        # Instrument
-        'txtInstrument': fields.get('instrument',''),
-    }
+    print(f"[IDX] Typing '{type_prefix}' to select dropdown option", flush=True)
+    page.keyboard.type(type_prefix, delay=100)
+    page.wait_for_timeout(1500)
 
-    for nm, el in fillable:
-        for key, val in field_map.items():
-            if nm.endswith(key) and val:
-                try:
-                    el.click()
-                    el.fill('')
-                    el.type(str(val), delay=50)
-                    print(f"[IDX] Filled {key}={val}", flush=True)
-                except Exception as e:
-                    print(f"[IDX] Fill error {key}: {e}", flush=True)
+    # Tab to move to the first input field (Book # or Last name)
+    page.keyboard.press('Tab')
+    page.wait_for_timeout(500)
 
-    # Set date range
+    if search_type == "Book & Page":
+        book = str(fields.get('book', ''))
+        pg = str(fields.get('page', ''))
+        print(f"[IDX] Typing book={book}", flush=True)
+        page.keyboard.type(book, delay=100)
+        page.wait_for_timeout(300)
+        page.keyboard.press('Tab')
+        page.wait_for_timeout(300)
+        print(f"[IDX] Typing page={pg}", flush=True)
+        page.keyboard.type(pg, delay=100)
+        page.wait_for_timeout(300)
+
+    elif search_type == "Individual":
+        last = fields.get('last', '')
+        first = fields.get('first', '')
+        print(f"[IDX] Typing last={last}", flush=True)
+        page.keyboard.type(last, delay=100)
+        page.wait_for_timeout(300)
+        page.keyboard.press('Tab')
+        page.wait_for_timeout(300)
+        print(f"[IDX] Typing first={first}", flush=True)
+        page.keyboard.type(first, delay=100)
+        page.wait_for_timeout(300)
+
+    # Press Enter to search
+    print("[IDX] Pressing Enter to search", flush=True)
+    page.keyboard.press('Enter')
+    page.wait_for_load_state('domcontentloaded', timeout=20000)
+    page.wait_for_timeout(4000)
+
+    # Log what we see
     try:
-        for nm, el in visible:
-            if 'FromDate' in nm:
-                el.fill(from_date)
-            elif 'ThruDate' in nm:
-                el.fill(today)
+        text = page.inner_text('body')
+        print(f"[IDX] Results page preview: {text[:600]}", flush=True)
     except: pass
-
-    # Step 3: Submit via JS - set hidden fields then submit form
-    # This keeps our cboKey value intact
-    print("[IDX] Submitting form via JS...", flush=True)
-    page.evaluate(f"""() => {{
-        // Make sure cboKey is still set
-        var inputs = document.querySelectorAll('input[type="text"]');
-        for (var inp of inputs) {{
-            if (inp.name && inp.name.endsWith('cboKey')) {{
-                inp.value = '{search_type}';
-            }}
-        }}
-        // Set event target to empty so it's a normal submit
-        var et = document.getElementById('__EVENTTARGET');
-        if (et) et.value = '';
-        var ea = document.getElementById('__EVENTARGUMENT');
-        if (ea) ea.value = '';
-        // Submit the form
-        document.getElementById('Search').submit();
-    }}""")
-
-    # Wait for results to load
-    page.wait_for_load_state('domcontentloaded', timeout=15000)
-    page.wait_for_timeout(3000)
-
-    # Get results
-    text = page.inner_text('body')
-    print(f"[IDX] Page after submit (500 chars): {text[:500]}", flush=True)
 
     return parse_idx_results(page.content())
 
