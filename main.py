@@ -643,20 +643,83 @@ def get_playwright_browser():
 def idx_select_search_type(page, search_type):
     """Select search type from the IDX custom JS dropdown."""
     print(f"[IDX] Selecting search type: {search_type}", flush=True)
-    # The dropdown is a custom control showing "Individual" by default
-    # Click it to open, then click the option
+
+    # First dump the full HTML to see what elements exist
     try:
-        # Click the dropdown to open it
-        page.click('text=Individual', timeout=5000)
-        page.wait_for_timeout(600)
-        # Now click the target option
-        page.click(f'text={search_type}', timeout=5000)
-        page.wait_for_timeout(800)
-        print(f"[IDX] Selected: {search_type}", flush=True)
-        return True
+        html = page.content()
+        print(f"[IDX] Full HTML length: {len(html)}", flush=True)
+        # Print the first 3000 chars to see the structure
+        print(f"[IDX] HTML START:\n{html[:3000]}", flush=True)
     except Exception as e:
-        print(f"[IDX] Dropdown selection failed: {e}", flush=True)
-        return False
+        print(f"[IDX] HTML dump failed: {e}", flush=True)
+
+    # Also list all select elements and their options
+    try:
+        selects = page.query_selector_all('select')
+        print(f"[IDX] Found {len(selects)} select elements", flush=True)
+        for i, sel in enumerate(selects):
+            options = sel.query_selector_all('option')
+            opts = [o.inner_text() for o in options]
+            print(f"[IDX] Select {i}: options = {opts}", flush=True)
+            val = sel.input_value()
+            print(f"[IDX] Select {i}: current value = {val}", flush=True)
+    except Exception as e:
+        print(f"[IDX] Select dump failed: {e}", flush=True)
+
+    # List all input elements
+    try:
+        inputs = page.query_selector_all('input')
+        print(f"[IDX] Found {len(inputs)} input elements", flush=True)
+        for i, inp in enumerate(inputs[:10]):
+            try:
+                ph = inp.get_attribute('placeholder')
+                tp = inp.get_attribute('type')
+                nm = inp.get_attribute('name')
+                print(f"[IDX] Input {i}: type={tp} name={nm} placeholder={ph}", flush=True)
+            except: pass
+    except Exception as e:
+        print(f"[IDX] Input dump failed: {e}", flush=True)
+
+    # Now try to actually select Book & Page
+    # Try using the select element if one exists with these options
+    try:
+        selects = page.query_selector_all('select')
+        for sel in selects:
+            options = sel.query_selector_all('option')
+            opts = [o.inner_text().strip() for o in options]
+            if 'Book & Page' in opts or any('Book' in o for o in opts):
+                # Found the right select
+                sel.select_option(label='Book & Page')
+                page.wait_for_timeout(1000)
+                print(f"[IDX] Selected via select element", flush=True)
+                return True
+    except Exception as e:
+        print(f"[IDX] Select option failed: {e}", flush=True)
+
+    # Try clicking any element containing "Individual" text as its complete text
+    try:
+        all_els = page.query_selector_all('*')
+        for el in all_els[:200]:
+            try:
+                txt = el.inner_text().strip()
+                if txt == 'Individual' and el.is_visible():
+                    tag = el.evaluate('el => el.tagName')
+                    cls = el.get_attribute('class') or ''
+                    print(f"[IDX] Found Individual element: tag={tag} class={cls}", flush=True)
+                    el.click()
+                    page.wait_for_timeout(500)
+                    # Try to find and click Book & Page
+                    bp = page.query_selector(f'text=Book & Page')
+                    if bp and bp.is_visible():
+                        bp.click()
+                        page.wait_for_timeout(500)
+                        print(f"[IDX] Clicked Book & Page option", flush=True)
+                        return True
+            except: continue
+    except Exception as e:
+        print(f"[IDX] Element search failed: {e}", flush=True)
+
+    return False
 
 
 def idx_fill_and_search(page, fields):
@@ -686,6 +749,8 @@ def idx_fill_and_search(page, fields):
 def idx_search_book_page(page, book, pg):
     """Search IDX by Book & Page number."""
     print(f"[IDX] Searching Book={book} Page={pg}", flush=True)
+    # Extra wait to ensure JS is fully rendered
+    page.wait_for_timeout(3000)
     try:
         page.screenshot(path="/tmp/idx_before.png")
     except: pass
@@ -744,7 +809,7 @@ def idx_search_name(page, last_name, first_name="", from_year=None):
 
     try:
         page.click('text=Index Search')
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(10000)  # Wait longer for JS to fully render
     except: pass
 
     return parse_idx_results(page)
