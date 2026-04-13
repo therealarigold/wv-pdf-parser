@@ -744,56 +744,89 @@ def idx_search(page, search_type, fields, from_date="01/01/1700"):
     page.wait_for_load_state('domcontentloaded', timeout=20000)
     page.wait_for_timeout(4000)
 
-    # Log what we see
+    # Take screenshot and save HTML for debugging
+    try:
+        page.screenshot(path="/tmp/idx_screenshot.png", full_page=False)
+        print("[IDX] Screenshot saved to /tmp/idx_screenshot.png", flush=True)
+    except Exception as e:
+        print(f"[IDX] Screenshot failed: {e}", flush=True)
+
     try:
         text = page.inner_text('body')
-        print(f"[IDX] Results page preview: {text[:600]}", flush=True)
+        print(f"[IDX] Results page preview: {text[:800]}", flush=True)
     except: pass
 
-    return parse_idx_results(page.content())
+    html = page.content()
+    # Count dxgvDataRow before parsing
+    import re
+    dr = re.findall(r'dxgvDataRow', html)
+    print(f"[IDX] dxgvDataRow count in HTML: {len(dr)}", flush=True)
+
+    return parse_idx_results(html)
 
 def parse_idx_results(html):
-    """Parse IDX results grid."""
+    """Parse IDX DevExpress grid results."""
     import re, html as html_mod
     records = []
 
-    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL|re.IGNORECASE)
-    SKIP = {'SUN','MON','TUE','WED','THU','FRI','SAT'}
-    UICHROME = {'SEARCH','SELECTIONS','ADVANCED','VIEW','RESULTS','TOOLS','ACCOUNT'}
-    header = []
-    found = False
+    # The DevExpress grid rows have class dxgvDataRow
+    # Extract them specifically
+    data_rows = re.findall(
+        r'<tr[^>]*class="[^"]*dxgvDataRow[^"]*"[^>]*>(.*?)</tr>',
+        html, re.DOTALL|re.IGNORECASE
+    )
+    print(f"[IDX] Found {len(data_rows)} dxgvDataRow rows", flush=True)
 
-    for row in rows:
-        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL|re.IGNORECASE)
+    # Also find header row
+    header_rows = re.findall(
+        r'<tr[^>]*class="[^"]*dxgvHeader[^"]*"[^>]*>(.*?)</tr>',
+        html, re.DOTALL|re.IGNORECASE
+    )
+    header = []
+    for hr in header_rows:
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', hr, re.DOTALL|re.IGNORECASE)
         cells = [re.sub(r'<[^>]+>','',c).strip() for c in cells]
-        cells = [html_mod.unescape(c) for c in cells]
-        cells = [' '.join(c.split()) for c in cells]
+        cells = [html_mod.unescape(' '.join(c.split())) for c in cells]
+        cells = [c for c in cells if c]
+        if cells:
+            header = cells
+            print(f"[IDX] Grid header: {cells}", flush=True)
+            break
+
+    for row_html in data_rows:
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.DOTALL|re.IGNORECASE)
+        cells = [re.sub(r'<[^>]+>','',c).strip() for c in cells]
+        cells = [html_mod.unescape(' '.join(c.split())) for c in cells]
         cells = [c for c in cells if c]
         if not cells: continue
-
-        # Skip calendar
-        if set(c.upper() for c in cells) & SKIP: continue
-        if all(c.isdigit() and int(c)<=31 for c in cells): continue
-
-        row_up = ' '.join(cells).upper()
-
-        # Find header
-        if any(h in row_up for h in ['INSTRUMENT TYPE','RECORDED DATE','GRANTOR NAME','BOOK NO','PAGE NO','GRANTEE NAME']):
-            header = cells
-            found = True
-            print(f"[IDX] Header: {cells}", flush=True)
-            continue
-
-        if not found: continue
-        if len(cells) < 2: continue
 
         if header and len(header) == len(cells):
             rec = {header[i].lower().replace(' ','_'): cells[i] for i in range(len(cells))}
         else:
             rec = {'raw': cells}
         records.append(rec)
-        print(f"[IDX] Row: {cells}", flush=True)
+        print(f"[IDX] Result: {cells}", flush=True)
 
+    # If no dxgvDataRow found, fall back to any table rows with deed data
+    if not records:
+        print("[IDX] No dxgvDataRow found, trying fallback parse", flush=True)
+        all_rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL|re.IGNORECASE)
+        SKIP = {'SUN','MON','TUE','WED','THU','FRI','SAT'}
+        for row in all_rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL|re.IGNORECASE)
+            cells = [re.sub(r'<[^>]+>','',c).strip() for c in cells]
+            cells = [html_mod.unescape(' '.join(c.split())) for c in cells]
+            cells = [c for c in cells if c]
+            if not cells or len(cells) < 3: continue
+            if set(c.upper() for c in cells) & SKIP: continue
+            if all(c.isdigit() and int(c)<=31 for c in cells if c): continue
+            # Must have a date pattern to be a deed record
+            if not any(re.search(r'\d{1,2}/\d{1,2}/\d{4}', c) for c in cells): continue
+            rec = {'raw': cells}
+            records.append(rec)
+            print(f"[IDX] Fallback row: {cells}", flush=True)
+
+    print(f"[IDX] Total records: {len(records)}", flush=True)
     return records
 
 def do_title_search(county_name, deed_book, deed_page, current_owner_name, years_back=25):
@@ -845,9 +878,11 @@ def do_title_search(county_name, deed_book, deed_page, current_owner_name, years
         page.wait_for_timeout(5000)
 
         # Search by name
+        # WV names are stored as "FIRSTNAME LASTNAME" or "LASTNAME FIRSTNAME"
+        # Assessment shows "KEENEY DON" meaning KEENEY=last, DON=first
         parts = current_owner_name.strip().split()
-        last = parts[-1] if len(parts) > 1 else parts[0]
-        first = parts[0] if len(parts) > 1 else ""
+        last = parts[0]   # First word is last name in WV records
+        first = parts[1] if len(parts) > 1 else ""
         name_records = idx_search(page, "Individual", {
             'last': last, 'first': first
         }, from_date=f"01/01/{cutoff_year}")
@@ -890,6 +925,25 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/counties":
             return self.respond({"success": True, "counties": get_county_registry()})
+
+        if path == "/proxy":
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            target = qs.get('url', [None])[0]
+            if not target:
+                return self.respond({"error": "No URL provided"})
+            try:
+                import urllib.request as ur
+                req = ur.Request(target, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                })
+                with ur.urlopen(req, timeout=15) as r:
+                    html = r.read().decode('utf-8', errors='replace')
+                return self.respond({"contents": html})
+            except Exception as e:
+                return self.respond({"error": str(e)})
+
         body = b'WV Tax Lien API - PDF + CAMA (55 counties) + IDX'
         self.send_response(200)
         self.send_header('Content-Type','text/plain')
@@ -940,6 +994,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/analyze":
                 data = json.loads(body)
                 return self.respond(call_claude(data.get("prompt","")))
+
+            if path == "/idx-screenshot":
+                try:
+                    import base64
+                    with open("/tmp/idx_screenshot.png","rb") as f:
+                        img = base64.b64encode(f.read()).decode()
+                    return self.respond({"success":True,"image":img})
+                except Exception as e:
+                    return self.respond({"success":False,"error":str(e)})
 
             if 'multipart/form-data' not in ct:
                 return self.respond({'success':False,'error':'Expected multipart/form-data'})
