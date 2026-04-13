@@ -1,3 +1,5 @@
+import os, sys, json, re, io, asyncio
+
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import subprocess, sys
 
@@ -1896,44 +1898,24 @@ async def scrape_sheriff_async(county, ticket, page):
     }
 
     try:
-        print(f"[SHERIFF] Loading {base}/index.html", flush=True)
-        await page.goto(base + "/index.html", timeout=25000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1500)
-
-        # Fill ticket number field
-        for sel in ["input[name=TICKET]", "input[name=TPTICK]", "input[name=ticket]"]:
-            try:
-                await page.fill(sel, str(ticket), timeout=3000)
-                print(f"[SHERIFF] Ticket {ticket} filled", flush=True)
-                break
-            except: pass
-
-        # Set to Real property only
-        try: await page.select_option("select[name=TXTYPE]", value="R", timeout=2000)
-        except: pass
-
-        # Submit search
-        for sel in ["input[type=submit]", "input[name=SEARCH]", "input[value=Search]", "button[type=submit]"]:
-            try:
-                await page.click(sel, timeout=3000)
-                print(f"[SHERIFF] Search submitted", flush=True)
-                break
-            except: pass
-
-        await page.wait_for_load_state("domcontentloaded", timeout=20000)
+        # Navigate directly to results URL - bypass form submission issues
+        # Software Systems Inc format: results.html with GET params
+        results_url = f"{base}/results.html?TAXYR=&TICKET={ticket}&SUFFIX=&DISTRICT=0&MAP=0000&PARCEL=0000&SUBPARCEL=0000&TAXNAME=&ACCOUNT=&TXTYPE=R&PAIDUNPAID=B&SEARCH=Search"
+        print(f"[SHERIFF] Loading results directly: {results_url}", flush=True)
+        await page.goto(results_url, timeout=25000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
         body_text = await page.inner_text("body")
         result["raw_text"] = body_text[:3000]
-        print(f"[SHERIFF] Results page snippet: {body_text[:300]}", flush=True)
+        print(f"[SHERIFF] Results page snippet: {body_text[:400]}", flush=True)
 
-        # Click the first ticket link in results
+        # Find and click the ticket link in results
         links = await page.query_selector_all("a")
         clicked = False
         for link in links:
             href = (await link.get_attribute("href")) or ""
             txt = (await link.inner_text()).strip()
-            if str(ticket) in href or str(ticket) in txt or "ticket" in href.lower():
+            if str(ticket) in href or str(ticket) in txt:
                 try:
                     await link.click()
                     await page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -1942,6 +1924,22 @@ async def scrape_sheriff_async(county, ticket, page):
                     print(f"[SHERIFF] Clicked ticket link: {href}", flush=True)
                     break
                 except: pass
+
+        # If no link found, try direct ticket URL formats
+        if not clicked:
+            for yr in ["2025", "2024", "2023", "2022"]:
+                ticket_url = f"{base}/ticket.html?TPTYR={yr}&TPTICK={ticket}&TPSX="
+                print(f"[SHERIFF] Trying direct ticket URL: {ticket_url}", flush=True)
+                await page.goto(ticket_url, timeout=15000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(1500)
+                body_check = await page.inner_text("body")
+                # If we got real data (not just the form), stop here
+                if any(kw in body_check.upper() for kw in ["APPRAISED", "ASSESSED", "TAX AMOUNT", "TOTAL DUE"]):
+                    print(f"[SHERIFF] Found data at {ticket_url}", flush=True)
+                    break
+                if str(ticket) in body_check and "OWNER" in body_check.upper():
+                    print(f"[SHERIFF] Found ticket detail at year {yr}", flush=True)
+                    break
 
         # Get all table data from detail page
         body_text = await page.inner_text("body")
@@ -2072,7 +2070,10 @@ async def run_full_assessment(county, ticket, owner, district, map_num, parcel, 
     Master assessment engine. Runs sheriff + assessment scrapers in parallel,
     checks production DB, builds fee breakdown, synthesizes with Claude.
     """
-    import anthropic as _anthropic
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        _anthropic = None
     county_up = county.upper().replace(" COUNTY","").strip()
 
     # Formation intel (instant, hardcoded)
@@ -2214,10 +2215,13 @@ Provide:
 8. ACTION: pull deed book {book}/{page_num} to verify mineral reservation language"""
 
     try:
-        client = _anthropic.Anthropic()
-        msg = client.messages.create(model="claude-opus-4-6", max_tokens=1500,
-            messages=[{"role":"user","content":prompt}])
-        claude_assessment = msg.content[0].text
+        if not _anthropic:
+            claude_assessment = "AI assessment unavailable: anthropic package not installed on server"
+        else:
+            client = _anthropic.Anthropic()
+            msg = client.messages.create(model="claude-opus-4-6", max_tokens=1500,
+                messages=[{"role":"user","content":prompt}])
+            claude_assessment = msg.content[0].text
     except Exception as e:
         claude_assessment = f"AI assessment unavailable: {e}"
 
