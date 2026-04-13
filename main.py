@@ -1877,485 +1877,368 @@ def calculate_roi(appraised_value, min_bid_str, county, effective_acres, formati
 
 
 async def scrape_sheriff_async(county, ticket, page):
-    """Scrape sheriff tax office. Returns financial data or None."""
-    county_up = county.upper().replace(" COUNTY","").strip().lower()
-    base = f"http://{county_up}.softwaresystems.com"
-    result = {"source": "sheriff", "url": base, "success": False}
-    
+    """
+    Scrape sheriff tax office by ticket number.
+    Returns: appraised value, assessed value, actual tax, fee breakdown, book/page.
+    The softwaresystems.com platform is used by most WV counties.
+    """
+    county_low = county.upper().replace(" COUNTY","").strip().lower()
+    base = f"http://{county_low}.softwaresystems.com"
+    result = {
+        "source": "sheriff", "url": base, "success": False,
+        "appraised_value": None, "assessed_value": None,
+        "actual_tax": None, "penalty": None, "interest": None,
+        "publication_fee": None, "total_due": None,
+        "tax_years": [],  # breakdown per year
+        "book": None, "page": None,
+        "owner_address": None,
+        "table_rows": [], "raw_text": ""
+    }
+
     try:
-        print(f"[SHERIFF] Trying {base}", flush=True)
-        await page.goto(base + "/index.html", timeout=20000, wait_until="domcontentloaded")
+        print(f"[SHERIFF] Loading {base}/index.html", flush=True)
+        await page.goto(base + "/index.html", timeout=25000, wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
-        
-        # Fill ticket number
-        for sel in ["input[name=TICKET]", "input[name=TPTICK]"]:
+
+        # Fill ticket number field
+        for sel in ["input[name=TICKET]", "input[name=TPTICK]", "input[name=ticket]"]:
             try:
                 await page.fill(sel, str(ticket), timeout=3000)
-                print(f"[SHERIFF] Ticket {ticket} entered", flush=True)
+                print(f"[SHERIFF] Ticket {ticket} filled", flush=True)
                 break
             except: pass
-        
-        # Set to real estate
+
+        # Set to Real property only
         try: await page.select_option("select[name=TXTYPE]", value="R", timeout=2000)
         except: pass
-        
-        # Submit
-        for sel in ["input[type=submit]", "input[name=SEARCH]", "input[value='Search']"]:
-            try: await page.click(sel, timeout=3000); break
+
+        # Submit search
+        for sel in ["input[type=submit]", "input[name=SEARCH]", "input[value=Search]", "button[type=submit]"]:
+            try:
+                await page.click(sel, timeout=3000)
+                print(f"[SHERIFF] Search submitted", flush=True)
+                break
             except: pass
-        
-        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+
+        await page.wait_for_load_state("domcontentloaded", timeout=20000)
         await page.wait_for_timeout(2000)
-        
-        # Try to find and click ticket link in results
-        links = await page.query_selector_all("a[href*='ticket'], a[href*='Ticket'], a[href*='TICK']")
-        if links:
-            await links[0].click()
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
-            await page.wait_for_timeout(1500)
-        
-        # Parse all text for financial values
-        body = await page.inner_text("body")
-        print(f"[SHERIFF] Body excerpt: {body[:400]}", flush=True)
-        result["raw_text"] = body[:2000]
-        
-        # Extract values using robust patterns
-        patterns = {
-            "appraised": [
-                r"[Aa]ppraised\s*[Vv]alue[:\s]+\$?([\d,]+\.?\d*)",
-                r"[Aa]PPRAISED\s*VALUE[:\s]+\$?([\d,]+\.?\d*)",
-                r"[Aa]ppraised[:\s]+\$?([\d,]+\.?\d*)",
-            ],
-            "assessed": [
-                r"[Aa]ssessed\s*[Vv]alue[:\s]+\$?([\d,]+\.?\d*)",
-                r"[Aa]SSESSED\s*VALUE[:\s]+\$?([\d,]+\.?\d*)",
-                r"[Aa]ssessed[:\s]+\$?([\d,]+\.?\d*)",
-            ],
-            "tax": [
-                r"[Tt]otal\s*[Tt]ax[:\s]+\$?([\d,]+\.?\d*)",
-                r"[Tt]AX\s*[Aa]MOUNT[:\s]+\$?([\d,]+\.?\d*)",
-                r"[Aa]mount\s*[Dd]ue[:\s]+\$?([\d,]+\.?\d*)",
-            ]
-        }
-        
-        for field, pats in patterns.items():
-            for pat in pats:
-                m = re.search(pat, body)
-                if m:
-                    try:
-                        val = float(m.group(1).replace(",",""))
-                        result[field + "_value"] = val
-                        print(f"[SHERIFF] Found {field}: {val}", flush=True)
-                        result["success"] = True
-                        break
-                    except: pass
-        
-        # Also parse tables
+
+        body_text = await page.inner_text("body")
+        result["raw_text"] = body_text[:3000]
+        print(f"[SHERIFF] Results page snippet: {body_text[:300]}", flush=True)
+
+        # Click the first ticket link in results
+        links = await page.query_selector_all("a")
+        clicked = False
+        for link in links:
+            href = (await link.get_attribute("href")) or ""
+            txt = (await link.inner_text()).strip()
+            if str(ticket) in href or str(ticket) in txt or "ticket" in href.lower():
+                try:
+                    await link.click()
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    await page.wait_for_timeout(2000)
+                    clicked = True
+                    print(f"[SHERIFF] Clicked ticket link: {href}", flush=True)
+                    break
+                except: pass
+
+        # Get all table data from detail page
+        body_text = await page.inner_text("body")
+        result["raw_text"] = body_text[:4000]
+
         tables = await page.query_selector_all("table")
         all_rows = []
         for table in tables:
-            rows = await table.query_selector_all("tr")
-            for row in rows:
-                cells = await row.query_selector_all("td, th")
+            rows_els = await table.query_selector_all("tr")
+            for row_el in rows_els:
+                cells = await row_el.query_selector_all("td, th")
                 texts = [(await c.inner_text()).strip() for c in cells]
                 if any(t.strip() for t in texts):
                     all_rows.append(texts)
-        result["table_rows"] = all_rows[:30]
-        
-        # Try to extract from table if text parsing missed
-        if not result.get("appraised_value"):
-            for row in all_rows:
-                row_join = " | ".join(row).upper()
-                if "APPRAISED" in row_join:
-                    for cell in row:
-                        m = re.search(r"[\d,]+\.?\d*", cell.replace(",",""))
-                        if m:
-                            try:
-                                v = float(m.group())
-                                if v > 10:  # filter out noise
-                                    result["appraised_value"] = v
-                                    result["success"] = True
-                                    print(f"[SHERIFF] Table appraised: {v}", flush=True)
-                            except: pass
-        
-    except Exception as e:
-        result["error"] = str(e)
-        print(f"[SHERIFF] Error: {e}", flush=True)
-    
-    return result
+        result["table_rows"] = all_rows[:50]
 
+        print(f"[SHERIFF] Rows found: {len(all_rows)}", flush=True)
+        for r in all_rows[:20]:
+            print(f"  ROW: {r}", flush=True)
 
-async def scrape_assessment_async(county, owner_name, district, map_num, parcel, page):
-    """Scrape mapwv.gov assessment portal. Returns property data or None."""
-    result = {"source": "mapwv_assessment", "success": False}
-    
-    COUNTY_NUMS = {
-        "BARBOUR":"1","BERKELEY":"2","BOONE":"3","BRAXTON":"4","BROOKE":"5",
-        "CABELL":"6","CALHOUN":"7","CLAY":"8","DODDRIDGE":"9","FAYETTE":"10",
-        "GILMER":"11","GRANT":"12","GREENBRIER":"13","HAMPSHIRE":"14","HANCOCK":"15",
-        "HARDY":"16","HARRISON":"17","JACKSON":"18","JEFFERSON":"19","KANAWHA":"20",
-        "LEWIS":"21","LINCOLN":"22","LOGAN":"23","MARION":"24","MARSHALL":"25",
-        "MASON":"26","MCDOWELL":"27","MERCER":"28","MINERAL":"29","MINGO":"30",
-        "MONONGALIA":"31","MONROE":"32","MORGAN":"33","NICHOLAS":"34","OHIO":"35",
-        "PENDLETON":"36","PLEASANTS":"37","POCAHONTAS":"38","PRESTON":"39","PUTNAM":"40",
-        "RALEIGH":"41","RANDOLPH":"42","RITCHIE":"43","ROANE":"44","SUMMERS":"45",
-        "TAYLOR":"46","TUCKER":"47","TYLER":"48","UPSHUR":"49","WAYNE":"50",
-        "WEBSTER":"51","WETZEL":"52","WIRT":"53","WOOD":"54","WYOMING":"55"
-    }
-    
-    county_up = county.upper().replace(" COUNTY","").strip()
-    county_num = COUNTY_NUMS.get(county_up, "")
-    
-    try:
-        print(f"[MAPWV] Loading assessment portal for {owner_name}", flush=True)
-        await page.goto("https://www.mapwv.gov/assessment/Assessment", timeout=30000)
-        await page.wait_for_load_state("networkidle", timeout=15000)
-        await page.wait_for_timeout(1000)
-        
-        # Select county
-        if county_num:
-            selects = await page.query_selector_all("select")
-            for sel in selects:
-                try:
-                    opts = await sel.query_selector_all("option")
-                    for opt in opts:
-                        v = await opt.get_attribute("value") or ""
-                        if v == county_num:
-                            await sel.select_option(value=county_num)
-                            print(f"[MAPWV] County {county_up} selected", flush=True)
-                            break
+        # ── PARSE ALL FINANCIAL DATA ──────────────────────────────────────────
+        def extract_dollar(text):
+            """Extract first dollar amount from text."""
+            text = text.replace(",", "").replace("$", "")
+            m = re.search(r"\d+\.?\d*", text)
+            if m:
+                try: return float(m.group())
                 except: pass
-        
-        # Fill owner name - last name first works best
-        name_parts = owner_name.strip().split()
-        search_name = name_parts[-1] if name_parts else owner_name  # last name
-        
-        inputs = await page.query_selector_all("input[type=text], input:not([type])")
-        for inp in inputs:
-            iname = (await inp.get_attribute("name") or "").upper()
-            iid = (await inp.get_attribute("id") or "").upper()
-            if "OWNER" in iname or "OWNER" in iid or "NAME" in iname:
-                await inp.fill(search_name)
-                print(f"[MAPWV] Owner '{search_name}' entered in {iname or iid}", flush=True)
-                break
-        else:
-            # Try first visible text input
-            if inputs:
-                await inputs[0].fill(search_name)
-                print(f"[MAPWV] Owner entered in first input", flush=True)
-        
-        # Submit
-        for sel in ["input[type=submit]", "button[type=submit]", "input[value*='Search']"]:
-            try:
-                await page.click(sel, timeout=3000)
-                print(f"[MAPWV] Search submitted", flush=True)
-                break
-            except: pass
-        
-        await page.wait_for_load_state("networkidle", timeout=20000)
-        await page.wait_for_timeout(2000)
-        
-        body = await page.inner_text("body")
-        result["raw_text"] = body[:3000]
-        print(f"[MAPWV] Results: {body[:400]}", flush=True)
-        
-        # Look for mineral/appraised value data
-        mineral_keywords = ["MINERAL", "OIL", "GAS", "ROYALT", "MIN ", "PRODUCING"]
-        appraised_patterns = [
-            r"[Aa]ppraised\s*(?:[Vv]alue)?[:\s]+\$?([\d,]+\.?\d*)",
-            r"\$\s*([\d,]+\.?\d*)\s*[Aa]ppraised",
-        ]
-        
-        records = []
-        rows = await page.query_selector_all("tr")
-        for row in rows:
-            cells = await row.query_selector_all("td")
-            texts = [(await c.inner_text()).strip() for c in cells]
-            row_text = " | ".join(texts)
-            if any(k in row_text.upper() for k in mineral_keywords):
-                records.append({"row": texts, "text": row_text, "is_mineral": True})
-            elif any(t.strip() for t in texts):
-                records.append({"row": texts, "text": row_text, "is_mineral": False})
-        
-        result["records"] = records[:20]
-        result["mineral_records"] = [r for r in records if r["is_mineral"]]
-        
-        if records:
-            result["success"] = True
-        
-        # Try to click into a record for more detail
-        links = await page.query_selector_all("a")
-        for link in links:
-            href = await link.get_attribute("href") or ""
-            txt = (await link.inner_text()).strip().upper()
-            if any(k in txt for k in ["MINERAL","DETAIL","VIEW","PARCEL"]):
-                try:
-                    await link.click()
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                    await page.wait_for_timeout(1500)
-                    detail_body = await page.inner_text("body")
-                    result["detail_text"] = detail_body[:2000]
-                    print(f"[MAPWV] Detail page: {detail_body[:300]}", flush=True)
-                    
-                    for pat in appraised_patterns:
-                        m = re.search(pat, detail_body)
-                        if m:
-                            try:
-                                result["appraised_value"] = float(m.group(1).replace(",",""))
-                                print(f"[MAPWV] Appraised: {result['appraised_value']}", flush=True)
-                            except: pass
-                    break
-                except: pass
-        
-    except Exception as e:
-        result["error"] = str(e)
-        print(f"[MAPWV] Error: {e}", flush=True)
-    
-    return result
+            return None
 
-
-async def scrape_wvdep_wells_async(county, district, page):
-    """Scrape WVDEP for active wells in county/district."""
-    result = {"source": "wvdep_wells", "success": False, "wells": []}
-    
-    try:
-        print(f"[WVDEP] Loading well DB for {county} / {district}", flush=True)
-        await page.goto("https://tagis.dep.wv.gov/oog/", timeout=30000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+        # Parse each row looking for financial fields
+        full_text = body_text.upper()
         
-        # Select county
-        county_title = county.replace(" COUNTY","").strip().title()
-        selects = await page.query_selector_all("select")
-        for sel in selects:
-            try:
-                await sel.select_option(label=county_title, timeout=3000)
-                print(f"[WVDEP] County {county_title} selected", flush=True)
-                break
-            except: pass
-        
-        # Set Active Wells
-        for sel in selects:
-            try:
-                opts = await sel.query_selector_all("option")
-                for opt in opts:
-                    t = await opt.inner_text()
-                    if "Active Well" in t or "Horizontal 6A" in t:
-                        await sel.select_option(label=t)
+        # Appraised and assessed values
+        for row in all_rows:
+            row_text = " | ".join(row).upper()
+            vals = [extract_dollar(c) for c in row if extract_dollar(c) and extract_dollar(c) > 0]
+            
+            if "APPRAISED" in row_text and not result["appraised_value"]:
+                for v in vals:
+                    if v > 100:
+                        result["appraised_value"] = v
+                        result["assessed_value"] = round(v * 0.60)
                         break
-            except: pass
+
+            if "ASSESSED" in row_text and vals and not result["assessed_value"]:
+                for v in vals:
+                    if v > 50:
+                        result["assessed_value"] = v
+                        break
+
+            # Fee breakdown rows
+            if "TAX" in row_text and ("AMOUNT" in row_text or "DUE" in row_text or "CHARGE" in row_text):
+                for v in vals:
+                    if v > 0 and not result["actual_tax"]:
+                        result["actual_tax"] = v
+
+            if "PENALT" in row_text and vals:
+                result["penalty"] = vals[0]
+
+            if "INTEREST" in row_text and vals:
+                result["interest"] = vals[0]
+
+            if ("PUBLICATION" in row_text or "PUB FEE" in row_text or "ADVERTISING" in row_text) and vals:
+                result["publication_fee"] = vals[0]
+
+            if ("TOTAL" in row_text and "DUE" in row_text) and vals:
+                result["total_due"] = max(vals)  # largest number in total due row
+
+            # Book and page
+            if "BOOK" in row_text and "PAGE" in row_text:
+                # Try to extract book and page numbers
+                book_m = re.search(r"BOOK[:\s]+([\w\-]+)", row_text)
+                page_m = re.search(r"PAGE[:\s]+([\w\-]+)", row_text)
+                if book_m: result["book"] = book_m.group(1).strip()
+                if page_m: result["page"] = page_m.group(1).strip()
+                # Also check adjacent cells
+                for i, cell in enumerate(row):
+                    if "BOOK" in cell.upper():
+                        if i+1 < len(row) and row[i+1].strip():
+                            result["book"] = row[i+1].strip()
+                    if "PAGE" in cell.upper():
+                        if i+1 < len(row) and row[i+1].strip():
+                            result["page"] = row[i+1].strip()
+
+            # Tax year breakdown
+            year_m = re.search(r"\b(20\d{2}|19\d{2})\b", row_text)
+            if year_m and vals and "TAX" in row_text:
+                result["tax_years"].append({
+                    "year": year_m.group(1),
+                    "amount": vals[0] if vals else None,
+                    "row": row
+                })
+
+        # Also try regex on full body text for appraised value
+        if not result["appraised_value"]:
+            m = re.search(r"[Aa]ppraised[\s\w]*[:\$]?\s*\$?([\d,]+)", body_text)
+            if m:
+                try: result["appraised_value"] = float(m.group(1).replace(",",""))
+                except: pass
+
+        # Calculate actual tax from assessed value if not found directly
+        if result["assessed_value"] and not result["actual_tax"]:
+            # WV Class 3 levy ~$0.70 per $100
+            result["actual_tax"] = round(result["assessed_value"] * 0.007, 2)
+
+        # Estimate fee breakdown from min_bid if we have actual tax
+        # min_bid = actual_tax_years + penalty(5%) + interest(1%/mo) + pub_fee($50-150) + sheriff($25)
         
-        # Submit
-        for sel2 in ["input[type=submit]", "input[value*='Search']"]:
-            try: await page.click(sel2, timeout=3000); break
-            except: pass
-        
-        await page.wait_for_load_state("domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(2000)
-        
-        body = await page.inner_text("body")
-        result["raw_text"] = body[:2000]
-        print(f"[WVDEP] Wells page: {body[:400]}", flush=True)
-        
-        rows = await page.query_selector_all("tr")
-        for row in rows[:40]:
-            cells = await row.query_selector_all("td")
-            texts = [(await c.inner_text()).strip() for c in cells]
-            row_text = " | ".join(texts)
-            if any(k in row_text.upper() for k in ["GAS","OIL","ACTIVE","HORIZONTAL","MARCELLUS","H6A"]):
-                result["wells"].append({"cells": texts, "text": row_text})
-        
-        if result["wells"]:
+        if any([result["appraised_value"], result["assessed_value"], result["actual_tax"]]):
             result["success"] = True
-            print(f"[WVDEP] Found {len(result['wells'])} wells", flush=True)
-        
+            print(f"[SHERIFF] SUCCESS - Appraised: {result['appraised_value']}, Tax: {result['actual_tax']}, Book: {result['book']}/{result['page']}", flush=True)
+        else:
+            print(f"[SHERIFF] No financial data found in {len(all_rows)} rows", flush=True)
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         result["error"] = str(e)
-        print(f"[WVDEP] Error: {e}", flush=True)
-    
+        print(f"[SHERIFF] Exception: {e}", flush=True)
+
     return result
+
 
 
 async def run_full_assessment(county, ticket, owner, district, map_num, parcel, min_bid, desc):
     """
-    Main assessment engine. Runs all scrapers in parallel where possible,
-    falls back gracefully, synthesizes everything with Claude.
+    Master assessment engine. Runs sheriff + assessment scrapers in parallel,
+    checks production DB, builds fee breakdown, synthesizes with Claude.
     """
-    import anthropic
-    
+    import anthropic as _anthropic
     county_up = county.upper().replace(" COUNTY","").strip()
-    
-    # Step 1: Formation intelligence (instant, no scraping needed)
+
+    # Formation intel (instant, hardcoded)
     formation = FORMATION_DATA.get(county_up, {
         "tier": 3, "marcellus": "UNKNOWN", "utica": "UNKNOWN",
         "desc": f"No formation data for {county_up}",
         "active_operators": [], "avg_royalty_per_acre": 100,
         "drilling_outlook": "UNKNOWN"
     })
-    
-    # Step 2: Description analysis (instant)
+
+    # Description analysis (instant)
     desc_analysis = analyze_description(desc, owner)
-    
-    # Step 3: Scrape all data sources
+
+    # Check production DB and cached tax data
+    production_records = []
+    cached_tax = None
+    try: production_records = lookup_production_data(owner, county_up)
+    except Exception as e: print(f"[ASSESS] Production lookup error: {e}", flush=True)
+    if ticket:
+        try: cached_tax = get_cached_tax_data(county_up, ticket)
+        except: pass
+
     sheriff_data = {"success": False}
+    if cached_tax:
+        sheriff_data = {"success": True, "source": "cached",
+            "appraised_value": cached_tax.get("appraised_value"),
+            "assessed_value": cached_tax.get("assessed_value"),
+            "actual_tax": cached_tax.get("actual_tax"),
+            "penalty": cached_tax.get("penalty"),
+            "interest": cached_tax.get("interest"),
+            "publication_fee": cached_tax.get("publication_fee"),
+            "book": cached_tax.get("book"), "page": cached_tax.get("page")}
+        print(f"[ASSESS] Using cached tax data for ticket {ticket}", flush=True)
+
+    # Run scrapers in parallel
     assessment_data = {"success": False}
-    well_data = {"success": False, "wells": []}
-    
+    well_data_result = {"success": False, "wells": []}
+
+    from playwright.async_api import async_playwright
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True, 
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-web-security"]
-        )
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
         ctx = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            ignore_https_errors=True
-        )
-        
-        # Run sheriff and assessment in parallel (separate pages)
-        page1 = await ctx.new_page()
-        page2 = await ctx.new_page()
-        page3 = await ctx.new_page()
-        
-        print(f"[ASSESS] Starting parallel scrape for {owner} / {county}", flush=True)
-        
-        # Run all three concurrently
-        results = await asyncio.gather(
-            scrape_sheriff_async(county_up, ticket, page1),
-            scrape_assessment_async(county_up, owner, district, map_num, parcel, page2),
-            scrape_wvdep_wells_async(county_up, district, page3),
-            return_exceptions=True
-        )
-        
-        sheriff_data = results[0] if not isinstance(results[0], Exception) else {"success": False, "error": str(results[0])}
-        assessment_data = results[1] if not isinstance(results[1], Exception) else {"success": False, "error": str(results[1])}
-        well_data = results[2] if not isinstance(results[2], Exception) else {"success": False, "error": str(results[2])}
-        
+            ignore_https_errors=True)
+
+        pg2 = await ctx.new_page()
+        pg3 = await ctx.new_page()
+
+        if not cached_tax and ticket:
+            pg1 = await ctx.new_page()
+            results = await asyncio.gather(
+                scrape_sheriff_async(county_up, ticket, pg1),
+                return_exceptions=True)
+            sheriff_data = results[0] if not isinstance(results[0], Exception) else {"success": False, "error": str(results[0])}
+        # Also scrape WVDEP wells (separate from browser context)
+        try:
+            well_list = await scrape_wvdep_wells(county_up.title())
+            well_data_result = {"success": bool(well_list), "wells": [{"text": str(w)} for w in well_list[:10]]}
+        except Exception as e:
+            well_data_result = {"success": False, "wells": [], "error": str(e)}
+
         await browser.close()
-    
-    print(f"[ASSESS] Sheriff: {sheriff_data.get('success')} | Assessment: {assessment_data.get('success')} | Wells: {well_data.get('success')}", flush=True)
-    
-    # Step 4: Determine best appraised value from available sources
-    appraised_value = None
-    value_source = "none"
-    
-    if sheriff_data.get("appraised_value"):
-        appraised_value = sheriff_data["appraised_value"]
-        value_source = "sheriff_tax_record"
-    elif assessment_data.get("appraised_value"):
-        appraised_value = assessment_data["appraised_value"]
-        value_source = "state_assessment_portal"
-    
-    # Step 5: ROI calculation
-    roi = calculate_roi(appraised_value, min_bid, county_up, 
-                        desc_analysis["effective_acres"], formation)
-    
-    # Step 6: Build Claude prompt with all available data
-    wells_summary = "\n".join([w["text"][:150] for w in well_data.get("wells", [])[:10]]) or "No well data retrieved"
-    sheriff_summary = sheriff_data.get("raw_text", "")[:500] or "Sheriff data unavailable"
-    assessment_summary = assessment_data.get("raw_text", "")[:500] or "Assessment portal unavailable"
-    
-    prompt = f"""You are an expert West Virginia oil and gas mineral rights investment analyst.
-Analyze this tax lien and provide a complete investment assessment.
 
-═══ PROPERTY DATA ═══
-Owner: {owner}
-County: {county}
-District: {district}  
-Description: {desc}
-Certificate: (from WV State Auditor tax lien sale)
-Minimum Bid: {min_bid}
-Ticket #: {ticket}
+    # Store new sheriff data
+    if sheriff_data.get("success") and ticket and not cached_tax:
+        try: store_og_tax_data(county_up, ticket, sheriff_data)
+        except: pass
 
-═══ DESCRIPTION ANALYSIS ═══
-Priority: {desc_analysis['priority']} (score: {desc_analysis['priority_score']})
-Signals: {json.dumps([s['note'] for s in desc_analysis['signals']], indent=2)}
-Net Mineral Acres: {desc_analysis['effective_acres']:.2f}
+    print(f"[ASSESS] Sheriff:{sheriff_data.get('success')} Assess:{assessment_data.get('success')} Wells:{well_data_result.get('success')} Prod:{len(production_records)}", flush=True)
 
-═══ FORMATION INTELLIGENCE ({county_up}) ═══
-Tier: {formation['tier']} ({formation.get('marcellus','?')} Marcellus / {formation.get('utica','?')} Utica)
-Assessment: {formation['desc']}
-Known Active Operators: {', '.join(formation.get('active_operators', [])) or 'None on record'}
-Drilling Outlook: {formation.get('drilling_outlook', 'Unknown')}
-{('Special Note: ' + formation['special']) if formation.get('special') else ''}
+    # Best value from sources
+    appraised_value = sheriff_data.get("appraised_value") or assessment_data.get("appraised_value")
+    value_source = "sheriff" if sheriff_data.get("appraised_value") else "assessment" if assessment_data.get("appraised_value") else "none"
 
-═══ SHERIFF TAX RECORD (Source 1) ═══
-Status: {'SUCCESS' if sheriff_data.get('success') else 'FAILED/UNAVAILABLE'}
-Appraised Value: {sheriff_data.get('appraised_value', 'Not retrieved')}
-Assessed Value: {sheriff_data.get('assessed_value', 'Not retrieved')}
-Tax Amount: {sheriff_data.get('tax_value', 'Not retrieved')}
-Data: {sheriff_summary}
+    # ROI
+    roi = calculate_roi(appraised_value, min_bid, county_up, desc_analysis.get("effective_acres",0), formation)
 
-═══ STATE ASSESSMENT PORTAL (Source 2) ═══
-Status: {'SUCCESS' if assessment_data.get('success') else 'FAILED/UNAVAILABLE'}
-Appraised Value: {assessment_data.get('appraised_value', 'Not retrieved')}
-Records Found: {len(assessment_data.get('records', []))}
-Mineral Records: {len(assessment_data.get('mineral_records', []))}
-Data: {assessment_summary}
+    # Fee breakdown
+    actual_tax = sheriff_data.get("actual_tax")
+    fee_breakdown = {}
+    if actual_tax and roi.get("min_bid",0) > 0:
+        mb = roi["min_bid"]
+        fees = max(0, mb - actual_tax)
+        fee_breakdown = {
+            "actual_tax": actual_tax,
+            "fees_and_penalties": round(fees, 2),
+            "tax_pct_of_bid": round((actual_tax/mb)*100, 1),
+            "fee_pct_of_bid": round((fees/mb)*100, 1),
+            "penalty": sheriff_data.get("penalty"),
+            "interest": sheriff_data.get("interest"),
+            "publication_fee": sheriff_data.get("publication_fee"),
+        }
 
-═══ WVDEP ACTIVE WELLS (Source 3) ═══
-Status: {'SUCCESS' if well_data.get('success') else 'FAILED/UNAVAILABLE'}
-Active Wells Found in District: {len(well_data.get('wells', []))}
-Well Data:
-{wells_summary}
+    book = sheriff_data.get("book")
+    page_num = sheriff_data.get("page")
+    idx_url = f"https://www.courtplus.com/cgi-bin/docdetail.cgi?county={county_up.lower()}&book={book}&page={page_num}" if book and page_num else None
 
-═══ ROI CALCULATION ═══
-Value Source: {roi.get('data_source', 'estimate')}
-Appraised Value Used: ${roi.get('appraised_value', 'N/A'):,} if isinstance(roi.get('appraised_value'), (int,float)) else roi.get('appraised_value', 'N/A')
-Estimated Annual Royalty: ${roi.get('royalty_low', 0):,} – ${roi.get('royalty_high', 0):,}/yr
-Mid Estimate: ${roi.get('royalty_mid', 0):,}/yr
-Investment (min bid): ${roi.get('min_bid', 0):,}
-Payback Period: {roi.get('payback_years', 'N/A')} years
-5-Year ROI: {roi.get('roi_5yr_pct', 'N/A')}%
-10-Year ROI: {roi.get('roi_10yr_pct', 'N/A')}%
-ROI Rating: {roi.get('roi_rating', 'N/A')}
+    confirmed_producing = any(float(r.get("gas_mcf",0) or 0) > 0 or float(r.get("oil_bbl",0) or 0) > 0 for r in production_records)
 
-═══ YOUR ANALYSIS TASK ═══
-Provide a complete investment assessment covering:
+    prod_lines = "\n".join([f"  {r.get('year')}: Gas={r.get('gas_mcf','?')} MCF Oil={r.get('oil_bbl','?')} BBL" for r in production_records[:5]]) or "  Not found in WVDEP database"
+    wells_lines = "\n".join([w.get("text","")[:100] for w in well_data_result.get("wells",[])[:6]]) or "No well data"
 
-1. **INVESTMENT GRADE** (A+ through F) with one-line justification
-2. **WHAT YOU'RE BUYING** - Explain in plain English what this mineral interest actually is
-3. **IS IT PRODUCING?** - Based on all available evidence, is this property currently generating royalty income?
-4. **FUTURE DRILLING POTENTIAL** - Given the formation data and active operators, what is the chance of future development?
-5. **VALUATION** - What is this worth? Use all available data sources, note which are confirmed vs estimated
-6. **RISK FACTORS** - What could go wrong?
-7. **RECOMMENDATION** - BID / SKIP / INVESTIGATE FURTHER, with specific reasoning
-8. **ACTION ITEMS** - If bidding, what should the attorney verify before the auction?
+    prompt = f"""You are an expert WV oil and gas mineral rights investment analyst.
 
-Be specific, reference actual data from the sources above, and flag any conflicts between data sources.
-If data sources are unavailable, note what additional research would confirm the value."""
+PROPERTY: {owner} | {county} | District: {district}
+DESCRIPTION: {desc}
+MIN BID: {min_bid}  TICKET: {ticket}
 
-    # Step 7: Claude synthesis
-    client = anthropic.Anthropic()
-    msg = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    claude_assessment = msg.content[0].text
-    
+FEE BREAKDOWN:
+  Actual property tax: ${actual_tax or "not retrieved"}
+  Publication/penalty fees: ${fee_breakdown.get("fees_and_penalties","?") if fee_breakdown else "not calculated"}
+  Tax is {fee_breakdown.get("tax_pct_of_bid","?")}% of bid | Fees are {fee_breakdown.get("fee_pct_of_bid","?")}%
+
+ASSESSED VALUES (source: {value_source}):
+  Appraised: ${appraised_value or "not retrieved"}
+  Assessed (60%): ${roi.get("assessed_value","?")}
+  Book/Page: {book or "not found"}/{page_num or "not found"}
+
+WVDEP PRODUCTION FOR THIS OWNER:
+{prod_lines}
+{"*** CONFIRMED PRODUCING - active royalty income! ***" if confirmed_producing else ""}
+
+FORMATION: {county_up} Tier {formation.get("tier")} - {formation.get("marcellus","?")} Marcellus
+{formation.get("desc","")}
+
+WELLS IN DISTRICT:
+{wells_lines}
+
+EST ROI: Bid ${roi.get("min_bid",0):,.2f} | Royalty est ${roi.get("royalty_low",0):,.0f}-${roi.get("royalty_high",0):,.0f}/yr | Payback {roi.get("payback_years","?")} yrs | 10yr ROI {roi.get("roi_10yr_pct","?")}%
+
+Provide:
+1. INVESTMENT GRADE (A+ to F)
+2. IS IT PRODUCING? (use production DB evidence - be specific about MCF numbers)
+3. FEE BREAKDOWN - what % of bid is real tax vs fees?
+4. WHAT YOU'RE BUYING - plain English
+5. VALUATION - appraised vs what you pay
+6. DRILLING POTENTIAL - formation + operators
+7. RECOMMENDATION: BID / SKIP / INVESTIGATE
+8. ACTION: pull deed book {book}/{page_num} to verify mineral reservation language"""
+
+    try:
+        client = _anthropic.Anthropic()
+        msg = client.messages.create(model="claude-opus-4-6", max_tokens=1500,
+            messages=[{"role":"user","content":prompt}])
+        claude_assessment = msg.content[0].text
+    except Exception as e:
+        claude_assessment = f"AI assessment unavailable: {e}"
+
     return {
-        "success": True,
-        "county": county_up,
-        "ticket": ticket,
-        "owner": owner,
-        "min_bid": min_bid,
-        "priority": desc_analysis["priority"],
-        "priority_score": desc_analysis["priority_score"],
-        "signals": desc_analysis["signals"],
-        "formation": formation,
-        "roi": roi,
+        "success": True, "county": county_up, "ticket": ticket, "owner": owner, "min_bid": min_bid,
+        "priority": desc_analysis.get("priority","LOW"),
+        "priority_score": desc_analysis.get("priority_score",0),
+        "signals": desc_analysis.get("signals",[]),
+        "formation": formation, "roi": roi,
+        "fee_breakdown": fee_breakdown,
+        "book": book, "page": page_num, "idx_url": idx_url,
+        "confirmed_producing": confirmed_producing,
+        "production_records": production_records,
         "sources": {
-            "sheriff": {"success": sheriff_data.get("success"), "appraised": sheriff_data.get("appraised_value")},
-            "assessment": {"success": assessment_data.get("success"), "appraised": assessment_data.get("appraised_value")},
-            "wells": {"success": well_data.get("success"), "count": len(well_data.get("wells",[]))}
+            "sheriff": {"success": sheriff_data.get("success"), "appraised": sheriff_data.get("appraised_value"), "source": sheriff_data.get("source","scraped")},
+            "assessment": {"success": assessment_data.get("success")},
+            "wells": {"success": well_data_result.get("success"), "count": len(well_data_result.get("wells",[]))}
         },
-        "raw_data": {
-            "sheriff": sheriff_data,
-            "assessment": assessment_data,
-            "wells": well_data
-        },
+        "raw_data": {"sheriff": sheriff_data},
         "assessment": claude_assessment
     }
-
 
 def run_assessment(county, ticket, owner, district, map_num, parcel, min_bid, desc):
     """Synchronous entry point."""
@@ -2375,6 +2258,158 @@ def run_assessment(county, ticket, owner, district, map_num, parcel, min_bid, de
 
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+# O&G DATA BANK - Download WVDEP production data into Supabase
+# ═══════════════════════════════════════════════════════════════════
+SUPABASE_URL_DB = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
+SUPABASE_KEY_DB = "sb_publishable_X1nUMQ4GQfiPj-AsVvigwQ_7g3d4i95"
+BANK_BUILD_STATUS = {"state": "idle", "progress": "", "records": 0, "errors": []}
+
+WVDEP_PRODUCTION_URLS = {
+    2024: "https://apps.dep.wv.gov/Documents/OOG/ProductionReports/2020-2029/2024Production.xlsx",
+    2023: "https://apps.dep.wv.gov/Documents/OOG/ProductionReports/2020-2029/2023Production.xlsx",
+    2022: "https://apps.dep.wv.gov/Documents/OOG/ProductionReports/2020-2029/2022Production.xlsx",
+}
+
+
+async def build_production_data_bank():
+    """Download WVDEP annual production Excel files and load into Supabase."""
+    import openpyxl, io, json, urllib.request, urllib.error
+    global BANK_BUILD_STATUS
+    BANK_BUILD_STATUS = {"state": "running", "progress": "Starting...", "records": 0, "errors": []}
+    total = 0
+
+    for year, url in WVDEP_PRODUCTION_URLS.items():
+        try:
+            BANK_BUILD_STATUS["progress"] = f"Downloading {year}..."
+            print(f"[BANK] Downloading {year}: {url}", flush=True)
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                excel_bytes = r.read()
+            print(f"[BANK] {year} downloaded: {len(excel_bytes)} bytes", flush=True)
+
+            wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), read_only=True, data_only=True)
+            ws = wb.active
+            headers = [str(c.value or "").strip().upper() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+            print(f"[BANK] {year} headers: {headers[:12]}", flush=True)
+
+            def col_idx(names):
+                for n in names:
+                    for i, h in enumerate(headers):
+                        if n.upper() in h: return i
+                return None
+
+            api_i  = col_idx(["API"])
+            cty_i  = col_idx(["COUNTY"])
+            own_i  = col_idx(["OWNER","OPERATOR","COMPANY","LESSEE"])
+            gas_i  = col_idx(["GAS","MCF"])
+            oil_i  = col_idx(["OIL","BBL"])
+            dst_i  = col_idx(["DISTRICT","DIST"])
+
+            batch = []
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not any(row): continue
+                def sv(i): return str(row[i] or "").strip() if i is not None and i < len(row) else ""
+                def nv(i):
+                    try: return float(row[i] or 0) if i is not None and i < len(row) else 0
+                    except: return 0
+                rec = {
+                    "api_number": sv(api_i), "county": sv(cty_i).upper(),
+                    "district": sv(dst_i).upper(), "owner_name": sv(own_i).upper(),
+                    "year": year, "gas_mcf": nv(gas_i), "oil_bbl": nv(oil_i),
+                    "operator": sv(own_i).upper()
+                }
+                if rec["county"] or rec["api_number"]:
+                    batch.append(rec)
+                if len(batch) >= 200:
+                    _supabase_insert("og_production", batch)
+                    total += len(batch)
+                    BANK_BUILD_STATUS["records"] = total
+                    BANK_BUILD_STATUS["progress"] = f"{year}: {total} records"
+                    batch = []
+            if batch:
+                _supabase_insert("og_production", batch)
+                total += len(batch)
+
+            print(f"[BANK] {year} done", flush=True)
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            BANK_BUILD_STATUS["errors"].append(f"{year}: {e}")
+
+    BANK_BUILD_STATUS["state"] = "complete"
+    BANK_BUILD_STATUS["progress"] = f"Done. {total} records loaded."
+    BANK_BUILD_STATUS["records"] = total
+    print(f"[BANK] Complete: {total} records", flush=True)
+
+
+def _supabase_insert(table, batch):
+    """Insert batch into Supabase table."""
+    import json, urllib.request, urllib.error
+    data = json.dumps(batch).encode()
+    req = urllib.request.Request(
+        f"{SUPABASE_URL_DB}/rest/v1/{table}",
+        data=data,
+        headers={"apikey": SUPABASE_KEY_DB, "Authorization": f"Bearer {SUPABASE_KEY_DB}",
+                 "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30): pass
+    except urllib.error.HTTPError as e:
+        print(f"[DB] Insert {table} error: {e.code} {e.read()[:300]}", flush=True)
+
+
+def lookup_production_data(owner_name, county):
+    """Look up production data for owner from Supabase."""
+    import json, urllib.request, urllib.parse
+    name_parts = owner_name.upper().strip().split()
+    search = name_parts[0] if name_parts else owner_name.upper()
+    county_up = county.upper().replace(" COUNTY","").strip()
+    try:
+        qs = f"owner_name=ilike.*{urllib.parse.quote(search)}*&county=eq.{urllib.parse.quote(county_up)}&order=year.desc&limit=10"
+        req = urllib.request.Request(
+            f"{SUPABASE_URL_DB}/rest/v1/og_production?{qs}",
+            headers={"apikey": SUPABASE_KEY_DB, "Authorization": f"Bearer {SUPABASE_KEY_DB}"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        print(f"[LOOKUP] {e}", flush=True)
+        return []
+
+
+def store_og_tax_data(county, ticket, data):
+    """Store sheriff scrape result in og_tax_data table."""
+    import json
+    record = {
+        "county": county.upper().replace(" COUNTY","").strip(), "ticket": str(ticket),
+        "appraised_value": data.get("appraised_value"), "assessed_value": data.get("assessed_value"),
+        "actual_tax": data.get("actual_tax"), "penalty": data.get("penalty"),
+        "interest": data.get("interest"), "publication_fee": data.get("publication_fee"),
+        "total_due": data.get("total_due"), "book": data.get("book"), "page": data.get("page"),
+    }
+    _supabase_insert("og_tax_data", [record])
+
+
+def get_cached_tax_data(county, ticket):
+    """Check if we already have sheriff data for this ticket."""
+    import json, urllib.request, urllib.parse
+    county_up = county.upper().replace(" COUNTY","").strip()
+    try:
+        qs = f"county=eq.{urllib.parse.quote(county_up)}&ticket=eq.{urllib.parse.quote(str(ticket))}&limit=1"
+        req = urllib.request.Request(
+            f"{SUPABASE_URL_DB}/rest/v1/og_tax_data?{qs}",
+            headers={"apikey": SUPABASE_KEY_DB, "Authorization": f"Bearer {SUPABASE_KEY_DB}"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            rows = json.loads(r.read())
+            return rows[0] if rows else None
+    except:
+        return None
+
+# ═══════════════════════════════════════════════════════════════════
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
@@ -2424,6 +2459,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond({"error": "county and ticket required"})
             result = run_sheriff_lookup(county, ticket, tax_year=tax_year)
             return self.respond(result)
+
+
+        if path == "/build-data-bank":
+            """Download WVDEP production data and load into Supabase."""
+            import threading
+            def run_build():
+                asyncio.run(build_production_data_bank())
+            t = threading.Thread(target=run_build, daemon=True)
+            t.start()
+            return self.respond({"status": "started", "message": "Building O&G data bank in background. Check /bank-status for progress."})
+
+        if path == "/bank-status":
+            return self.respond({"status": BANK_BUILD_STATUS})
 
         if path == "/og-intel":
             from urllib.parse import parse_qs, urlparse
