@@ -1880,9 +1880,8 @@ def calculate_roi(appraised_value, min_bid_str, county, effective_acres, formati
 
 async def scrape_sheriff_async(county, ticket, page):
     """
-    Scrape sheriff tax office by ticket number.
-    Returns: appraised value, assessed value, actual tax, fee breakdown, book/page.
-    The softwaresystems.com platform is used by most WV counties.
+    Scrape sheriff tax office by ticket number + year 2024.
+    Uses Search by Ticket button - the correct button for ticket searches.
     """
     county_low = county.upper().replace(" COUNTY","").strip().lower()
     base = f"http://{county_low}.softwaresystems.com"
@@ -1891,60 +1890,74 @@ async def scrape_sheriff_async(county, ticket, page):
         "appraised_value": None, "assessed_value": None,
         "actual_tax": None, "penalty": None, "interest": None,
         "publication_fee": None, "total_due": None,
-        "tax_years": [],  # breakdown per year
-        "book": None, "page": None,
-        "owner_address": None,
-        "table_rows": [], "raw_text": ""
+        "tax_years": [], "book": None, "page": None,
+        "owner_address": None, "table_rows": [], "raw_text": ""
     }
 
     try:
-        # Navigate directly to results URL - bypass form submission issues
-        # Software Systems Inc format: results.html with GET params
-        results_url = f"{base}/results.html?TAXYR=&TICKET={ticket}&SUFFIX=&DISTRICT=0&MAP=0000&PARCEL=0000&SUBPARCEL=0000&TAXNAME=&ACCOUNT=&TXTYPE=R&PAIDUNPAID=B&SEARCH=Search"
-        print(f"[SHERIFF] Loading results directly: {results_url}", flush=True)
-        await page.goto(results_url, timeout=25000, wait_until="domcontentloaded")
+        print(f"[SHERIFF] Loading {base}/index.html", flush=True)
+        await page.goto(base + "/index.html", timeout=25000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+
+        # Fill Tax Year = 2024
+        for sel in ["input[name=TAXYR]", "input[name=TPTYR]"]:
+            try:
+                await page.fill(sel, "2024", timeout=3000)
+                print(f"[SHERIFF] Year 2024 filled", flush=True)
+                break
+            except: pass
+
+        # Fill Ticket Number
+        for sel in ["input[name=TICKET]", "input[name=TPTICK]"]:
+            try:
+                await page.fill(sel, str(ticket), timeout=3000)
+                print(f"[SHERIFF] Ticket {ticket} filled", flush=True)
+                break
+            except: pass
+
+        # Click "Search by Ticket" button specifically - NOT the generic submit
+        clicked = False
+        buttons = await page.query_selector_all("input[type=submit], input[type=button], button")
+        for btn in buttons:
+            val = ((await btn.get_attribute("value")) or "").upper()
+            txt = ((await btn.inner_text()) or "").upper()
+            if "TICKET" in val or "TICKET" in txt:
+                await btn.click()
+                clicked = True
+                print(f"[SHERIFF] Clicked Search by Ticket button", flush=True)
+                break
+
+        if not clicked:
+            # fallback - click first submit
+            for sel in ["input[type=submit]", "input[name=SEARCH]"]:
+                try:
+                    await page.click(sel, timeout=3000)
+                    print(f"[SHERIFF] Clicked fallback submit", flush=True)
+                    break
+                except: pass
+
+        await page.wait_for_load_state("domcontentloaded", timeout=20000)
         await page.wait_for_timeout(2000)
 
         body_text = await page.inner_text("body")
-        result["raw_text"] = body_text[:3000]
-        print(f"[SHERIFF] Results page snippet: {body_text[:400]}", flush=True)
+        result["raw_text"] = body_text[:4000]
+        print(f"[SHERIFF] Results: {body_text[:400]}", flush=True)
 
-        # Find and click the ticket link in results
+        # Click the ticket link in results to get detail page
         links = await page.query_selector_all("a")
-        clicked = False
         for link in links:
             href = (await link.get_attribute("href")) or ""
             txt = (await link.inner_text()).strip()
             if str(ticket) in href or str(ticket) in txt:
-                try:
-                    await link.click()
-                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                    await page.wait_for_timeout(2000)
-                    clicked = True
-                    print(f"[SHERIFF] Clicked ticket link: {href}", flush=True)
-                    break
-                except: pass
+                await link.click()
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(2000)
+                body_text = await page.inner_text("body")
+                result["raw_text"] = body_text[:4000]
+                print(f"[SHERIFF] Detail page loaded: {body_text[:300]}", flush=True)
+                break
 
-        # If no link found, try direct ticket URL formats
-        if not clicked:
-            for yr in ["2025", "2024", "2023", "2022"]:
-                ticket_url = f"{base}/ticket.html?TPTYR={yr}&TPTICK={ticket}&TPSX="
-                print(f"[SHERIFF] Trying direct ticket URL: {ticket_url}", flush=True)
-                await page.goto(ticket_url, timeout=15000, wait_until="domcontentloaded")
-                await page.wait_for_timeout(1500)
-                body_check = await page.inner_text("body")
-                # If we got real data (not just the form), stop here
-                if any(kw in body_check.upper() for kw in ["APPRAISED", "ASSESSED", "TAX AMOUNT", "TOTAL DUE"]):
-                    print(f"[SHERIFF] Found data at {ticket_url}", flush=True)
-                    break
-                if str(ticket) in body_check and "OWNER" in body_check.upper():
-                    print(f"[SHERIFF] Found ticket detail at year {yr}", flush=True)
-                    break
-
-        # Get all table data from detail page
-        body_text = await page.inner_text("body")
-        result["raw_text"] = body_text[:4000]
-
+        # Get all table rows from detail page
         tables = await page.query_selector_all("table")
         all_rows = []
         for table in tables:
@@ -1957,118 +1970,59 @@ async def scrape_sheriff_async(county, ticket, page):
         result["table_rows"] = all_rows[:50]
 
         print(f"[SHERIFF] Rows found: {len(all_rows)}", flush=True)
-        for r in all_rows[:20]:
+        for r in all_rows[:25]:
             print(f"  ROW: {r}", flush=True)
 
-        # ── PARSE SOFTWARESYSTEMS.COM TICKET PAGE FORMAT ─────────────────────
-        # Format is key-value pairs in adjacent cells:
-        # ['Book:', '0397', 'Page:', '0533', '']
-        # ['Appraised Value:', '$12,500', 'Assessed Value:', '$7,500']
-        # ['Total Tax:', '$87.50', 'Penalty:', '$4.38', 'Interest:', '$10.50']
-
+        # Parse key->value cell pairs
         def extract_dollar(text):
             t = str(text).replace(",","").replace("$","").strip()
             m = re.search(r"\d+\.?\d*", t)
             try: return float(m.group()) if m else None
             except: return None
 
-        # Parse key-value cell pairs
         for row in all_rows:
             cells = [str(c).strip() for c in row]
-            row_text = " | ".join(cells).upper()
-
-            # Walk cells as key->value pairs
             i = 0
             while i < len(cells) - 1:
-                key = cells[i].upper().rstrip(':').strip()
+                key = cells[i].upper().rstrip(":").strip()
                 val = cells[i+1].strip() if i+1 < len(cells) else ""
-
-                if key == "BOOK" and val and val != "":
+                if key == "BOOK" and val:
                     result["book"] = val.lstrip("0") or val
-                elif key == "PAGE" and val and val != "":
+                elif key == "PAGE" and val:
                     result["page"] = val.lstrip("0") or val
-                elif key in ("APPRAISED VALUE", "APPRAISED") and val:
+                elif "APPRAISED" in key and val:
                     v = extract_dollar(val)
                     if v and v > 0: result["appraised_value"] = v
-                elif key in ("ASSESSED VALUE", "ASSESSED") and val:
+                elif "ASSESSED" in key and val:
                     v = extract_dollar(val)
                     if v and v > 0: result["assessed_value"] = v
-                elif key in ("TOTAL TAX", "TAX AMOUNT", "TAX DUE", "CURRENT TAX") and val:
+                elif key in ("TOTAL TAX","TAX AMOUNT","CURRENT TAX","TAX DUE") and val:
                     v = extract_dollar(val)
                     if v and v > 0 and not result["actual_tax"]: result["actual_tax"] = v
-                elif key in ("PENALTY", "PENALT") and val:
+                elif "PENALT" in key and val:
                     v = extract_dollar(val)
                     if v: result["penalty"] = v
                 elif key == "INTEREST" and val:
                     v = extract_dollar(val)
                     if v: result["interest"] = v
-                elif key in ("PUBLICATION FEE", "PUB FEE", "ADVERTISING FEE") and val:
+                elif "PUBLICATION" in key and val:
                     v = extract_dollar(val)
                     if v: result["publication_fee"] = v
-                elif key in ("TOTAL DUE", "AMOUNT DUE", "TOTAL AMOUNT DUE") and val:
+                elif "TOTAL DUE" in key and val:
                     v = extract_dollar(val)
                     if v: result["total_due"] = v
-                elif key == "OWNER NAME" and val and not result["owner_address"]:
-                    result["owner_address"] = val
-                elif key == "PROPERTY" and val:
-                    if not result.get("property_desc"):
-                        result["property_desc"] = val
                 i += 1
 
-            # Also check full row text for dollar amounts near keywords
-            if "APPRAISED" in row_text and not result["appraised_value"]:
-                for cell in cells:
-                    v = extract_dollar(cell)
-                    if v and v > 100: result["appraised_value"] = v; break
-
-            if "ASSESSED" in row_text and not result["assessed_value"]:
-                for cell in cells:
-                    v = extract_dollar(cell)
-                    if v and v > 50: result["assessed_value"] = v; break
-
-            # Tax year rows - look for year + dollar amount
-            year_m = re.search(r"(20\d{2})", row_text)
-            if year_m and ("TAX" in row_text or "AMOUNT" in row_text):
-                for cell in cells:
-                    v = extract_dollar(cell)
-                    if v and v > 0:
-                        result["tax_years"].append({"year": year_m.group(1), "amount": v})
-                        if not result["actual_tax"]: result["actual_tax"] = v
-                        break
-
-        # Full body text fallback for appraised value
-        if not result["appraised_value"]:
-            for pat in [r"[Aa]ppraised\s*[Vv]alue[:\s]+\$?([\d,]+)", 
-                        r"[Aa]PPRAISED[:\s]+\$?([\d,]+)"]:
-                m = re.search(pat, body_text)
-                if m:
-                    try: result["appraised_value"] = float(m.group(1).replace(",","")); break
-                    except: pass
-
-        # Calculate assessed if missing
-        if result["appraised_value"] and not result["assessed_value"]:
-            result["assessed_value"] = round(result["appraised_value"] * 0.60)
-
-        # Estimate actual tax from assessed value if not found
-        if result["assessed_value"] and not result["actual_tax"]:
-            result["actual_tax"] = round(result["assessed_value"] * 0.007, 2)
-
-        print(f"[SHERIFF] Parsed - Appraised:{result['appraised_value']} Assessed:{result['assessed_value']} Tax:{result['actual_tax']} Book:{result['book']}/{result['page']}", flush=True)
-        
-        if any([result["appraised_value"], result["assessed_value"], result["actual_tax"]]):
+        if result["appraised_value"] or result["book"]:
             result["success"] = True
-            print(f"[SHERIFF] SUCCESS - Appraised: {result['appraised_value']}, Tax: {result['actual_tax']}, Book: {result['book']}/{result['page']}", flush=True)
-        else:
-            print(f"[SHERIFF] No financial data found in {len(all_rows)} rows", flush=True)
+
+        print(f"[SHERIFF] Parsed - Appraised:{result['appraised_value']} Tax:{result['actual_tax']} Book:{result['book']}/{result['page']}", flush=True)
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         result["error"] = str(e)
-        print(f"[SHERIFF] Exception: {e}", flush=True)
 
     return result
-
 
 
 async def run_full_assessment(county, ticket, owner, district, map_num, parcel, min_bid, desc):
@@ -2442,6 +2396,257 @@ def get_cached_tax_data(county, ticket):
         return None
 
 # ═══════════════════════════════════════════════════════════════════
+
+# ── SHERIFF TAX SCRAPER v2 ────────────────────────────────────────────────────
+# Correct logic:
+# - Certificate year 2025 → search tax ticket year 2024 (one year behind)
+# - Certificate year 2026 → search tax ticket year 2025
+# - Always use "Search by Ticket" button specifically
+# - Verify owner name matches auction PDF name before using data
+
+def get_ticket_year_from_cert(cert):
+    """Extract cert year and return the tax ticket year (one year behind)."""
+    import re
+    m = re.match(r"(\d{4})-C-", str(cert))
+    if m:
+        cert_year = int(m.group(1))
+        return cert_year - 1  # 2025 cert = 2024 ticket year
+    return 2024  # default fallback
+
+def names_match(auction_name, sheriff_name, threshold=0.6):
+    """
+    Compare auction PDF name with sheriff result name.
+    Returns True if they are likely the same person/entity.
+    Uses first significant word match as minimum requirement.
+    """
+    if not auction_name or not sheriff_name:
+        return False
+    
+    # Clean both names
+    a = auction_name.upper().strip()
+    s = sheriff_name.upper().strip()
+    
+    # Exact match
+    if a == s: return True
+    
+    # Check if first word (last name) matches
+    a_words = [w for w in re.split(r'[\s,]+', a) if len(w) > 2]
+    s_words = [w for w in re.split(r'[\s,]+', s) if len(w) > 2]
+    
+    if not a_words or not s_words: return False
+    
+    # First significant word must match (last name)
+    if a_words[0] == s_words[0]: return True
+    
+    # Check word overlap
+    a_set = set(a_words)
+    s_set = set(s_words)
+    overlap = len(a_set & s_set)
+    total = len(a_set | s_set)
+    
+    return overlap / total >= threshold if total > 0 else False
+
+
+async def scrape_sheriff_v2(county, ticket, cert, auction_name, page):
+    """
+    Scrape sheriff tax system using correct year and Search by Ticket button.
+    Verifies owner name matches auction PDF name.
+    
+    Returns dict with:
+    - success: bool
+    - name_match: bool (sheriff name matches auction name)
+    - sheriff_name: name found on sheriff site
+    - assessed_gross: land gross value
+    - assessed_net: land net value  
+    - annual_tax: total annual tax (2x the half-year amount)
+    - book: deed book number
+    - page: deed page number
+    - is_nonproducing: True if assessed at $100/acre (state standard for non-producing)
+    - map: map number
+    - parcel: parcel number
+    - tax_class: tax class (3 = mineral)
+    """
+    county_low = county.upper().replace(" COUNTY","").strip().lower()
+    base = f"http://{county_low}.softwaresystems.com"
+    
+    # Calculate correct ticket year from cert number
+    ticket_year = get_ticket_year_from_cert(cert)
+    
+    result = {
+        "source": "sheriff_v2",
+        "url": base,
+        "success": False,
+        "name_match": False,
+        "name_match_note": "",
+        "sheriff_name": None,
+        "ticket_year_searched": ticket_year,
+        "assessed_gross": None,
+        "assessed_net": None,
+        "half_year_tax": None,
+        "annual_tax": None,
+        "book": None,
+        "page": None,
+        "map": None,
+        "parcel": None,
+        "tax_class": None,
+        "is_nonproducing": None,
+        "property_desc": None,
+        "address": None,
+    }
+    
+    try:
+        print(f"[SHERIFFv2] {base} ticket={ticket} year={ticket_year}", flush=True)
+        await page.goto(base + "/index.html", timeout=25000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+
+        # Fill Tax Year
+        for sel in ["input[name=TAXYR]", "input[name=TPTYR]"]:
+            try:
+                await page.fill(sel, str(ticket_year), timeout=3000)
+                print(f"[SHERIFFv2] Year {ticket_year} filled", flush=True)
+                break
+            except: pass
+
+        # Fill Ticket Number
+        for sel in ["input[name=TICKET]", "input[name=TPTICK]"]:
+            try:
+                await page.fill(sel, str(ticket), timeout=3000)
+                print(f"[SHERIFFv2] Ticket {ticket} filled", flush=True)
+                break
+            except: pass
+
+        # Click "Search by Ticket" button specifically
+        clicked = False
+        buttons = await page.query_selector_all("input[type=submit], input[type=button], button")
+        for btn in buttons:
+            val = ((await btn.get_attribute("value")) or "").upper()
+            txt = ((await btn.inner_text()) or "").upper()
+            if "TICKET" in val or "TICKET" in txt:
+                await btn.click()
+                clicked = True
+                print(f"[SHERIFFv2] Clicked Search by Ticket", flush=True)
+                break
+        
+        if not clicked:
+            for sel in ["input[type=submit]"]:
+                try: await page.click(sel, timeout=3000); break
+                except: pass
+
+        await page.wait_for_load_state("domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+
+        body_text = await page.inner_text("body")
+        print(f"[SHERIFFv2] Results: {body_text[:300]}", flush=True)
+
+        # Click the ticket detail link
+        links = await page.query_selector_all("a")
+        for link in links:
+            href = (await link.get_attribute("href")) or ""
+            txt = (await link.inner_text()).strip()
+            if str(ticket) in href or str(ticket) in txt or "Details" in txt:
+                await link.click()
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(2000)
+                body_text = await page.inner_text("body")
+                print(f"[SHERIFFv2] Detail loaded: {body_text[:400]}", flush=True)
+                break
+
+        # Parse all table cells as key->value pairs
+        tables = await page.query_selector_all("table")
+        all_rows = []
+        for table in tables:
+            rows_els = await table.query_selector_all("tr")
+            for row_el in rows_els:
+                cells = await row_el.query_selector_all("td, th")
+                texts = [(await c.inner_text()).strip() for c in cells]
+                if any(t.strip() for t in texts):
+                    all_rows.append(texts)
+
+        print(f"[SHERIFFv2] {len(all_rows)} rows", flush=True)
+        for r in all_rows[:30]:
+            print(f"  {r}", flush=True)
+
+        def get_num(text):
+            t = str(text).replace(",","").replace("$","").strip()
+            m = re.search(r"\d+\.?\d*", t)
+            try: return float(m.group()) if m else None
+            except: return None
+
+        # Walk rows as key->value pairs
+        for row in all_rows:
+            cells = [str(c).strip() for c in row]
+            row_text = " | ".join(cells).upper()
+
+            # Walk adjacent cells
+            i = 0
+            while i < len(cells) - 1:
+                key = cells[i].upper().rstrip(":").strip()
+                val = cells[i+1].strip() if i+1 < len(cells) else ""
+
+                if "OWNER NAME" in key and val:
+                    result["sheriff_name"] = val.replace("\n"," ").strip()
+                elif key == "BOOK" and val:
+                    result["book"] = val.lstrip("0") or val
+                elif key == "PAGE" and val:
+                    result["page"] = val.lstrip("0") or val
+                elif key == "MAP" and val:
+                    result["map"] = val.strip()
+                elif "PARCEL" in key and val:
+                    result["parcel"] = val.strip()
+                elif "TAX CLASS" in key and val:
+                    result["tax_class"] = val.strip()
+                elif "PROPERTY" in key and val and not result["property_desc"]:
+                    result["property_desc"] = val.strip()
+                elif "ADDRESS" in key and val:
+                    result["address"] = val.strip()
+                i += 1
+
+            # Parse ASSESSMENT table rows
+            # Format: Land | 100 | 100 | 1.25
+            #         Building | 0 | 0 |
+            #         Total | 100 | 100 | 1.25
+            if "LAND" in row_text and len(cells) >= 3:
+                nums = [get_num(c) for c in cells if get_num(c) is not None]
+                if len(nums) >= 2:
+                    result["assessed_gross"] = nums[0]
+                    result["assessed_net"] = nums[1]
+                    if len(nums) >= 3:
+                        result["half_year_tax"] = nums[2]
+
+            if "TOTAL" in row_text and len(cells) >= 3:
+                nums = [get_num(c) for c in cells if get_num(c) is not None]
+                if len(nums) >= 3:
+                    result["half_year_tax"] = nums[2]  # TAX (1/2 Year)
+
+        # Calculate annual tax
+        if result["half_year_tax"]:
+            result["annual_tax"] = round(result["half_year_tax"] * 2, 2)
+
+        # Determine if non-producing ($100/acre = state standard for non-producing minerals)
+        if result["assessed_gross"] is not None:
+            result["is_nonproducing"] = result["assessed_gross"] <= 100
+
+        # Verify name match
+        if result["sheriff_name"] and auction_name:
+            match = names_match(auction_name, result["sheriff_name"])
+            result["name_match"] = match
+            if match:
+                result["name_match_note"] = f"✓ Names match: auction=\"{auction_name}\" sheriff=\"{result['sheriff_name']}\""
+            else:
+                result["name_match_note"] = f"⚠️ Name mismatch: auction=\"{auction_name}\" sheriff=\"{result['sheriff_name']}\" — verify manually"
+
+        if result["book"] or result["assessed_gross"] is not None:
+            result["success"] = True
+
+        print(f"[SHERIFFv2] Done - Match:{result['name_match']} Gross:{result['assessed_gross']} Tax:{result['annual_tax']} Book:{result['book']}/{result['page']}", flush=True)
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        result["error"] = str(e)
+
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
@@ -2479,6 +2684,35 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/wvsao-sync":
             return self.respond(sync_wvsao_dates())
+
+        if path == "/sheriff-v2":
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            get = lambda k: qs.get(k, [''])[0]
+            county = get('county')
+            ticket = get('ticket')
+            cert   = get('cert')
+            owner  = get('owner')
+            if not county or not ticket:
+                return self.respond({"error": "county and ticket required"})
+            try:
+                from playwright.async_api import async_playwright
+                import asyncio
+                async def _run():
+                    async with async_playwright() as p:
+                        browser = await p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+                        page = await browser.new_page()
+                        result = await scrape_sheriff_v2(county, ticket, cert, owner, page)
+                        await browser.close()
+                        return result
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(_run())
+                loop.close()
+                return self.respond(result)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                return self.respond({"error": str(e)})
 
         if path == "/sheriff-lookup":
             from urllib.parse import parse_qs, urlparse
