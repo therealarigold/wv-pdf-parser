@@ -1960,94 +1960,100 @@ async def scrape_sheriff_async(county, ticket, page):
         for r in all_rows[:20]:
             print(f"  ROW: {r}", flush=True)
 
-        # ── PARSE ALL FINANCIAL DATA ──────────────────────────────────────────
+        # ── PARSE SOFTWARESYSTEMS.COM TICKET PAGE FORMAT ─────────────────────
+        # Format is key-value pairs in adjacent cells:
+        # ['Book:', '0397', 'Page:', '0533', '']
+        # ['Appraised Value:', '$12,500', 'Assessed Value:', '$7,500']
+        # ['Total Tax:', '$87.50', 'Penalty:', '$4.38', 'Interest:', '$10.50']
+
         def extract_dollar(text):
-            """Extract first dollar amount from text."""
-            text = text.replace(",", "").replace("$", "")
-            m = re.search(r"\d+\.?\d*", text)
-            if m:
-                try: return float(m.group())
-                except: pass
-            return None
+            t = str(text).replace(",","").replace("$","").strip()
+            m = re.search(r"\d+\.?\d*", t)
+            try: return float(m.group()) if m else None
+            except: return None
 
-        # Parse each row looking for financial fields
-        full_text = body_text.upper()
-        
-        # Appraised and assessed values
+        # Parse key-value cell pairs
         for row in all_rows:
-            row_text = " | ".join(row).upper()
-            vals = [extract_dollar(c) for c in row if extract_dollar(c) and extract_dollar(c) > 0]
-            
+            cells = [str(c).strip() for c in row]
+            row_text = " | ".join(cells).upper()
+
+            # Walk cells as key->value pairs
+            i = 0
+            while i < len(cells) - 1:
+                key = cells[i].upper().rstrip(':').strip()
+                val = cells[i+1].strip() if i+1 < len(cells) else ""
+
+                if key == "BOOK" and val and val != "":
+                    result["book"] = val.lstrip("0") or val
+                elif key == "PAGE" and val and val != "":
+                    result["page"] = val.lstrip("0") or val
+                elif key in ("APPRAISED VALUE", "APPRAISED") and val:
+                    v = extract_dollar(val)
+                    if v and v > 0: result["appraised_value"] = v
+                elif key in ("ASSESSED VALUE", "ASSESSED") and val:
+                    v = extract_dollar(val)
+                    if v and v > 0: result["assessed_value"] = v
+                elif key in ("TOTAL TAX", "TAX AMOUNT", "TAX DUE", "CURRENT TAX") and val:
+                    v = extract_dollar(val)
+                    if v and v > 0 and not result["actual_tax"]: result["actual_tax"] = v
+                elif key in ("PENALTY", "PENALT") and val:
+                    v = extract_dollar(val)
+                    if v: result["penalty"] = v
+                elif key == "INTEREST" and val:
+                    v = extract_dollar(val)
+                    if v: result["interest"] = v
+                elif key in ("PUBLICATION FEE", "PUB FEE", "ADVERTISING FEE") and val:
+                    v = extract_dollar(val)
+                    if v: result["publication_fee"] = v
+                elif key in ("TOTAL DUE", "AMOUNT DUE", "TOTAL AMOUNT DUE") and val:
+                    v = extract_dollar(val)
+                    if v: result["total_due"] = v
+                elif key == "OWNER NAME" and val and not result["owner_address"]:
+                    result["owner_address"] = val
+                elif key == "PROPERTY" and val:
+                    if not result.get("property_desc"):
+                        result["property_desc"] = val
+                i += 1
+
+            # Also check full row text for dollar amounts near keywords
             if "APPRAISED" in row_text and not result["appraised_value"]:
-                for v in vals:
-                    if v > 100:
-                        result["appraised_value"] = v
-                        result["assessed_value"] = round(v * 0.60)
+                for cell in cells:
+                    v = extract_dollar(cell)
+                    if v and v > 100: result["appraised_value"] = v; break
+
+            if "ASSESSED" in row_text and not result["assessed_value"]:
+                for cell in cells:
+                    v = extract_dollar(cell)
+                    if v and v > 50: result["assessed_value"] = v; break
+
+            # Tax year rows - look for year + dollar amount
+            year_m = re.search(r"(20\d{2})", row_text)
+            if year_m and ("TAX" in row_text or "AMOUNT" in row_text):
+                for cell in cells:
+                    v = extract_dollar(cell)
+                    if v and v > 0:
+                        result["tax_years"].append({"year": year_m.group(1), "amount": v})
+                        if not result["actual_tax"]: result["actual_tax"] = v
                         break
 
-            if "ASSESSED" in row_text and vals and not result["assessed_value"]:
-                for v in vals:
-                    if v > 50:
-                        result["assessed_value"] = v
-                        break
-
-            # Fee breakdown rows
-            if "TAX" in row_text and ("AMOUNT" in row_text or "DUE" in row_text or "CHARGE" in row_text):
-                for v in vals:
-                    if v > 0 and not result["actual_tax"]:
-                        result["actual_tax"] = v
-
-            if "PENALT" in row_text and vals:
-                result["penalty"] = vals[0]
-
-            if "INTEREST" in row_text and vals:
-                result["interest"] = vals[0]
-
-            if ("PUBLICATION" in row_text or "PUB FEE" in row_text or "ADVERTISING" in row_text) and vals:
-                result["publication_fee"] = vals[0]
-
-            if ("TOTAL" in row_text and "DUE" in row_text) and vals:
-                result["total_due"] = max(vals)  # largest number in total due row
-
-            # Book and page
-            if "BOOK" in row_text and "PAGE" in row_text:
-                # Try to extract book and page numbers
-                book_m = re.search(r"BOOK[:\s]+([\w\-]+)", row_text)
-                page_m = re.search(r"PAGE[:\s]+([\w\-]+)", row_text)
-                if book_m: result["book"] = book_m.group(1).strip()
-                if page_m: result["page"] = page_m.group(1).strip()
-                # Also check adjacent cells
-                for i, cell in enumerate(row):
-                    if "BOOK" in cell.upper():
-                        if i+1 < len(row) and row[i+1].strip():
-                            result["book"] = row[i+1].strip()
-                    if "PAGE" in cell.upper():
-                        if i+1 < len(row) and row[i+1].strip():
-                            result["page"] = row[i+1].strip()
-
-            # Tax year breakdown
-            year_m = re.search(r"\b(20\d{2}|19\d{2})\b", row_text)
-            if year_m and vals and "TAX" in row_text:
-                result["tax_years"].append({
-                    "year": year_m.group(1),
-                    "amount": vals[0] if vals else None,
-                    "row": row
-                })
-
-        # Also try regex on full body text for appraised value
+        # Full body text fallback for appraised value
         if not result["appraised_value"]:
-            m = re.search(r"[Aa]ppraised[\s\w]*[:\$]?\s*\$?([\d,]+)", body_text)
-            if m:
-                try: result["appraised_value"] = float(m.group(1).replace(",",""))
-                except: pass
+            for pat in [r"[Aa]ppraised\s*[Vv]alue[:\s]+\$?([\d,]+)", 
+                        r"[Aa]PPRAISED[:\s]+\$?([\d,]+)"]:
+                m = re.search(pat, body_text)
+                if m:
+                    try: result["appraised_value"] = float(m.group(1).replace(",","")); break
+                    except: pass
 
-        # Calculate actual tax from assessed value if not found directly
+        # Calculate assessed if missing
+        if result["appraised_value"] and not result["assessed_value"]:
+            result["assessed_value"] = round(result["appraised_value"] * 0.60)
+
+        # Estimate actual tax from assessed value if not found
         if result["assessed_value"] and not result["actual_tax"]:
-            # WV Class 3 levy ~$0.70 per $100
             result["actual_tax"] = round(result["assessed_value"] * 0.007, 2)
 
-        # Estimate fee breakdown from min_bid if we have actual tax
-        # min_bid = actual_tax_years + penalty(5%) + interest(1%/mo) + pub_fee($50-150) + sheriff($25)
+        print(f"[SHERIFF] Parsed - Appraised:{result['appraised_value']} Assessed:{result['assessed_value']} Tax:{result['actual_tax']} Book:{result['book']}/{result['page']}", flush=True)
         
         if any([result["appraised_value"], result["assessed_value"], result["actual_tax"]]):
             result["success"] = True
@@ -2278,8 +2284,8 @@ WVDEP_PRODUCTION_URLS = {
 
 
 async def build_production_data_bank():
-    """Download WVDEP annual production Excel files and load into Supabase."""
-    import openpyxl, io, json, urllib.request, urllib.error
+    """Download WVDEP production Excel files and load into Supabase - memory efficient."""
+    import openpyxl, io, json, urllib.request, urllib.error, gc
     global BANK_BUILD_STATUS
     BANK_BUILD_STATUS = {"state": "running", "progress": "Starting...", "records": 0, "errors": []}
     total = 0
@@ -2288,12 +2294,24 @@ async def build_production_data_bank():
         try:
             BANK_BUILD_STATUS["progress"] = f"Downloading {year}..."
             print(f"[BANK] Downloading {year}: {url}", flush=True)
+
+            # Download in chunks to avoid memory spike
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            chunks = []
             with urllib.request.urlopen(req, timeout=120) as r:
-                excel_bytes = r.read()
-            print(f"[BANK] {year} downloaded: {len(excel_bytes)} bytes", flush=True)
+                while True:
+                    chunk = r.read(65536)  # 64KB chunks
+                    if not chunk: break
+                    chunks.append(chunk)
+            excel_bytes = b"".join(chunks)
+            chunks = None  # free memory
+            gc.collect()
+            print(f"[BANK] {year} downloaded: {len(excel_bytes)/1024/1024:.1f}MB", flush=True)
 
             wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), read_only=True, data_only=True)
+            excel_bytes = None  # free memory immediately
+            gc.collect()
+
             ws = wb.active
             headers = [str(c.value or "").strip().upper() for c in next(ws.iter_rows(min_row=1, max_row=1))]
             print(f"[BANK] {year} headers: {headers[:12]}", flush=True)
@@ -2304,14 +2322,15 @@ async def build_production_data_bank():
                         if n.upper() in h: return i
                 return None
 
-            api_i  = col_idx(["API"])
-            cty_i  = col_idx(["COUNTY"])
-            own_i  = col_idx(["OWNER","OPERATOR","COMPANY","LESSEE"])
-            gas_i  = col_idx(["GAS","MCF"])
-            oil_i  = col_idx(["OIL","BBL"])
-            dst_i  = col_idx(["DISTRICT","DIST"])
+            api_i = col_idx(["API"])
+            cty_i = col_idx(["COUNTY"])
+            own_i = col_idx(["OWNER","OPERATOR","COMPANY","LESSEE"])
+            gas_i = col_idx(["GAS","MCF"])
+            oil_i = col_idx(["OIL","BBL"])
+            dst_i = col_idx(["DISTRICT","DIST"])
 
             batch = []
+            row_count = 0
             for row in ws.iter_rows(min_row=2, values_only=True):
                 if not any(row): continue
                 def sv(i): return str(row[i] or "").strip() if i is not None and i < len(row) else ""
@@ -2326,24 +2345,33 @@ async def build_production_data_bank():
                 }
                 if rec["county"] or rec["api_number"]:
                     batch.append(rec)
-                if len(batch) >= 200:
+                row_count += 1
+
+                # Smaller batches + sleep to free memory between inserts
+                if len(batch) >= 100:
                     _supabase_insert("og_production", batch)
                     total += len(batch)
                     BANK_BUILD_STATUS["records"] = total
                     BANK_BUILD_STATUS["progress"] = f"{year}: {total} records"
                     batch = []
+                    gc.collect()
+                    await asyncio.sleep(0.1)  # yield to event loop
+
             if batch:
                 _supabase_insert("og_production", batch)
                 total += len(batch)
 
-            print(f"[BANK] {year} done", flush=True)
+            wb.close()
+            gc.collect()
+            print(f"[BANK] {year} done: {row_count} rows", flush=True)
 
         except Exception as e:
             import traceback; traceback.print_exc()
-            BANK_BUILD_STATUS["errors"].append(f"{year}: {e}")
+            BANK_BUILD_STATUS["errors"].append(f"{year}: {str(e)[:100]}")
+            gc.collect()
 
     BANK_BUILD_STATUS["state"] = "complete"
-    BANK_BUILD_STATUS["progress"] = f"Done. {total} records loaded."
+    BANK_BUILD_STATUS["progress"] = f"Done. {total} total records loaded."
     BANK_BUILD_STATUS["records"] = total
     print(f"[BANK] Complete: {total} records", flush=True)
 
