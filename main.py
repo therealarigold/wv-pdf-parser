@@ -1883,8 +1883,15 @@ async def scrape_sheriff_async(county, ticket, page):
     Scrape sheriff tax office by ticket number + year 2024.
     Uses Search by Ticket button - the correct button for ticket searches.
     """
-    county_low = county.upper().replace(" COUNTY","").strip().lower()
-    base = f"http://{county_low}.softwaresystems.com"
+    county_up = county.upper().replace(" COUNTY","").strip()
+    base = get_sheriff_url(county_up)
+    
+    # Check if county is supported
+    if base is None:
+        print(f"[SHERIFFv2] {county_up} not on supported platform", flush=True)
+        result["error"] = f"{county_up} County uses a different tax system not yet supported"
+        result["unsupported"] = True
+        return result
     result = {
         "source": "sheriff", "url": base, "success": False,
         "appraised_value": None, "assessed_value": None,
@@ -2447,6 +2454,79 @@ def names_match(auction_name, sheriff_name, threshold=0.6):
     return overlap / total >= threshold if total > 0 else False
 
 
+
+# ── SHERIFF TAX SITE URL MAP ──────────────────────────────────────────────────
+# Most counties use {county}.softwaresystems.com
+# Exceptions are listed here explicitly
+# Counties NOT on softwaresystems.com cannot be scraped by sheriff-v2 yet
+SHERIFF_URLS = {
+    # softwaresystems.com counties (confirmed working)
+    "BERKELEY":    "http://berkeley.softwaresystems.com",
+    "BOONE":       "http://boone.softwaresystems.com",
+    "BRAXTON":     "http://braxton.softwaresystems.com",
+    "BROOKE":      "http://brooke.softwaresystems.com",
+    "CABELL":      "http://cabell.softwaresystems.com",
+    "CALHOUN":     "http://calhoun.softwaresystems.com",
+    "CLAY":        "http://clay.softwaresystems.com",
+    "DODDRIDGE":   "http://doddridge.softwaresystems.com",
+    "FAYETTE":     "http://fayette.softwaresystems.com",
+    "GILMER":      "http://gilmer.softwaresystems.com",
+    "GRANT":       "http://grant.softwaresystems.com",
+    "GREENBRIER":  "http://greenbrier.softwaresystems.com",
+    "HAMPSHIRE":   "http://hampshire.softwaresystems.com",
+    "HANCOCK":     "http://hancock.softwaresystems.com",
+    "HARDY":       "http://hardy.softwaresystems.com",
+    "HARRISON":    "http://harrison.softwaresystems.com",
+    "JACKSON":     "http://jackson.softwaresystems.com",
+    "JEFFERSON":   "http://jefferson.softwaresystems.com",
+    "KANAWHA":     "http://kanawha.softwaresystems.com",
+    "LEWIS":       "http://lewis.softwaresystems.com",
+    "LINCOLN":     "http://lincoln.softwaresystems.com",
+    "LOGAN":       "http://logan.softwaresystems.com",
+    "MARSHALL":    "http://marshall.softwaresystems.com",
+    "MASON":       "http://mason.softwaresystems.com",
+    "MCDOWELL":    "http://mcdowell.softwaresystems.com",
+    "MERCER":      "http://mercer.softwaresystems.com",
+    "MINERAL":     "http://mineral.softwaresystems.com",
+    "MINGO":       "http://mingo.softwaresystems.com",
+    "MONONGALIA":  "http://monongalia.softwaresystems.com",
+    "MONROE":      "http://monroe.softwaresystems.com",
+    "MORGAN":      "http://morgan.softwaresystems.com",
+    "OHIO":        "http://ohio.softwaresystems.com",
+    "PENDLETON":   "http://pendleton.softwaresystems.com",
+    "PLEASANTS":   "http://pleasants.softwaresystems.com",
+    "POCAHONTAS":  "http://pocahontas.softwaresystems.com",
+    "PUTNAM":      "http://putnam.softwaresystems.com",
+    "RALEIGH":     "http://raleigh.softwaresystems.com",
+    "RANDOLPH":    "http://randolph.softwaresystems.com",
+    "RITCHIE":     "http://ritchie.softwaresystems.com",
+    "ROANE":       "http://roane.softwaresystems.com",
+    "SUMMERS":     "http://summers.softwaresystems.com",
+    "TAYLOR":      "http://taylor.softwaresystems.com",
+    "TUCKER":      "http://tucker.softwaresystems.com",
+    "UPSHUR":      "http://upshur.softwaresystems.com",
+    "WAYNE":       "http://wayne.softwaresystems.com",
+    "WEBSTER":     "http://webster.softwaresystems.com",
+    "WETZEL":      "http://wetzel.softwaresystems.com",
+    "WIRT":        "http://wirt.softwaresystems.com",
+    "WOOD":        "http://wood.softwaresystems.com",
+    "WYOMING":     "http://wyoming.softwaresystems.com",
+    # NOT on softwaresystems.com - different platform, not supported yet
+    "BARBOUR":     None,  # barbourtax.compiled-technologies.com
+    "MARION":      None,  # marion.wvsheriff.com
+    "NICHOLAS":    None,  # nicholaswv.compiled-technologies.com
+    "PRESTON":     None,  # prestonwv.compiled-technologies.com/WEBTax/
+    "TYLER":       None,  # tylerwv.compiled-technologies.com/WEBTax/
+}
+
+def get_sheriff_url(county):
+    """Get the sheriff tax site URL for a county. Returns None if not supported."""
+    c = county.upper().replace(" COUNTY","").strip()
+    if c in SHERIFF_URLS:
+        return SHERIFF_URLS[c]
+    # Default fallback: try softwaresystems.com
+    return f"http://{c.lower()}.softwaresystems.com"
+# ─────────────────────────────────────────────────────────────────────────────
 async def scrape_sheriff_v2(county, ticket, cert, auction_name, page):
     """
     Scrape sheriff tax system using correct year and Search by Ticket button.
