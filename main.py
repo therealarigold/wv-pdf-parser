@@ -466,6 +466,8 @@ def fetch_assessment_detail(map_pid):
             'property_class': '',
             'land_use': '',
             'total_appraisal': '',
+            'e911_address': '',
+            'physical_address': '',
             'sales_history': [],
             'parcel_history': [],
         }
@@ -488,6 +490,19 @@ def fetch_assessment_detail(map_pid):
             m = re.search(r'Mailing\s*Address[^<]*<[^>]+>\s*([A-Z0-9][^<]{5,})', clean_html, re.I)
         if m:
             result['mailing_address'] = m.group(1).strip()
+
+        # ── Physical / E-911 address ───────────────────────────────
+        m = re.search(r'Physical\s*Address\s*</td>\s*<td[^>]*>\s*([^<]+)', clean_html, re.I)
+        if m:
+            val = m.group(1).strip()
+            if val and val != '---':
+                result['physical_address'] = val
+
+        m = re.search(r'E-911\s*Address\s*</td>\s*<td[^>]*>\s*([^<]+)', clean_html, re.I)
+        if m:
+            val = m.group(1).strip()
+            if val and val != '---':
+                result['e911_address'] = val
 
         # ── Tax class ──────────────────────────────────────────────
         # "Tax Class" header then value in next cell
