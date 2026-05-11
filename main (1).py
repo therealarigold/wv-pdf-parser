@@ -2970,3 +2970,108 @@ def og_intel_assessment(county, district, owner_name, description, min_bid, well
         'mineral_fraction': mineral_fraction,
         'acres': acres,
     }
+
+# ─── PRE-REGISTRATION PDF PARSER (added 2026-05) ──────────────────────────────
+import re as _prereg_re
+import subprocess as _prereg_subprocess
+import tempfile as _prereg_tempfile
+import os as _prereg_os
+from fastapi import UploadFile, File
+
+@app.post("/prereg-parse")
+async def prereg_parse(file: UploadFile = File(...)):
+    """Parse a WVSAO Pre-Registration Report PDF.
+    Returns a list of {name, agent, street, city, state, zip} entries.
+    Uses pdftotext -layout which is pre-installed on Render's poppler-utils.
+    """
+    # Save the upload to a temp file
+    suffix = ".pdf"
+    with _prereg_tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    try:
+        # Run pdftotext -layout for fixed-width text output
+        result = _prereg_subprocess.run(
+            ["pdftotext", "-layout", tmp_path, "-"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode != 0:
+            return {"ok": False, "error": "pdftotext failed: " + result.stderr[:500]}
+        text = result.stdout
+    finally:
+        try: _prereg_os.unlink(tmp_path)
+        except: pass
+
+    # Parse the text
+    lines = text.split("\n")
+    records = []
+    current = None
+
+    for line in lines:
+        if not line.strip():
+            if current:
+                records.append(current); current = None
+            continue
+        if "PRE-REGISTRATION" in line: continue
+        if _prereg_re.match(r"^\s*\d+\s+of\s+\d+\s*$", line): continue
+        if _prereg_re.match(r"^\s*NAME\s+AGENT\s+ADDRESS", line): continue
+
+        first_char_match = _prereg_re.search(r"\S", line)
+        if not first_char_match: continue
+        first_pos = first_char_match.start()
+
+        if first_pos < 5:
+            if current: records.append(current); current = None
+            parts = [p.strip() for p in _prereg_re.split(r"\s{2,}", line) if p.strip()]
+            if len(parts) < 3: continue
+            name = parts[0]
+            addr1 = parts[-1]
+            agent = " ".join(parts[1:-1])
+            current = {"name": name, "agent": agent, "addr_lines": [addr1]}
+        else:
+            if current:
+                current["addr_lines"].append(line.strip())
+
+    if current: records.append(current)
+
+    # Parse street/city/state/zip
+    parsed = []
+    for r in records:
+        addr_lines = [l for l in r["addr_lines"] if l.strip()]
+        city_line = ""
+        street_lines = []
+        for j, l in enumerate(addr_lines):
+            if _prereg_re.search(r"\b[A-Z]{2}\s+\d{5}(-\d{4})?\s*$", l) or _prereg_re.search(r"\b[A-Z]{2}\b.*\d{5}", l):
+                city_line = l
+                street_lines = addr_lines[:j]
+                break
+        if not city_line and addr_lines:
+            city_line = addr_lines[-1]
+            street_lines = addr_lines[:-1]
+        street = ", ".join(street_lines).strip()
+        city, state, zipc = "", "", ""
+        m = _prereg_re.match(r"^(.+?),?\s+([A-Z]{2})[,]?\s+(\d{5}(?:-\d{4})?)\s*$", city_line)
+        if m:
+            city = m.group(1).rstrip(",").strip()
+            state = m.group(2)
+            zipc = m.group(3)
+        else:
+            m2 = _prereg_re.match(r"^(.+?),?\s+(?:[A-Z]{2},?\s+)?([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", city_line)
+            if m2:
+                city = m2.group(1).rstrip(",").strip()
+                state = m2.group(2)
+                zipc = m2.group(3)
+            else:
+                city = city_line
+        name = r["name"].strip()
+        agent = r["agent"].strip()
+        if name and len(name) >= 2 and street:
+            parsed.append({
+                "name": name, "agent": agent,
+                "street": street, "city": city,
+                "state": state, "zip": zipc,
+            })
+
+    return {"ok": True, "count": len(parsed), "records": parsed}
+# ─────────────────────────────────────────────────────────────────────────────
