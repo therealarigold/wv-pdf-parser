@@ -2958,7 +2958,7 @@ class Handler(BaseHTTPRequestHandler):
                     city_line_pr = ''
                     street_lines_pr = []
                     for j_pr, l_pr in enumerate(all_lines_pr):
-                        if re.search(r'\b[A-Z]{2}\s+\d{5}(-\d{4})?\s*$', l_pr) or re.search(r'\b[A-Z]{2}\b.*\d{5}', l_pr):
+                        if re.search(r',\s+[A-Z]{2}[,]?\s+\d{5}(?:-\d{4})?\s*$', l_pr) or re.search(r',\s+[A-Z][A-Z\s]+\s+\d{5}', l_pr):
                             city_line_pr = l_pr
                             street_lines_pr = all_lines_pr[:j_pr]
                             break
