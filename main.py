@@ -2891,6 +2891,107 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             path = self.path.split("?")[0]
 
+            if path == "/prereg-parse":
+                # Parse WVSAO Pre-Registration PDF using pdftotext -layout
+                # Body is multipart/form-data with the PDF file
+                import tempfile, subprocess
+                if 'multipart/form-data' not in ct:
+                    return self.respond({'success':False,'error':'Expected multipart/form-data'})
+                boundary_pr = ct.split('boundary=')[1].strip().encode()
+                pdf_bytes_pr = None
+                for part in body.split(b'--' + boundary_pr):
+                    if b'filename=' in part and b'.pdf' in part.lower():
+                        hend = part.find(b'\r\n\r\n')
+                        if hend != -1:
+                            pdf_bytes_pr = part[hend+4:].rstrip(b'\r\n-')
+                            break
+                if not pdf_bytes_pr:
+                    return self.respond({'success':False,'error':'No PDF found in upload'})
+
+                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                    tmp.write(pdf_bytes_pr)
+                    tmp_path = tmp.name
+                try:
+                    proc = subprocess.run(
+                        ['pdftotext', '-layout', tmp_path, '-'],
+                        capture_output=True, text=True, timeout=60
+                    )
+                    if proc.returncode != 0:
+                        return self.respond({'success':False,'error':'pdftotext failed: ' + proc.stderr[:300]})
+                    text_pr = proc.stdout
+                finally:
+                    try:
+                        import os as _osp; _osp.unlink(tmp_path)
+                    except: pass
+
+                # Parse the layout-preserved text
+                lines_pr = text_pr.split('\n')
+                records_pr = []
+                current_pr = None
+                for line_pr in lines_pr:
+                    if not line_pr.strip():
+                        if current_pr:
+                            records_pr.append(current_pr); current_pr = None
+                        continue
+                    if 'PRE-REGISTRATION' in line_pr: continue
+                    if re.match(r'^\s*\d+\s+of\s+\d+\s*$', line_pr): continue
+                    if re.match(r'^\s*NAME\s+AGENT\s+ADDRESS', line_pr): continue
+                    fc = re.search(r'\S', line_pr)
+                    if not fc: continue
+                    if fc.start() < 5:
+                        if current_pr: records_pr.append(current_pr); current_pr = None
+                        parts_pr = [p.strip() for p in re.split(r'\s{2,}', line_pr) if p.strip()]
+                        if len(parts_pr) < 3: continue
+                        current_pr = {
+                            'name': parts_pr[0],
+                            'agent': ' '.join(parts_pr[1:-1]),
+                            'addr_lines': [parts_pr[-1]],
+                        }
+                    elif current_pr:
+                        current_pr['addr_lines'].append(line_pr.strip())
+                if current_pr: records_pr.append(current_pr)
+
+                # Parse addresses into street/city/state/zip
+                parsed_pr = []
+                for r_pr in records_pr:
+                    all_lines_pr = [l for l in r_pr['addr_lines'] if l.strip()]
+                    city_line_pr = ''
+                    street_lines_pr = []
+                    for j_pr, l_pr in enumerate(all_lines_pr):
+                        if re.search(r'\b[A-Z]{2}\s+\d{5}(-\d{4})?\s*$', l_pr) or re.search(r'\b[A-Z]{2}\b.*\d{5}', l_pr):
+                            city_line_pr = l_pr
+                            street_lines_pr = all_lines_pr[:j_pr]
+                            break
+                    if not city_line_pr and all_lines_pr:
+                        city_line_pr = all_lines_pr[-1]
+                        street_lines_pr = all_lines_pr[:-1]
+                    street_pr = ', '.join(street_lines_pr).strip()
+                    city_pr, state_pr, zip_pr = '', '', ''
+                    m_pr = re.match(r'^(.+?),?\s+([A-Z]{2})[,]?\s+(\d{5}(?:-\d{4})?)\s*$', city_line_pr)
+                    if m_pr:
+                        city_pr = m_pr.group(1).rstrip(',').strip()
+                        state_pr = m_pr.group(2)
+                        zip_pr = m_pr.group(3)
+                    else:
+                        m_pr2 = re.match(r'^(.+?),?\s+(?:[A-Z]{2},?\s+)?([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$', city_line_pr)
+                        if m_pr2:
+                            city_pr = m_pr2.group(1).rstrip(',').strip()
+                            state_pr = m_pr2.group(2)
+                            zip_pr = m_pr2.group(3)
+                        else:
+                            city_pr = city_line_pr
+                    name_pr = r_pr['name'].strip()
+                    if name_pr and len(name_pr) >= 2 and street_pr:
+                        parsed_pr.append({
+                            'name': name_pr,
+                            'agent': r_pr['agent'].strip(),
+                            'street': street_pr,
+                            'city': city_pr,
+                            'state': state_pr,
+                            'zip': zip_pr,
+                        })
+                return self.respond({'success': True, 'count': len(parsed_pr), 'records': parsed_pr})
+                
             if path == "/cama":
                 data = json.loads(body)
                 return self.respond(lookup_cama(
