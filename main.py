@@ -3177,14 +3177,6 @@ def parse_pdf(pdf_bytes):
     except Exception as e:
         return {'success':False,'error':f'PDF parsing error: {str(e)}'}
 
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    print(f'WV Tax Lien API running on port {port} — 55 counties CAMA enabled')
-    ensure_chromium()
-    HTTPServer(('0.0.0.0', port), Handler).serve_forever()
-
-
 # ── O&G INTEL - PLAYWRIGHT SCRAPER ───────────────────────────────────────────
 # Scrapes WVDEP well database for active H6A (Marcellus/Utica) wells by county
 # Cross-references with district/corp to score tax lien O&G potential
@@ -3749,3 +3741,10 @@ def run_wvsao_refresh_sync(scope='daily_recent'):
         loop.close()
     return result
 # ═════════════════════════════════════════════════════════════════════════════
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    print(f'WV Tax Lien API running on port {port} — 55 counties CAMA enabled')
+    ensure_chromium()
+    HTTPServer(('0.0.0.0', port), Handler).serve_forever()
