@@ -3405,3 +3405,318 @@ def og_intel_assessment(county, district, owner_name, description, min_bid, well
         'mineral_fraction': mineral_fraction,
         'acres': acres,
     }
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WVSAO AUTO-REFRESH ENGINE (Phase E)
+# ═════════════════════════════════════════════════════════════════════════════
+import asyncio as _re_asyncio
+import re as _re_re
+import json as _re_json
+import urllib.request as _re_ur
+import urllib.parse as _re_up
+from datetime import datetime as _re_dt
+
+# Reuse the existing Supabase creds from earlier in file
+_RE_SUPABASE_URL = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
+_RE_SUPABASE_KEY = "sb_publishable_X1nUMQ4GQfiPj-AsVvigwQ_7g3d4i95"
+
+_RE_HEADERS = {
+    "apikey": _RE_SUPABASE_KEY,
+    "Authorization": f"Bearer {_RE_SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
+
+_WV_COUNTIES_ALL = [
+    'BARBOUR','BERKELEY','BOONE','BRAXTON','BROOKE','CABELL','CALHOUN','CLAY',
+    'DODDRIDGE','FAYETTE','GILMER','GRANT','GREENBRIER','HAMPSHIRE','HANCOCK',
+    'HARDY','HARRISON','JACKSON','JEFFERSON','KANAWHA','LEWIS','LINCOLN','LOGAN',
+    'MARION','MARSHALL','MASON','MCDOWELL','MERCER','MINERAL','MINGO','MONONGALIA',
+    'MONROE','MORGAN','NICHOLAS','OHIO','PENDLETON','PLEASANTS','POCAHONTAS',
+    'PRESTON','PUTNAM','RALEIGH','RANDOLPH','RITCHIE','ROANE','SUMMERS','TAYLOR',
+    'TUCKER','TYLER','UPSHUR','WAYNE','WEBSTER','WETZEL','WIRT','WOOD','WYOMING'
+]
+
+
+def _re_normalize(s):
+    return _re_re.sub(r'[^A-Z0-9]', '', (s or '').upper())
+
+
+def _re_is_entity(name):
+    if not name: return False
+    u = name.upper()
+    for kw in [' LLC',' L.L.C',' INC',' INC.',' CORP',' CORPORATION',
+              ' COMPANY',' CO.',' TRUST',' LP',' LTD',' LIMITED',
+              ' PARTNERSHIP',' ENTERPRISES',' HOLDINGS',' GROUP',
+              ' ASSOCIATES',' PROPERTIES',' AGENCY',' FOUNDATION']:
+        if kw in u: return True
+    return False
+
+
+def _re_sb_get(path):
+    """Supabase GET with Range pagination (returns ALL rows)."""
+    out = []
+    offset = 0
+    BATCH = 1000
+    while True:
+        h = dict(_RE_HEADERS)
+        h['Range-Unit'] = 'items'
+        h['Range'] = f'{offset}-{offset+BATCH-1}'
+        req = _re_ur.Request(f'{_RE_SUPABASE_URL}/rest/v1/{path}', headers=h, method='GET')
+        try:
+            with _re_ur.urlopen(req, timeout=30) as r:
+                rows = _re_json.loads(r.read())
+        except Exception as e:
+            print(f'[refresh] SB GET error: {e}', flush=True)
+            return out
+        out.extend(rows)
+        if len(rows) < BATCH: break
+        offset += BATCH
+    return out
+
+
+def _re_sb_upsert(table, rows, on_conflict):
+    """Supabase upsert batch."""
+    if not rows: return True
+    h = dict(_RE_HEADERS)
+    h['Prefer'] = 'resolution=merge-duplicates,return=minimal'
+    url = f'{_RE_SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}'
+    data = _re_json.dumps(rows).encode()
+    req = _re_ur.Request(url, data=data, headers=h, method='POST')
+    try:
+        with _re_ur.urlopen(req, timeout=60) as r:
+            return True
+    except Exception as e:
+        print(f'[refresh] SB upsert error: {e}', flush=True)
+        return False
+
+
+def _re_sb_insert(table, rows):
+    """Supabase plain insert."""
+    if not rows: return None
+    h = dict(_RE_HEADERS)
+    h['Prefer'] = 'return=representation'
+    data = _re_json.dumps(rows).encode()
+    req = _re_ur.Request(f'{_RE_SUPABASE_URL}/rest/v1/{table}', data=data, headers=h, method='POST')
+    try:
+        with _re_ur.urlopen(req, timeout=60) as r:
+            return _re_json.loads(r.read())
+    except Exception as e:
+        print(f'[refresh] SB insert error: {e}', flush=True)
+        return None
+
+
+async def _re_scrape_county_year(page, year, county):
+    """Scrape a single year+county from WVSAO."""
+    url = 'https://www.wvsao.gov/CountyCollections/CertifiedToState/Default'
+    try:
+        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+        await page.wait_for_timeout(1000)
+        # Pick year + county
+        try:
+            await page.select_option('select[name*="Year"]', value=str(year), timeout=5000)
+            await page.wait_for_timeout(500)
+        except: pass
+        try:
+            await page.select_option('select[name*="County"]', label=county.title()+' County', timeout=5000)
+            await page.wait_for_timeout(500)
+        except:
+            try:
+                await page.select_option('select[name*="County"]', label=county, timeout=3000)
+            except: pass
+        # Click search
+        try:
+            await page.click('input[type=submit]', timeout=3000)
+            await page.wait_for_load_state('domcontentloaded', timeout=15000)
+            await page.wait_for_timeout(1500)
+        except: pass
+
+        # Parse rows from result table
+        rows_out = []
+        rows = await page.query_selector_all('table tr')
+        for row in rows:
+            cells = await row.query_selector_all('td')
+            if len(cells) < 6: continue
+            texts = []
+            for c in cells:
+                t = (await c.inner_text()).strip()
+                texts.append(t)
+            # Cert # should match pattern in first cell
+            if not _re_re.search(r'\d{4}-C-\d+', texts[0]): continue
+            rows_out.append(texts)
+        return rows_out
+    except Exception as e:
+        print(f'[refresh] scrape {year}/{county} error: {e}', flush=True)
+        return []
+
+
+def _re_parse_cert_row(row, year, county):
+    """Same parsing as the original loader."""
+    if len(row) < 6: return None
+    cert_lines = (row[0] or '').split('\n')
+    cert_num = ''
+    for line in cert_lines:
+        if _re_re.match(r'\d{4}-C-\d+', line.strip()):
+            cert_num = line.strip()
+            break
+    if not cert_num: return None
+
+    status_full = row[5] if len(row) > 5 else ''
+    parts = status_full.split('\n', 1)
+    status = parts[0].strip()
+    status_detail = parts[1].strip() if len(parts) > 1 else ''
+
+    buyer_raw = (row[4] if len(row) > 4 else '').strip()
+    return {
+        'year': str(year), 'county': county, 'cert_number': cert_num,
+        'ticket': (row[1] if len(row) > 1 else '').strip(),
+        'taxpayer': (row[2] if len(row) > 2 else '').strip(),
+        'description': (row[3] if len(row) > 3 else '').strip(),
+        'buyer_name_raw': buyer_raw,
+        'buyer_normalized': _re_normalize(buyer_raw),
+        'status': status, 'status_detail': status_detail,
+        'ntr_rec': (row[6] if len(row) > 6 else '').strip(),
+        'deed_fee_rec': (row[7] if len(row) > 7 else '').strip(),
+    }
+
+
+async def run_wvsao_refresh(scope='daily_recent'):
+    """
+    Main refresh function. 
+    scope: 'daily_recent' = last 2 years only, 'weekly_full' = all years
+    Returns log dict with counts.
+    """
+    from playwright.async_api import async_playwright
+    start_ts = _re_dt.now()
+    log = {
+        'scrape_scope': scope, 'years_scraped': [], 'counties_scraped': 0,
+        'total_certs_seen': 0, 'new_certs': 0, 'status_changes': 0,
+        'new_buyers': 0, 'late_round_flips': 0,
+        'new_buyer_ids': [], 'status_change_summary': {},
+        'errors': [], 'status': 'success', 'notes': ''
+    }
+
+    # Determine years to scrape (autodetect would need a page load - we'll use calendar)
+    current_year = _re_dt.now().year
+    # Tax years run 1 behind calendar year
+    most_recent_tax = current_year - 1
+    if scope == 'daily_recent':
+        years = [most_recent_tax, most_recent_tax - 1]
+    else:
+        years = list(range(2021, most_recent_tax + 1))
+    log['years_scraped'] = [str(y) for y in years]
+
+    # 1. Pull existing certs from DB into a map for fast lookup
+    print(f'[refresh] Loading existing certs from DB...', flush=True)
+    existing = {}
+    for y in years:
+        rows = _re_sb_get(f'wvsao_certs?year=eq.{y}&select=year,county,cert_number,status,buyer_normalized,buyer_name_raw')
+        for r in rows:
+            key = (r['year'], r['county'], r['cert_number'])
+            existing[key] = r
+    print(f'[refresh] Loaded {len(existing)} existing certs', flush=True)
+
+    # 2. Pull existing buyer normalized names
+    existing_buyer_norms = set()
+    buyer_rows = _re_sb_get('wvsao_buyers?select=normalized_name')
+    for r in buyer_rows:
+        if r.get('normalized_name'): existing_buyer_norms.add(r['normalized_name'])
+    print(f'[refresh] Have {len(existing_buyer_norms)} buyers in roster', flush=True)
+
+    # 3. Scrape
+    cert_upserts = []
+    new_buyer_norms_seen = {}  # norm -> {display_name, is_entity}
+    
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote'])
+        ctx = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        page = await ctx.new_page()
+
+        for year in years:
+            for county in _WV_COUNTIES_ALL:
+                log['counties_scraped'] += 1
+                rows = await _re_scrape_county_year(page, year, county)
+                for raw in rows:
+                    parsed = _re_parse_cert_row(raw, year, county)
+                    if not parsed: continue
+                    log['total_certs_seen'] += 1
+
+                    key = (parsed['year'], parsed['county'], parsed['cert_number'])
+                    old = existing.get(key)
+
+                    if not old:
+                        # Brand new cert
+                        log['new_certs'] += 1
+                        cert_upserts.append(parsed)
+                    elif old['status'] != parsed['status']:
+                        # Status changed!
+                        log['status_changes'] += 1
+                        flip = f"{old['status']}_TO_{parsed['status']}".replace(' ','_')
+                        log['status_change_summary'][flip] = log['status_change_summary'].get(flip, 0) + 1
+                        # Detect late-round flip specifically
+                        if old['status'] == 'NO BID' and parsed['status'] == 'SOLD':
+                            log['late_round_flips'] += 1
+                            parsed['was_late_round_flip'] = True
+                        parsed['previous_status'] = old['status']
+                        parsed['status_changed_at'] = _re_dt.utcnow().isoformat()
+                        cert_upserts.append(parsed)
+
+                    # Track potentially-new buyers
+                    norm = parsed['buyer_normalized']
+                    if norm and norm not in existing_buyer_norms and norm not in new_buyer_norms_seen:
+                        new_buyer_norms_seen[norm] = {
+                            'normalized_name': norm,
+                            'display_name': parsed['buyer_name_raw'],
+                            'is_entity': _re_is_entity(parsed['buyer_name_raw']),
+                            'first_seen_at': _re_dt.utcnow().isoformat(),
+                        }
+
+                # Upsert batch every 500 to avoid huge requests
+                if len(cert_upserts) >= 500:
+                    _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number')
+                    cert_upserts = []
+
+            print(f'[refresh] Year {year} done. {log["counties_scraped"]} counties so far.', flush=True)
+
+        await browser.close()
+
+    # Flush remaining
+    if cert_upserts:
+        _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number')
+
+    # 4. Insert new buyers
+    if new_buyer_norms_seen:
+        new_buyer_rows = list(new_buyer_norms_seen.values())
+        inserted = _re_sb_insert('wvsao_buyers', new_buyer_rows)
+        if inserted:
+            log['new_buyers'] = len(inserted)
+            log['new_buyer_ids'] = [b['id'] for b in inserted if 'id' in b]
+        print(f'[refresh] Inserted {log["new_buyers"]} new buyers', flush=True)
+
+    # 5. Recompute buyer stats (totals, per-year, status counts) for ALL buyers affected
+    # For simplicity, recompute for all buyers using a SQL function would be cleaner,
+    # but for now we'll skip — the buyer rows update via a separate maintenance call
+
+    duration = (_re_dt.now() - start_ts).total_seconds()
+    log['duration_seconds'] = int(duration)
+
+    # 6. Write log entry
+    _re_sb_insert('wvsao_refresh_log', [log])
+
+    print(f'[refresh] DONE: {log["new_certs"]} new, {log["status_changes"]} changed, {log["new_buyers"]} new buyers, {log["late_round_flips"]} late flips, {duration:.0f}s', flush=True)
+
+    return log
+
+
+# Sync wrapper
+def run_wvsao_refresh_sync(scope='daily_recent'):
+    loop = _re_asyncio.new_event_loop()
+    _re_asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(run_wvsao_refresh(scope=scope))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        result = {'status': 'failed', 'error': str(e)}
+    finally:
+        loop.close()
+    return result
+# ═════════════════════════════════════════════════════════════════════════════
