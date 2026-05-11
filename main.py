@@ -2821,7 +2821,35 @@ class Handler(BaseHTTPRequestHandler):
             result = run_sheriff_lookup(county, ticket, tax_year=tax_year)
             return self.respond(result)
 
+        if path == "/refresh-wvsao":
+                # Trigger the auto-refresh in the background (returns immediately).
+                # ?scope=daily_recent (default) or ?scope=weekly_full or ?scope=manual
+                from urllib.parse import parse_qs, urlparse
+                import threading
+                qs = parse_qs(urlparse(self.path).query)
+                scope = qs.get('scope', ['daily_recent'])[0]
+                def run_refresh_bg():
+                    try:
+                        run_wvsao_refresh_sync(scope=scope)
+                    except Exception as e:
+                        import traceback; traceback.print_exc()
+                t = threading.Thread(target=run_refresh_bg, daemon=True)
+                t.start()
+                return self.respond({"status": "started", "scope": scope, "message": "Refresh running in background. Check Supabase wvsao_refresh_log for progress."})
 
+            if path == "/refresh-status":
+                # Returns the most recent refresh log entry from Supabase.
+                import urllib.request as _ur
+                try:
+                    req = _ur.Request(
+                        _RE_SUPABASE_URL + '/rest/v1/wvsao_refresh_log?select=*&order=ran_at.desc&limit=1',
+                        headers=_RE_HEADERS
+                    )
+                    with _ur.urlopen(req, timeout=10) as r:
+                        rows = _re_json.loads(r.read())
+                    return self.respond({"success": True, "last_run": rows[0] if rows else None})
+                except Exception as e:
+                    return self.respond({"success": False, "error": str(e)})
         if path == "/build-data-bank":
             """Download WVDEP production data and load into Supabase."""
             import threading
