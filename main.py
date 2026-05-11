@@ -2981,7 +2981,12 @@ class Handler(BaseHTTPRequestHandler):
                         else:
                             city_pr = city_line_pr
                     name_pr = r_pr['name'].strip()
-                    if name_pr and len(name_pr) >= 2 and street_pr:
+                    if name_pr and len(name_pr) >= 2 and (street_pr or city_pr):
+                        # Fix: if no street but we have a "city" line that doesn't actually have state+zip,
+                        # use that line as the street instead
+                        if not street_pr and city_pr and not state_pr and not zip_pr:
+                            street_pr = city_pr
+                            city_pr = ''
                         parsed_pr.append({
                             'name': name_pr,
                             'agent': r_pr['agent'].strip(),
