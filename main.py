@@ -3821,7 +3821,8 @@ async def run_wvsao_refresh(scope='daily_recent'):
 # exactly what the scraper is failing to parse.
 
 async def diagnose_wvsao_scrape(county, year):
-    """Load one county/year page on wvsao.gov and return everything we see."""
+    """Load one county/year page on wvsao.gov using the SAME flow as the working scraper.
+    Returns full diagnostic info — final URL, page title, all rows found, errors."""
     from playwright.async_api import async_playwright
     diag = {
         'county': county, 'year': year,
@@ -3834,73 +3835,126 @@ async def diagnose_wvsao_scrape(county, year):
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote'])
-            ctx = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            ctx = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
             page = await ctx.new_page()
-            url = 'https://www.wvsao.gov/CountyCollections/CertifiedToState/Default'
+
+            # CORRECT URL — matches working scripts
+            url = 'https://www.wvsao.gov/CountyCollections/Default'
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-            await page.wait_for_timeout(2000)
             try:
-                await page.select_option('select[name*="Year"]', value=str(year), timeout=5000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_load_state('networkidle', timeout=15000)
+            except: pass
+            await _re_asyncio.sleep(0.8)
+            diag['initial_url'] = page.url
+            try: diag['initial_title'] = await page.title()
+            except: pass
+
+            # Step 2: select year using EXACT ASP.NET selector + wait for postback
+            try:
+                async with page.expect_navigation(wait_until='domcontentloaded', timeout=20000):
+                    await page.select_option(
+                        'select[name="ctl00$FixedWidthContent$YearDD"]',
+                        value=str(year)
+                    )
+                try:
+                    await page.wait_for_load_state('networkidle', timeout=15000)
+                except: pass
+                await _re_asyncio.sleep(0.5)
                 diag['year_selected'] = True
             except Exception as e:
-                diag['errors'].append(f'year select failed: {str(e)[:200]}')
+                diag['errors'].append(f'year select failed: {str(e)[:300]}')
                 diag['year_selected'] = False
+
+            # Step 3: find county value in the now-populated dropdown
             try:
-                await page.select_option('select[name*="County"]', label=county.title()+' County', timeout=5000)
-                diag['county_selected_as'] = county.title()+' County'
-            except Exception as e1:
-                try:
-                    await page.select_option('select[name*="County"]', label=county, timeout=3000)
-                    diag['county_selected_as'] = county
-                except Exception as e2:
-                    diag['errors'].append(f'county select failed: {str(e1)[:120]} / {str(e2)[:120]}')
-                    diag['county_selected_as'] = None
-            await page.wait_for_timeout(500)
-            try:
-                await page.click('input[type=submit]', timeout=3000)
-                await page.wait_for_load_state('domcontentloaded', timeout=15000)
-                await page.wait_for_timeout(3000)
-                diag['submit_clicked'] = True
+                county_options = await page.evaluate(
+                    """() => {
+                        const sel = document.querySelector('select[name=\"ctl00$FixedWidthContent$CountyDD\"]');
+                        if (!sel) return [];
+                        return Array.from(sel.options).map(o => ({value: o.value, label: o.text.trim()}));
+                    }"""
+                )
+                diag['county_options_count'] = len(county_options)
+                county_value = None
+                for c in county_options:
+                    if c['label'].upper() == county.upper():
+                        county_value = c['value']
+                        break
+                diag['county_value_found'] = county_value
             except Exception as e:
-                diag['errors'].append(f'submit failed: {str(e)[:200]}')
-                diag['submit_clicked'] = False
+                diag['errors'].append(f'county lookup failed: {str(e)[:200]}')
+                county_value = None
+
+            if county_value:
+                # Step 4: select county
+                try:
+                    try:
+                        async with page.expect_navigation(wait_until='domcontentloaded', timeout=5000):
+                            await page.select_option(
+                                'select[name="ctl00$FixedWidthContent$CountyDD"]',
+                                value=county_value
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_load_state('networkidle', timeout=10000)
+                    except: pass
+                    await _re_asyncio.sleep(0.3)
+                    diag['county_selected_as'] = county
+                except Exception as e:
+                    diag['errors'].append(f'county select failed: {str(e)[:200]}')
+                    diag['county_selected_as'] = None
+
+                # Step 5: click the SPECIFIC search button
+                try:
+                    async with page.expect_navigation(wait_until='domcontentloaded', timeout=60000):
+                        await page.click('input[name="ctl00$FixedWidthContent$SearchBTN"]')
+                    try:
+                        await page.wait_for_load_state('networkidle', timeout=30000)
+                    except: pass
+                    await _re_asyncio.sleep(0.8)
+                    diag['submit_clicked'] = True
+                except Exception as e:
+                    diag['errors'].append(f'submit failed: {str(e)[:300]}')
+                    diag['submit_clicked'] = False
 
             diag['final_url'] = page.url
             try: diag['title'] = await page.title()
             except: pass
 
-            rows = await page.query_selector_all('table tr')
-            diag['rows_found_total'] = len(rows)
-            for row in rows[:30]:
-                cells = await row.query_selector_all('td')
-                texts = []
-                for c in cells:
-                    try: texts.append((await c.inner_text()).strip())
-                    except: texts.append('')
-                if len(cells) >= 6:
-                    diag['rows_with_6plus_cells'] += 1
-                    if texts and _re_re.search(r'\d{4}-C-\d+', texts[0]):
-                        diag['rows_matching_cert_regex'] += 1
-                if len(diag['first_few_rows_raw']) < 8 and texts:
-                    diag['first_few_rows_raw'].append({'cell_count': len(cells), 'cells': texts[:10]})
+            # Step 6: extract rows
+            try:
+                data = await page.evaluate(
+                    """() => {
+                        const tables = document.querySelectorAll('table');
+                        for (const t of tables) {
+                            if (/\\d{4}-C-\\d+/.test(t.innerText || '')) {
+                                const rows = [];
+                                t.querySelectorAll('tr').forEach(tr => {
+                                    const cells = Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim());
+                                    if (cells.length > 0) rows.push(cells);
+                                });
+                                return rows;
+                            }
+                        }
+                        return [];
+                    }"""
+                )
+                diag['rows_found_total'] = len(data or [])
+                for row in (data or [])[:30]:
+                    if len(row) >= 6:
+                        diag['rows_with_6plus_cells'] += 1
+                        if row[0] and _re_re.search(r'\d{4}-C-\d+', row[0]):
+                            diag['rows_matching_cert_regex'] += 1
+                    if len(diag['first_few_rows_raw']) < 8 and row:
+                        diag['first_few_rows_raw'].append({'cell_count': len(row), 'cells': row[:10]})
+            except Exception as e:
+                diag['errors'].append(f'row extract failed: {str(e)[:200]}')
 
             try:
                 txt = await page.inner_text('body')
                 diag['page_text_preview'] = txt[:3000]
-            except Exception as e:
-                diag['errors'].append(f'inner_text failed: {str(e)[:100]}')
-
-            try:
-                html_full = await page.content()
-                table_match = _re_re.search(r'<table[^>]*>.{0,8000}', html_full, _re_re.DOTALL|_re_re.IGNORECASE)
-                if table_match:
-                    diag['table_html_preview'] = table_match.group(0)[:5000]
-                else:
-                    diag['table_html_preview'] = '(no <table> found in page)'
-                    diag['html_head_preview'] = html_full[:3000]
-            except Exception as e:
-                diag['errors'].append(f'content() failed: {str(e)[:100]}')
+            except: pass
 
             await browser.close()
     except Exception as e:
