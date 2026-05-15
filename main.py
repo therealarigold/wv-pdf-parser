@@ -2851,6 +2851,22 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.respond({"success": False, "error": str(e)})
 
+        if path == "/refresh-diagnose":
+            # Diagnostic: load one county/year of wvsao.gov and return what we see.
+            # Usage: /refresh-diagnose?county=KANAWHA&year=2024
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            county = (qs.get('county', ['KANAWHA'])[0]).upper()
+            try:
+                year = int(qs.get('year', [2024])[0])
+            except:
+                year = 2024
+            try:
+                result = diagnose_wvsao_sync(county, year)
+                return self.respond({'success': True, 'diagnostic': result})
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                return self.respond({'success': False, 'error': str(e)})
         if path == "/build-data-bank":
             """Download WVDEP production data and load into Supabase."""
             import threading
@@ -3176,6 +3192,14 @@ def parse_pdf(pdf_bytes):
         return {'success':True,'data':result}
     except Exception as e:
         return {'success':False,'error':f'PDF parsing error: {str(e)}'}
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    print(f'WV Tax Lien API running on port {port} — 55 counties CAMA enabled')
+    ensure_chromium()
+    HTTPServer(('0.0.0.0', port), Handler).serve_forever()
+
 
 # ── O&G INTEL - PLAYWRIGHT SCRAPER ───────────────────────────────────────────
 # Scrapes WVDEP well database for active H6A (Marcellus/Utica) wells by county
@@ -3728,6 +3752,110 @@ async def run_wvsao_refresh(scope='daily_recent'):
     return log
 
 
+# ── DIAGNOSTIC ENDPOINT ──────────────────────────────────────────────────────
+# Returns raw page state from wvsao.gov for one county/year so we can see
+# exactly what the scraper is failing to parse.
+
+async def diagnose_wvsao_scrape(county, year):
+    """Load one county/year page on wvsao.gov and return everything we see."""
+    from playwright.async_api import async_playwright
+    diag = {
+        'county': county, 'year': year,
+        'final_url': None, 'title': None,
+        'rows_found_total': 0, 'rows_with_6plus_cells': 0,
+        'rows_matching_cert_regex': 0,
+        'first_few_rows_raw': [],
+        'page_text_preview': '', 'errors': []
+    }
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote'])
+            ctx = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            page = await ctx.new_page()
+            url = 'https://www.wvsao.gov/CountyCollections/CertifiedToState/Default'
+            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            await page.wait_for_timeout(2000)
+            try:
+                await page.select_option('select[name*="Year"]', value=str(year), timeout=5000)
+                await page.wait_for_timeout(800)
+                diag['year_selected'] = True
+            except Exception as e:
+                diag['errors'].append(f'year select failed: {str(e)[:200]}')
+                diag['year_selected'] = False
+            try:
+                await page.select_option('select[name*="County"]', label=county.title()+' County', timeout=5000)
+                diag['county_selected_as'] = county.title()+' County'
+            except Exception as e1:
+                try:
+                    await page.select_option('select[name*="County"]', label=county, timeout=3000)
+                    diag['county_selected_as'] = county
+                except Exception as e2:
+                    diag['errors'].append(f'county select failed: {str(e1)[:120]} / {str(e2)[:120]}')
+                    diag['county_selected_as'] = None
+            await page.wait_for_timeout(500)
+            try:
+                await page.click('input[type=submit]', timeout=3000)
+                await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                await page.wait_for_timeout(3000)
+                diag['submit_clicked'] = True
+            except Exception as e:
+                diag['errors'].append(f'submit failed: {str(e)[:200]}')
+                diag['submit_clicked'] = False
+
+            diag['final_url'] = page.url
+            try: diag['title'] = await page.title()
+            except: pass
+
+            rows = await page.query_selector_all('table tr')
+            diag['rows_found_total'] = len(rows)
+            for row in rows[:30]:
+                cells = await row.query_selector_all('td')
+                texts = []
+                for c in cells:
+                    try: texts.append((await c.inner_text()).strip())
+                    except: texts.append('')
+                if len(cells) >= 6:
+                    diag['rows_with_6plus_cells'] += 1
+                    if texts and _re_re.search(r'\d{4}-C-\d+', texts[0]):
+                        diag['rows_matching_cert_regex'] += 1
+                if len(diag['first_few_rows_raw']) < 8 and texts:
+                    diag['first_few_rows_raw'].append({'cell_count': len(cells), 'cells': texts[:10]})
+
+            try:
+                txt = await page.inner_text('body')
+                diag['page_text_preview'] = txt[:3000]
+            except Exception as e:
+                diag['errors'].append(f'inner_text failed: {str(e)[:100]}')
+
+            try:
+                html_full = await page.content()
+                table_match = _re_re.search(r'<table[^>]*>.{0,8000}', html_full, _re_re.DOTALL|_re_re.IGNORECASE)
+                if table_match:
+                    diag['table_html_preview'] = table_match.group(0)[:5000]
+                else:
+                    diag['table_html_preview'] = '(no <table> found in page)'
+                    diag['html_head_preview'] = html_full[:3000]
+            except Exception as e:
+                diag['errors'].append(f'content() failed: {str(e)[:100]}')
+
+            await browser.close()
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        diag['errors'].append(f'top-level: {str(e)}')
+
+    return diag
+
+
+def diagnose_wvsao_sync(county, year):
+    loop = _re_asyncio.new_event_loop()
+    _re_asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(diagnose_wvsao_scrape(county, year))
+    finally:
+        loop.close()
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # Sync wrapper
 def run_wvsao_refresh_sync(scope='daily_recent'):
     loop = _re_asyncio.new_event_loop()
@@ -3741,10 +3869,3 @@ def run_wvsao_refresh_sync(scope='daily_recent'):
         loop.close()
     return result
 # ═════════════════════════════════════════════════════════════════════════════
-
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    print(f'WV Tax Lien API running on port {port} — 55 counties CAMA enabled')
-    ensure_chromium()
-    HTTPServer(('0.0.0.0', port), Handler).serve_forever()
