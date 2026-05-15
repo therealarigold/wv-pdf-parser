@@ -3546,44 +3546,113 @@ def _re_sb_insert(table, rows):
 
 
 async def _re_scrape_county_year(page, year, county):
-    """Scrape a single year+county from WVSAO."""
-    url = 'https://www.wvsao.gov/CountyCollections/CertifiedToState/Default'
+    """Scrape a single year+county from WVSAO.
+    Uses the same proven flow as the working manual scraper scripts:
+    - Exact ASP.NET selector names
+    - Waits for postback after year change
+    - Clicks the specific Certified-to-State Search button
+    - Extracts rows via JS to find the table containing cert numbers
+    """
+    url = 'https://www.wvsao.gov/CountyCollections/Default'
     try:
+        # Step 1: load page fresh
         await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-        await page.wait_for_timeout(1000)
-        # Pick year + county
         try:
-            await page.select_option('select[name*="Year"]', value=str(year), timeout=5000)
-            await page.wait_for_timeout(500)
-        except: pass
-        try:
-            await page.select_option('select[name*="County"]', label=county.title()+' County', timeout=5000)
-            await page.wait_for_timeout(500)
+            await page.wait_for_load_state('networkidle', timeout=15000)
         except:
-            try:
-                await page.select_option('select[name*="County"]', label=county, timeout=3000)
-            except: pass
-        # Click search
-        try:
-            await page.click('input[type=submit]', timeout=3000)
-            await page.wait_for_load_state('domcontentloaded', timeout=15000)
-            await page.wait_for_timeout(1500)
-        except: pass
+            pass
+        await _re_asyncio.sleep(0.5)
 
-        # Parse rows from result table
+        # Step 2: select year (triggers ASP.NET postback - must wait for navigation)
+        try:
+            async with page.expect_navigation(wait_until='domcontentloaded', timeout=20000):
+                await page.select_option(
+                    'select[name="ctl00$FixedWidthContent$YearDD"]',
+                    value=str(year)
+                )
+            try:
+                await page.wait_for_load_state('networkidle', timeout=15000)
+            except:
+                pass
+            await _re_asyncio.sleep(0.5)
+        except Exception as e:
+            print(f'[refresh] year-select failed {year}/{county}: {e}', flush=True)
+            return []
+
+        # Step 3: find county value (county dropdown gets populated after year postback)
+        county_value = await page.evaluate(
+            """() => {
+                const sel = document.querySelector('select[name=\"ctl00$FixedWidthContent$CountyDD\"]');
+                if (!sel) return null;
+                const target = arguments_target_county;
+                for (const o of sel.options) {
+                    if (o.text.trim().toUpperCase() === target) return o.value;
+                }
+                return null;
+            }""".replace('arguments_target_county', repr(county.upper()))
+        )
+        if not county_value:
+            print(f'[refresh] county not found {year}/{county}', flush=True)
+            return []
+
+        # Step 4: select county (may or may not trigger postback - handle both)
+        try:
+            async with page.expect_navigation(wait_until='domcontentloaded', timeout=5000):
+                await page.select_option(
+                    'select[name="ctl00$FixedWidthContent$CountyDD"]',
+                    value=county_value
+                )
+        except Exception:
+            # No navigation happened - that's fine
+            pass
+        try:
+            await page.wait_for_load_state('networkidle', timeout=10000)
+        except:
+            pass
+        await _re_asyncio.sleep(0.3)
+
+        # Step 5: click the SPECIFIC Certified-to-State Search button
+        try:
+            async with page.expect_navigation(wait_until='domcontentloaded', timeout=60000):
+                await page.click('input[name="ctl00$FixedWidthContent$SearchBTN"]')
+            try:
+                await page.wait_for_load_state('networkidle', timeout=30000)
+            except:
+                pass
+            await _re_asyncio.sleep(0.5)
+        except Exception as e:
+            print(f'[refresh] search-click failed {year}/{county}: {e}', flush=True)
+            return []
+
+        # Step 6: extract rows via JS - find the table containing cert numbers
+        data = await page.evaluate(
+            """() => {
+                const tables = document.querySelectorAll('table');
+                for (const t of tables) {
+                    if (/\\d{4}-C-\\d+/.test(t.innerText || '')) {
+                        const dataRows = [];
+                        t.querySelectorAll('tr').forEach(tr => {
+                            const cells = Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim());
+                            if (cells.length > 0) dataRows.push(cells);
+                        });
+                        return dataRows;
+                    }
+                }
+                return [];
+            }"""
+        )
+
+        # Filter to rows that actually have a cert number
         rows_out = []
-        rows = await page.query_selector_all('table tr')
-        for row in rows:
-            cells = await row.query_selector_all('td')
-            if len(cells) < 6: continue
-            texts = []
-            for c in cells:
-                t = (await c.inner_text()).strip()
-                texts.append(t)
-            # Cert # should match pattern in first cell
-            if not _re_re.search(r'\d{4}-C-\d+', texts[0]): continue
-            rows_out.append(texts)
+        for row in (data or []):
+            if not row or len(row) < 6:
+                continue
+            if not _re_re.search(r'\d{4}-C-\d+', row[0] or ''):
+                continue
+            rows_out.append(row)
+
         return rows_out
+
     except Exception as e:
         print(f'[refresh] scrape {year}/{county} error: {e}', flush=True)
         return []
