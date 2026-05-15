@@ -3704,10 +3704,13 @@ async def run_wvsao_refresh(scope='daily_recent'):
         'errors': [], 'status': 'success', 'notes': ''
     }
 
-    # Determine years to scrape (autodetect would need a page load - we'll use calendar)
+    # Determine years to scrape based on what's actually in wvsao.gov dropdown.
+    # The dropdown shows TAX YEAR (CERT YEAR) — e.g. "2024 (2025-C)".
+    # The state publishes a new tax year roughly 6 months after the calendar year ends.
+    # In May 2026, the most recent tax year in the dropdown is 2024 (which holds 2025-C certs).
+    # Safe rule: most recent tax year available = calendar year minus 2.
     current_year = _re_dt.now().year
-    # Tax years run 1 behind calendar year
-    most_recent_tax = current_year - 1
+    most_recent_tax = current_year - 2
     if scope == 'daily_recent':
         years = [most_recent_tax, most_recent_tax - 1]
     else:
