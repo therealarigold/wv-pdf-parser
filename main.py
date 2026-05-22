@@ -3804,9 +3804,93 @@ async def run_wvsao_refresh(scope='daily_recent'):
             log['new_buyer_ids'] = [b['id'] for b in inserted if 'id' in b]
         print(f'[refresh] Inserted {log["new_buyers"]} new buyers', flush=True)
 
-    # 5. Recompute buyer stats (totals, per-year, status counts) for ALL buyers affected
-    # For simplicity, recompute for all buyers using a SQL function would be cleaner,
-    # but for now we'll skip — the buyer rows update via a separate maintenance call
+    # 5. Recompute buyer stats (totals, per-year, status counts) for ALL buyers
+    # This was previously skipped, causing stale counts. Now it runs every scrape.
+    try:
+        print('[refresh] Recomputing buyer stats...', flush=True)
+
+        # Pull all certs (just the fields we need)
+        all_certs = _re_sb_get('wvsao_certs?select=buyer_normalized,year,status')
+
+        # Build per-buyer aggregate
+        VOIDED_STATUSES = {'CANCELED','DISMISSED','ERRONEOUS ASSESSMENT','BANKRUPTCY'}
+        buyer_stats = {}  # buyer_normalized -> dict of counts
+        for c in all_certs:
+            norm = c.get('buyer_normalized')
+            if not norm: continue
+            if norm not in buyer_stats:
+                buyer_stats[norm] = {
+                    'total_certs': 0,
+                    'deeded_count': 0, 'redeemed_count': 0, 'sold_count': 0,
+                    'certified_count': 0, 'no_bid_count': 0, 'voided_count': 0,
+                    'years': {},  # year -> count
+                }
+            s = buyer_stats[norm]
+            s['total_certs'] += 1
+            status = (c.get('status') or '').upper()
+            if status == 'DEEDED': s['deeded_count'] += 1
+            elif status == 'REDEEMED': s['redeemed_count'] += 1
+            elif status == 'SOLD': s['sold_count'] += 1
+            elif status == 'CERTIFIED': s['certified_count'] += 1
+            elif status == 'NO BID': s['no_bid_count'] += 1
+            elif status in VOIDED_STATUSES: s['voided_count'] += 1
+            yr = str(c.get('year') or '')
+            if yr:
+                s['years'][yr] = s['years'].get(yr, 0) + 1
+
+        # Pull all buyers
+        all_buyers = _re_sb_get('wvsao_buyers?select=id,normalized_name,total_certs,deeded_count,redeemed_count,sold_count,certified_count,no_bid_count,voided_count,certs_2021,certs_2022,certs_2023,certs_2024')
+
+        # Build update list — only buyers whose stats actually changed
+        updates = []
+        for b in all_buyers:
+            norm = b.get('normalized_name')
+            if not norm: continue
+            s = buyer_stats.get(norm, {
+                'total_certs': 0,
+                'deeded_count': 0, 'redeemed_count': 0, 'sold_count': 0,
+                'certified_count': 0, 'no_bid_count': 0, 'voided_count': 0,
+                'years': {},
+            })
+            new_row = {
+                'id': b['id'],
+                'total_certs': s['total_certs'],
+                'deeded_count': s['deeded_count'],
+                'redeemed_count': s['redeemed_count'],
+                'sold_count': s['sold_count'],
+                'certified_count': s['certified_count'],
+                'no_bid_count': s['no_bid_count'],
+                'voided_count': s['voided_count'],
+                'certs_2021': s['years'].get('2021', 0),
+                'certs_2022': s['years'].get('2022', 0),
+                'certs_2023': s['years'].get('2023', 0),
+                'certs_2024': s['years'].get('2024', 0),
+            }
+            # Only include if any value differs from current row
+            changed = False
+            for k, v in new_row.items():
+                if k == 'id': continue
+                if (b.get(k) or 0) != v:
+                    changed = True
+                    break
+            if changed:
+                updates.append(new_row)
+
+        # Upsert in batches
+        if updates:
+            BATCH = 200
+            for i in range(0, len(updates), BATCH):
+                batch = updates[i:i+BATCH]
+                _re_sb_upsert('wvsao_buyers', batch, 'id')
+            print(f'[refresh] Updated stats on {len(updates)} buyers', flush=True)
+            log['buyer_stats_updated'] = len(updates)
+        else:
+            print('[refresh] No buyer stats needed updating', flush=True)
+            log['buyer_stats_updated'] = 0
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f'[refresh] Buyer stats recompute FAILED: {e}', flush=True)
+        log['buyer_stats_error'] = str(e)
 
     duration = (_re_dt.now() - start_ts).total_seconds()
     log['duration_seconds'] = int(duration)
