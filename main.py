@@ -3514,9 +3514,32 @@ def _re_sb_get(path):
     return out
 
 
-def _re_sb_upsert(table, rows, on_conflict):
-    """Supabase upsert batch."""
+# Every row in one bulk POST must carry the SAME keys or PostgREST rejects the
+# whole batch. These three are optional per-row, so they are filled in on every
+# row before sending; without this a single flip discards up to 500 certs.
+_RE_CERT_OPTIONAL = {'previous_status': None, 'status_changed_at': None, 'was_late_round_flip': False}
+
+def _re_norm_cert_rows(rows):
+    """Give every cert row an identical key set (see _RE_CERT_OPTIONAL)."""
+    keys = set()
+    for r in rows:
+        keys.update(r.keys())
+    for r in rows:
+        for k in keys:
+            if k not in r:
+                r[k] = _RE_CERT_OPTIONAL.get(k)
+    return rows
+
+
+def _re_sb_upsert(table, rows, on_conflict, log=None):
+    """Supabase upsert batch. Returns True on success.
+
+    Failures are LOUD: a rejected batch used to look identical to a clean run,
+    which is how months of status changes went missing unnoticed.
+    """
     if not rows: return True
+    if table == 'wvsao_certs':
+        _re_norm_cert_rows(rows)
     h = dict(_RE_HEADERS)
     h['Prefer'] = 'resolution=merge-duplicates,return=minimal'
     url = f'{_RE_SUPABASE_URL}/rest/v1/{table}?on_conflict={on_conflict}'
@@ -3526,7 +3549,17 @@ def _re_sb_upsert(table, rows, on_conflict):
         with _re_ur.urlopen(req, timeout=60) as r:
             return True
     except Exception as e:
-        print(f'[refresh] SB upsert error: {e}', flush=True)
+        body = ''
+        try:
+            body = e.read().decode('utf-8', 'replace')[:400]
+        except Exception:
+            pass
+        msg = f'{table} upsert FAILED ({len(rows)} rows): {e} {body}'.strip()
+        print(f'[refresh] !! {msg}', flush=True)
+        if log is not None:
+            log.setdefault('errors', []).append(msg)
+            log['rows_lost'] = log.get('rows_lost', 0) + len(rows)
+            log['status'] = 'partial'
         return False
 
 
@@ -3721,7 +3754,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
     print(f'[refresh] Loading existing certs from DB...', flush=True)
     existing = {}
     for y in years:
-        rows = _re_sb_get(f'wvsao_certs?year=eq.{y}&select=year,county,cert_number,status,buyer_normalized,buyer_name_raw')
+        rows = _re_sb_get(f'wvsao_certs?year=eq.{y}&select=year,county,cert_number,status,buyer_normalized,buyer_name_raw,was_late_round_flip')
         for r in rows:
             key = (r['year'], r['county'], r['cert_number'])
             existing[key] = r
@@ -3764,10 +3797,14 @@ async def run_wvsao_refresh(scope='daily_recent'):
                         log['status_changes'] += 1
                         flip = f"{old['status']}_TO_{parsed['status']}".replace(' ','_')
                         log['status_change_summary'][flip] = log['status_change_summary'].get(flip, 0) + 1
-                        # Detect late-round flip specifically
-                        if old['status'] == 'NO BID' and parsed['status'] == 'SOLD':
+                        # An online-round pickup: a leftover cert acquires a buyer.
+                        # NO BID goes to the State Auditor as CERTIFIED before it is
+                        # resold, so BOTH transitions are the same real-world event.
+                        was_flip = bool(old.get('was_late_round_flip'))
+                        if parsed['status'] == 'SOLD' and old['status'] in ('NO BID', 'CERTIFIED'):
                             log['late_round_flips'] += 1
-                            parsed['was_late_round_flip'] = True
+                            was_flip = True
+                        parsed['was_late_round_flip'] = was_flip   # never lose an earlier flip
                         parsed['previous_status'] = old['status']
                         parsed['status_changed_at'] = _re_dt.utcnow().isoformat()
                         cert_upserts.append(parsed)
@@ -3784,7 +3821,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
 
                 # Upsert batch every 500 to avoid huge requests
                 if len(cert_upserts) >= 500:
-                    _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number')
+                    _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number', log)
                     cert_upserts = []
 
             print(f'[refresh] Year {year} done. {log["counties_scraped"]} counties so far.', flush=True)
@@ -3793,7 +3830,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
 
     # Flush remaining
     if cert_upserts:
-        _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number')
+        _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number', log)
 
     # 4. Insert new buyers
     if new_buyer_norms_seen:
@@ -3881,7 +3918,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
             BATCH = 200
             for i in range(0, len(updates), BATCH):
                 batch = updates[i:i+BATCH]
-                _re_sb_upsert('wvsao_buyers', batch, 'id')
+                _re_sb_upsert('wvsao_buyers', batch, 'id', log)
             print(f'[refresh] Updated stats on {len(updates)} buyers', flush=True)
             log['buyer_stats_updated'] = len(updates)
         else:
@@ -3898,6 +3935,8 @@ async def run_wvsao_refresh(scope='daily_recent'):
     # 6. Write log entry
     _re_sb_insert('wvsao_refresh_log', [log])
 
+    if log.get('rows_lost'):
+        print(f'[refresh] !! {log["rows_lost"]} rows FAILED TO SAVE - counts above were detected but not written', flush=True)
     print(f'[refresh] DONE: {log["new_certs"]} new, {log["status_changes"]} changed, {log["new_buyers"]} new buyers, {log["late_round_flips"]} late flips, {duration:.0f}s', flush=True)
 
     return log
