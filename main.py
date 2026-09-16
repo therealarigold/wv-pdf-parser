@@ -3729,11 +3729,22 @@ async def run_wvsao_refresh(scope='daily_recent'):
     # Safe rule: most recent tax year available = calendar year minus 2.
     current_year = _re_dt.now().year
     most_recent_tax = current_year - 2
+    # The daily scope only watches the two newest tax years, so a NO BID cert from
+    # an earlier year was never re-checked and a flip on it could never be seen -
+    # which is exactly what the online rounds sell. One day a week the daily run
+    # upgrades itself to the full sweep, so nothing new has to be scheduled.
+    if scope == 'daily_recent' and _re_dt.now().weekday() == WEEKLY_FULL_WEEKDAY:
+        scope = 'weekly_full'
+        log['scrape_scope'] = scope
+        log['notes'] = (log.get('notes') or '') + 'daily run upgraded to full sweep (weekly); '
+        print('[refresh] Weekly full sweep day - covering all tax years', flush=True)
+
     if scope == 'daily_recent':
         years = [most_recent_tax, most_recent_tax - 1]
     else:
-        years = list(range(2021, most_recent_tax + 1))
+        years = list(range(EARLIEST_TAX_YEAR, most_recent_tax + 1))
     log['years_scraped'] = [str(y) for y in years]
+    print(f'[refresh] scope={scope} years={log["years_scraped"]}', flush=True)
 
     # 1. Pull existing certs from DB into a map for fast lookup
     print(f'[refresh] Loading existing certs from DB...', flush=True)
@@ -4081,6 +4092,13 @@ def diagnose_wvsao_sync(county, year):
 
 
 # Sync wrapper
+# Which weekday the daily run does the full sweep instead. 0=Mon ... 6=Sun.
+WEEKLY_FULL_WEEKDAY = 6
+# How far back the full sweep reaches. Online rounds resell leftovers from older
+# tax years, so this is the real limit on which flips can ever be detected.
+EARLIEST_TAX_YEAR = 2021
+
+
 def run_wvsao_refresh_sync(scope='daily_recent'):
     loop = _re_asyncio.new_event_loop()
     _re_asyncio.set_event_loop(loop)
