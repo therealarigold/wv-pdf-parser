@@ -3878,7 +3878,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
                 s['years'][yr] = s['years'].get(yr, 0) + 1
 
         # Pull all buyers
-        all_buyers = _re_sb_get('wvsao_buyers?select=id,normalized_name,total_certs,deeded_count,redeemed_count,sold_count,certified_count,no_bid_count,voided_count,certs_2021,certs_2022,certs_2023,certs_2024')
+        all_buyers = _re_sb_get('wvsao_buyers?select=id,normalized_name,display_name,total_certs,deeded_count,redeemed_count,sold_count,certified_count,no_bid_count,voided_count,certs_2021,certs_2022,certs_2023,certs_2024')
 
         # Build update list — only buyers whose stats actually changed
         updates = []
@@ -3893,6 +3893,11 @@ async def run_wvsao_refresh(scope='daily_recent'):
             })
             new_row = {
                 'id': b['id'],
+                # Required columns: the upsert is an INSERT ... ON CONFLICT, and Postgres
+                # checks NOT NULL before resolving the conflict, so without these every
+                # batch was rejected (stats frozen since 2026-09-16).
+                'normalized_name': norm,
+                'display_name': b.get('display_name') or norm,   # sent back unchanged (fetched above)
                 'total_certs': s['total_certs'],
                 'deeded_count': s['deeded_count'],
                 'redeemed_count': s['redeemed_count'],
@@ -3908,7 +3913,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
             # Only include if any value differs from current row
             changed = False
             for k, v in new_row.items():
-                if k == 'id': continue
+                if k in ('id', 'normalized_name', 'display_name'): continue
                 if (b.get(k) or 0) != v:
                     changed = True
                     break
@@ -3920,7 +3925,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
             BATCH = 200
             for i in range(0, len(updates), BATCH):
                 batch = updates[i:i+BATCH]
-                _re_sb_upsert('wvsao_buyers', batch, 'id')
+                _re_sb_upsert('wvsao_buyers', batch, 'id', log)   # failures recorded in the run log
             print(f'[refresh] Updated stats on {len(updates)} buyers', flush=True)
             log['buyer_stats_updated'] = len(updates)
         else:
