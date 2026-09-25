@@ -2249,7 +2249,17 @@ def run_assessment(county, ticket, owner, district, map_num, parcel, min_bid, de
 # O&G DATA BANK - Download WVDEP production data into Supabase
 # ═══════════════════════════════════════════════════════════════════
 SUPABASE_URL_DB = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
-SUPABASE_KEY_DB = "sb_publishable_X1nUMQ4GQfiPj-AsVvigwQ_7g3d4i95"
+# Private key from Render (Environment -> SUPABASE_SECRET_KEY, an sb_secret_... key).
+# The tables the scraper writes are closed to the public key, so it needs this.
+# Without it we fall back to the public key, which is how it always ran.
+SUPABASE_KEY_DB = os.environ.get("SUPABASE_SECRET_KEY", "").strip() or "sb_publishable_X1nUMQ4GQfiPj-AsVvigwQ_7g3d4i95"
+def _sb_auth_headers(key):
+    # Secret keys go on the apikey header only - Supabase rejects them as a Bearer
+    # token. The public key keeps both headers, exactly as before.
+    if key.startswith("sb_secret_"):
+        return {"apikey": key}
+    return {"apikey": key, "Authorization": f"Bearer {key}"}
+print("[supabase] using", "private key" if SUPABASE_KEY_DB.startswith("sb_secret_") else "public key", flush=True)
 BANK_BUILD_STATUS = {"state": "idle", "progress": "", "records": 0, "errors": []}
 
 WVDEP_PRODUCTION_URLS = {
@@ -2359,7 +2369,7 @@ def _supabase_insert(table, batch):
     req = urllib.request.Request(
         f"{SUPABASE_URL_DB}/rest/v1/{table}",
         data=data,
-        headers={"apikey": SUPABASE_KEY_DB, "Authorization": f"Bearer {SUPABASE_KEY_DB}",
+        headers={**_sb_auth_headers(SUPABASE_KEY_DB),
                  "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates"},
         method="POST"
     )
@@ -2379,7 +2389,7 @@ def lookup_production_data(owner_name, county):
         qs = f"owner_name=ilike.*{urllib.parse.quote(search)}*&county=eq.{urllib.parse.quote(county_up)}&order=year.desc&limit=10"
         req = urllib.request.Request(
             f"{SUPABASE_URL_DB}/rest/v1/og_production?{qs}",
-            headers={"apikey": SUPABASE_KEY_DB, "Authorization": f"Bearer {SUPABASE_KEY_DB}"}
+            headers=_sb_auth_headers(SUPABASE_KEY_DB)
         )
         with urllib.request.urlopen(req, timeout=8) as r:
             return json.loads(r.read())
@@ -2409,7 +2419,7 @@ def get_cached_tax_data(county, ticket):
         qs = f"county=eq.{urllib.parse.quote(county_up)}&ticket=eq.{urllib.parse.quote(str(ticket))}&limit=1"
         req = urllib.request.Request(
             f"{SUPABASE_URL_DB}/rest/v1/og_tax_data?{qs}",
-            headers={"apikey": SUPABASE_KEY_DB, "Authorization": f"Bearer {SUPABASE_KEY_DB}"}
+            headers=_sb_auth_headers(SUPABASE_KEY_DB)
         )
         with urllib.request.urlopen(req, timeout=8) as r:
             rows = json.loads(r.read())
@@ -3458,11 +3468,10 @@ from datetime import datetime as _re_dt
 
 # Reuse the existing Supabase creds from earlier in file
 _RE_SUPABASE_URL = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
-_RE_SUPABASE_KEY = "sb_publishable_X1nUMQ4GQfiPj-AsVvigwQ_7g3d4i95"
+_RE_SUPABASE_KEY = SUPABASE_KEY_DB          # private key when set on Render
 
 _RE_HEADERS = {
-    "apikey": _RE_SUPABASE_KEY,
-    "Authorization": f"Bearer {_RE_SUPABASE_KEY}",
+    **_sb_auth_headers(_RE_SUPABASE_KEY),
     "Content-Type": "application/json",
 }
 
