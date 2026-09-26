@@ -2843,9 +2843,18 @@ class Handler(BaseHTTPRequestHandler):
                     run_wvsao_refresh_sync(scope=scope)
                 except Exception as e:
                     import traceback; traceback.print_exc()
+                run_og_refresh_if_due()          # well production: once a week
             t = threading.Thread(target=run_refresh_bg, daemon=True)
             t.start()
             return self.respond({"status": "started", "scope": scope, "message": "Refresh running in background. Check Supabase wvsao_refresh_log for progress."})
+
+        if path == "/refresh-og":
+            # Reload WV DEP wells + monthly production now (background). Progress: /og-status
+            _og_threading.Thread(target=run_og_refresh, daemon=True).start()
+            return self.respond({"status": "started", "message": "Loading well production in background. Check /og-status."})
+
+        if path == "/og-status":
+            return self.respond({"status": OG_STATUS})
 
         if path == "/refresh-status":
             # Returns the most recent refresh log entry from Supabase.
@@ -4124,6 +4133,156 @@ def run_wvsao_refresh_sync(scope='daily_recent'):
     finally:
         loop.close()
     return result
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 🛢️ WELL PRODUCTION (WV DEP) → og_well / og_prod / og_meta   (portal: og_info)
+# Every DEP well (name, number, status, operator) from the TAGIS map service, and
+# monthly gas/oil per well from the DEP's yearly production files (2022 on; a year
+# is published the following year). Weekly, after the daily refresh, or /refresh-og.
+# ═════════════════════════════════════════════════════════════════════════════
+OG_WELLS_URL = "https://tagis.dep.wv.gov/arcgis/rest/services/WVDEP_enterprise/oil_gas/MapServer/7/query"
+OG_PROD_URL = "https://apps.dep.wv.gov/Documents/OOG/ProductionReports/{d}/{y}Production.xlsx"
+OG_FIRST_YEAR = 2022
+OG_STATUS = {"state": "idle"}
+import threading as _og_threading
+_og_lock = _og_threading.Lock()
+
+
+def _og_get(url, timeout=120):
+    req = _re_ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with _re_ur.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _og_load_wells(log):
+    """All DEP wells, one row per API (the service repeats a well once per completion)."""
+    fields = "objectid,api,county,permit,farmname,wellnumber,wellstatus,welltype,welluse,respparty,formation,compdate"
+    offset, seen, batch, total = 0, {}, [], 0
+    while True:
+        q = _re_up.urlencode({"where": "1=1", "outFields": fields, "returnGeometry": "true", "outSR": 4326,
+                              "orderByFields": "objectid", "resultOffset": offset, "resultRecordCount": 2000, "f": "json"})
+        d = _re_json.loads(_og_get(OG_WELLS_URL + "?" + q))
+        feats = d.get("features") or []
+        for f in feats:
+            a, g = f.get("attributes") or {}, f.get("geometry") or {}
+            api = str(a.get("api") or "").strip()
+            if len(api) != 10 or not api.startswith("47"): continue
+            row = {"api": api, "county_code": api[2:5], "permit": a.get("permit"),
+                   "farm": (a.get("farmname") or "").strip() or None, "well_no": (a.get("wellnumber") or "").strip() or None,
+                   "status": a.get("wellstatus"), "well_type": a.get("welltype"), "well_use": (a.get("welluse") or "").strip() or None,
+                   "operator": a.get("respparty"), "formation": a.get("formation"), "comp_date": a.get("compdate"),
+                   "lat": round(g["y"], 6) if g.get("y") is not None else None,
+                   "lng": round(g["x"], 6) if g.get("x") is not None else None}
+            prev = seen.get(api)
+            if prev is not None:
+                # same well again: keep the latest completion date only
+                if (row["comp_date"] or "") > (prev["comp_date"] or ""): prev["comp_date"] = row["comp_date"]
+                continue
+            seen[api] = row
+            batch.append(row)
+        while len(batch) >= 1000:
+            _re_sb_upsert("og_well", batch[:1000], "api", log); total += 1000; batch = batch[1000:]
+        OG_STATUS["progress"] = f"wells: {len(seen)}"
+        if not feats or not d.get("exceededTransferLimit"): break
+        offset += len(feats)
+    if batch: _re_sb_upsert("og_well", batch, "api", log); total += len(batch)
+    return len(seen)
+
+
+def _og_load_year(year, log):
+    """One yearly production file. Several companies can report the same well: summed."""
+    import openpyxl, io, gc
+    url = OG_PROD_URL.format(d=f"{year // 10 * 10}-{year // 10 * 10 + 9}", y=year)
+    try:
+        data = _og_get(url, timeout=300)
+    except Exception as e:
+        if getattr(e, "code", None) == 404: return None        # not published yet
+        raise
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    data = None
+    ws = wb.active
+    rows = ws.iter_rows(values_only=True)
+    hdr = [str(h or "").strip().lower() for h in next(rows)]
+    ix = lambda n: hdr.index(n.lower())
+    api_i, op_i = ix("API"), ix("Operator")
+    gas_i = [ix(m + "_Gas") for m in ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")]
+    oil_i = [ix(m + "_Oil") for m in ("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")]
+    def num(v):
+        try: return float(v or 0)
+        except (TypeError, ValueError): return 0.0
+    wells, state_gas = {}, [0.0] * 12
+    for r in rows:
+        api = str(r[api_i] or "").strip()
+        if len(api) != 10: continue
+        gas = [num(r[i]) for i in gas_i]; oil = [num(r[i]) for i in oil_i]
+        for m in range(12): state_gas[m] += gas[m]
+        w = wells.setdefault(api, {"gas": [0.0] * 12, "oil": [0.0] * 12, "op": None, "best": -1})
+        for m in range(12): w["gas"][m] += gas[m]; w["oil"][m] += oil[m]
+        t = sum(gas) + sum(oil)
+        if t > w["best"]: w["best"], w["op"] = t, (r[op_i] or None)
+    wb.close(); gc.collect()
+    batch, n = [], 0
+    for api, w in wells.items():
+        if not any(w["gas"]) and not any(w["oil"]): continue   # nothing produced: absence says the same
+        batch.append({"api": api, "year": year, "gas": [int(round(v)) for v in w["gas"]],
+                      "oil": [int(round(v)) for v in w["oil"]], "operator": w["op"]})
+        if len(batch) >= 1000:
+            _re_sb_upsert("og_prod", batch, "api,year", log); n += len(batch); batch = []
+    if batch: _re_sb_upsert("og_prod", batch, "api,year", log); n += len(batch)
+    return {"wells": n, "state_gas": [int(v) for v in state_gas]}
+
+
+def run_og_refresh():
+    """Load wells + production. Returns a summary; progress in OG_STATUS."""
+    if not _og_lock.acquire(blocking=False):
+        return {"status": "already running"}
+    started = _re_dt.utcnow().isoformat() + "Z"
+    log = {}
+    try:
+        OG_STATUS.clear(); OG_STATUS.update({"state": "running", "started": started, "progress": "wells"})
+        wells = _og_load_wells(log)
+        years, latest = {}, None
+        for y in range(OG_FIRST_YEAR, _re_dt.utcnow().year + 1):
+            OG_STATUS["progress"] = f"production {y}"
+            res = _og_load_year(y, log)
+            if not res: continue
+            years[y] = res["wells"]
+            sg = res["state_gas"]
+            full = [v for v in sg if v > 0]
+            if full:
+                avg = sum(full) / len(full)
+                m = max(i for i, v in enumerate(sg) if v > avg * 0.5)
+                latest = {"year": y, "month": m + 1}
+        summary = {"wells": wells, "years": years, "latest": latest, "errors": log.get("errors", [])[:5],
+                   "started": started, "finished": _re_dt.utcnow().isoformat() + "Z"}
+        now = _re_dt.utcnow().isoformat() + "Z"
+        meta = [{"k": "loaded", "v": summary, "updated_at": now}]
+        if latest: meta.append({"k": "latest", "v": latest, "updated_at": now})
+        _re_sb_upsert("og_meta", meta, "k", log)
+        OG_STATUS.clear(); OG_STATUS.update({"state": "done", **summary})
+        print(f"[og] done: {summary}", flush=True)
+        return summary
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        OG_STATUS.clear(); OG_STATUS.update({"state": "failed", "error": str(e), "started": started})
+        return {"status": "failed", "error": str(e)}
+    finally:
+        _og_lock.release()
+
+
+def run_og_refresh_if_due(days=7):
+    """Called after the daily refresh: reload the well data once a week."""
+    try:
+        rows = _re_sb_get("og_meta?select=updated_at&k=eq.loaded")
+        if rows:
+            last = _re_dt.fromisoformat(rows[0]["updated_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+            if (_re_dt.utcnow() - last).days < days: return None
+        return run_og_refresh()
+    except Exception as e:
+        print(f"[og] weekly check failed: {e}", flush=True)
+        return None
 # ═════════════════════════════════════════════════════════════════════════════
 
 
