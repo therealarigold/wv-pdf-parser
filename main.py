@@ -4713,7 +4713,7 @@ def fernando_work_one():
     run = _fz_rpc("fernando_claim", {})
     if not run: return False
     county, cert = run["county"], run["cert"]
-    FERNANDO.update({"state": "working", "current": f"{county} {cert}"})
+    FERNANDO.setdefault("working", {})[f"{county} {cert}"] = _re_dt.utcnow().isoformat() + "Z"
     try:
         if county not in IDX2_URLS:
             if county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
@@ -4732,13 +4732,13 @@ def fernando_work_one():
         try: _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "failed", "p_reason": str(e)[:300]})
         except Exception: pass
     finally:
-        FERNANDO.update({"state": "idle", "last": f"{county} {cert}"}); FERNANDO.pop("current", None)
+        FERNANDO.get("working", {}).pop(f"{county} {cert}", None); FERNANDO["last"] = f"{county} {cert}"
     return True
 
 
-def fernando_loop():
+def fernando_loop(n=0):
     import time as _t
-    _t.sleep(30)                                       # let the server start first
+    _t.sleep(30 + 20 * n)                              # let the server start first; workers start a little apart
     while True:
         try:
             worked = fernando_work_one()
@@ -4911,5 +4911,6 @@ if __name__ == '__main__':
     print(f'WV Tax Lien API running on port {port} — 55 counties CAMA enabled')
     ensure_chromium()
     if os.environ.get("SUPABASE_SECRET_KEY"):
-        _og_threading.Thread(target=fernando_loop, daemon=True).start()   # 🤖 Fernando
+        for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
+            _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
