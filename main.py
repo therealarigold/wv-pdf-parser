@@ -4393,7 +4393,9 @@ def _idx2_open(pg, county, url):
     """Open a county's IDX search page; sign in first where the county requires an account.
     The username / password are Render secrets IDX_<COUNTY>_USER / IDX_<COUNTY>_PASS (set by the office, never in code)."""
     pg.goto(url, wait_until="networkidle", timeout=60000)
-    if pg.locator("#popLogin_LoginPanel_pan_txtUser_I").count():
+    # a login is needed only when the site sends us to its login page (many pages carry a hidden, optional login box)
+    box = pg.locator("#popLogin_LoginPanel_pan_txtUser_I")
+    if "login.aspx" in pg.url.lower() or (box.count() and box.first.is_visible()):
         user = os.environ.get(f"IDX_{county}_USER", "").strip()
         pw = os.environ.get(f"IDX_{county}_PASS", "").strip()
         if not (user and pw):
