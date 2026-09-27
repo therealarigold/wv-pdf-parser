@@ -2856,6 +2856,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/og-status":
             return self.respond({"status": OG_STATUS})
 
+        if path == "/idx-survey":
+            # From this server: which county record sites open, and do they have the IDX search controls?
+            import time as _t
+            def check(item):
+                county, url = item
+                t0 = _t.time()
+                try:
+                    req = _re_ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with _re_ur.urlopen(req, timeout=20) as r:
+                        html = r.read(400000).decode("utf-8", "replace")
+                    m = _re_re.search(r"<title[^>]*>(.*?)</title>", html, _re_re.I | _re_re.S)
+                    return county, {"ok": True, "title": (m.group(1).strip()[:60] if m else None),
+                                    "name_boxes": "txtLname" in html, "grid": "grd" in html, "captcha": "recaptcha" in html.lower(),
+                                    "login_form": bool(_re_re.search(r'type=["\']password', html)) and "txtLname" not in html,
+                                    "s": round(_t.time() - t0, 1)}
+                except Exception as e:
+                    return county, {"ok": False, "error": str(e)[:120], "s": round(_t.time() - t0, 1)}
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(8) as ex:
+                res = dict(ex.map(check, IDX2_SURVEY.items()))
+            return self.respond(res)
+
         if path == "/idx-owner":
             # Start an owner report (background). ?last=MOAG&first=JOSEPH[&book=974&page=518][&county=MARSHALL]
             from urllib.parse import parse_qs, urlparse
@@ -4183,6 +4205,29 @@ def run_wvsao_refresh_sync(scope='daily_recent'):
 # then /idx-owner-result?job=...  (Marshall only for now.)
 # ═════════════════════════════════════════════════════════════════════════════
 IDX2_URLS = {"MARSHALL": "http://129.71.117.225/"}
+# County record sites found 2026-09-27 (county clerk pages + NETR); /idx-survey checks them from here.
+IDX2_SURVEY = {
+    "BARBOUR": "http://129.71.117.241/WEBInquiry/Default.aspx", "BOONE": "http://129.71.203.53/", "BROOKE": "http://129.71.117.252/",
+    "CABELL": "http://www.recordscabellcountyclerk.org/Default.aspx", "DODDRIDGE": "http://129.71.118.43/", "FAYETTE": "http://129.71.202.7/",
+    "GILMER": "http://www.gilmercountywv.gov/idxsearch/", "GRANT": "http://129.71.112.124/", "GREENBRIER": "http://129.71.205.208/",
+    "HAMPSHIRE": "http://129.71.205.207/idxsearch", "HANCOCK": "https://hancockwv.compiled-technologies.com/",
+    "HARRISON": "http://lookup.harrisoncountywv.com/", "JEFFERSON": "http://documents.jeffersoncountywv.org/",
+    "LEWIS": "http://inquiry.lewiscountywv.org/", "LINCOLN": "http://129.71.206.62/Default.aspx", "LOGAN": "https://loganwv.compiled-technologies.com/",
+    "MCDOWELL": "http://mcdowellcountyclerk.com/", "MARION": "http://129.71.118.22/", "MARSHALL": "http://129.71.117.225/",
+    "MASON": "http://129.71.206.28/", "MINERAL": "http://129.71.112.118/Default.aspx", "MINGO": "https://mingowv.compiled-technologies.com/",
+    "MONONGALIA": "https://searchrecords.monongaliacountyclerk.com/", "MONROE": "https://monroewv.compiled-technologies.com/",
+    "MORGAN": "http://129.71.118.67/", "NICHOLAS": "https://nicholaswv.compiled-technologies.com/", "OHIO": "http://129.71.117.182/",
+    "PENDLETON": "http://129.71.118.1/", "PLEASANTS": "https://pleasantswv.compiled-technologies.com/IDXSearch/Default.aspx",
+    "POCAHONTAS": "http://129.71.203.38/", "PRESTON": "https://prestonwv.compiled-technologies.com/IDXSearch/Default.aspx",
+    "RITCHIE": "https://www.ritchiecountyclerk.com/IDXSearch/Default.aspx", "ROANE": "http://129.71.205.30/", "SUMMERS": "http://129.71.206.41/",
+    "TAYLOR": "http://taylorwv.compiled-technologies.com/", "TYLER": "https://tylerwv.compiled-technologies.com/IDXSearch/",
+    "UPSHUR": "http://inquiry.upshurcounty.org/", "WAYNE": "http://www.waynecountywv.us/IDXSearch/Default.aspx",
+    "WIRT": "http://records.wirtcountywv.net/", "WOOD": "https://inquiries.woodcountywv.com/legacywebinquiry/default.aspx",
+    "WYOMING": "http://129.71.205.79/",
+    # not the IDX product
+    "BERKELEY": "https://search.berkeleydeeds.com/NameSearch.php", "PUTNAM": "https://recordhub.cottsystems.com/PutnamWV",
+    "TUCKER": "https://us5.courthousecomputersystems.com/TuckerWV/", "WETZEL": "http://www.wetzelcountywv.us/WEBInquiry/Default.aspx",
+}
 IDX2_JOBS = {}
 _IDX2_COLS = ["index", "image", "flag", "status", "date", "doc", "bookpage", "pages", "role", "name", "role2", "other", "desc", "cross", "instrument"]
 _IDX2_READ = """() => [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(tr =>
