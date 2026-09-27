@@ -5645,10 +5645,19 @@ def sao_loop(n=0):
             try:
                 res = sao_read_cert(site, job)
             except SaoBlocked as e:
-                SAO["pause_until"] = _t.time() + 1800
-                SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']}")
-                print(f"[sao] pushback: {e} - all readers pause 30 min", flush=True)
-                res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site pushed back: {e}"}
+                slow = "slow" in str(e)
+                if slow and not SAO.get("slow_last_cert"):
+                    # some certificates make the site hang (~50 s answers) while others answer in 1 s: skip this one
+                    # (it is tried again later); only a second slow certificate in a row counts as the site pushing back
+                    SAO["slow_last_cert"] = True
+                    SAO.setdefault("slow_certs", []).append(f"{job['county']} {job['cert']}")
+                    res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": "the site hangs on this certificate - tried again later"}
+                else:
+                    SAO["pause_until"] = _t.time() + 1800
+                    SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']}")
+                    print(f"[sao] pushback: {e} - all readers pause 30 min", flush=True)
+                    res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site pushed back: {e}"}
+                    SAO["slow_last_cert"] = False
             except Exception as e:
                 res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": str(e)[:300]}
             try:
@@ -5661,6 +5670,7 @@ def sao_loop(n=0):
                 res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": ("save refused: " + body)[:300]}
                 try: _fz_rpc("sao_save", {"p": res})
                 except Exception: pass
+            if res["status"] == "done": SAO["slow_last_cert"] = False
             st = res["status"] if res["status"] in ("done", "none", "failed") else "requeued"
             SAO[st] = SAO.get(st, 0) + 1
             SAO["last"] = f"{job['county']} {job['cert']} {res['status']}"
