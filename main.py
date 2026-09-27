@@ -2856,6 +2856,27 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/og-status":
             return self.respond({"status": OG_STATUS})
 
+        if path == "/idx-owner":
+            # Start an owner report (background). ?last=MOAG&first=JOSEPH[&book=974&page=518][&county=MARSHALL]
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            g = lambda k: (qs.get(k, [""])[0] or "").strip()
+            county = (g("county") or "MARSHALL").upper()
+            last, first = _re_re.sub(r"[^A-Za-z' -]", "", g("last")), _re_re.sub(r"[^A-Za-z' -]", "", g("first"))
+            book, pg_ = _re_re.sub(r"\W", "", g("book")), _re_re.sub(r"\W", "", g("page"))
+            if county not in IDX2_URLS or not last or not first:
+                return self.respond({"error": "county (Marshall only for now), last and first are required"})
+            import uuid
+            job = uuid.uuid4().hex[:12]
+            IDX2_JOBS[job] = {"state": "queued"}
+            _og_threading.Thread(target=_idx2_run, args=(job, county, last, first, book or None, pg_ or None), daemon=True).start()
+            return self.respond({"job": job, "check": "/idx-owner-result?job=" + job})
+
+        if path == "/idx-owner-result":
+            from urllib.parse import parse_qs, urlparse
+            job = (parse_qs(urlparse(self.path).query).get("job", [""])[0])
+            return self.respond(IDX2_JOBS.get(job, {"state": "unknown job"}))
+
         if path == "/idx-ping":
             # Can this server reach a county IDX at all? (Marshall by default) - loads the home page only.
             import time as _t
@@ -4151,6 +4172,170 @@ def run_wvsao_refresh_sync(scope='daily_recent'):
         loop.close()
     return result
 # ═════════════════════════════════════════════════════════════════════════════
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 🔎 IDX OWNER REPORT (v2, taught 2026-09-27 on the Marshall IDX in a real browser)
+# The page's own DevExpress controls are driven by name (cboKey, txtLname, txtFname,
+# txtBook, txtPage, grd) and the search is started with a real Enter key; results are
+# read from the grid rows. Then: debts vs releases, estate/death signs, spouses, and the
+# chain of title back from a deed book/page. Test: /idx-owner?last=&first=[&book=&page=]
+# then /idx-owner-result?job=...  (Marshall only for now.)
+# ═════════════════════════════════════════════════════════════════════════════
+IDX2_URLS = {"MARSHALL": "http://129.71.117.225/"}
+IDX2_JOBS = {}
+_IDX2_COLS = ["index", "image", "flag", "status", "date", "doc", "bookpage", "pages", "role", "name", "role2", "other", "desc", "cross", "instrument"]
+_IDX2_READ = """() => [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(tr =>
+  [...tr.querySelectorAll('td')].map(td => td.innerText.replace(/\\s+/g, ' ').trim()))"""
+
+
+def _idx2_search(pg, mode, fields, enter_in):
+    """mode: 0 Individual, 2 Book & Page. fields: {'txtLname': 'MOAG', ...}."""
+    if mode == 0 and pg.evaluate("() => cboKey.GetSelectedIndex()") != 0:
+        # back to a name search: the name boxes stay hidden after Book & Page, so reload (opens on names)
+        pg.reload(wait_until="networkidle", timeout=60000)
+        pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
+    if pg.evaluate("() => cboKey.GetSelectedIndex()") != mode:
+        pg.evaluate("(i) => { cboKey.SetSelectedIndex(i); if (cboKey.RaiseSelectedIndexChanged) cboKey.RaiseSelectedIndexChanged(); }", mode)
+        pg.wait_for_timeout(1500)
+    # real keystrokes (values set from script alone are not picked up by the name search)
+    # (Book & Page boxes stay hidden after switching from script, but take values set there)
+    for k, v in fields.items():
+        box = pg.locator("#CallFormPanel_contentSplitter_CallToolPanel_" + k + "_I")
+        if box.is_visible():
+            box.click(); box.press("Control+a"); box.press("Delete")
+            if v: box.type(str(v), delay=20)
+        else:
+            pg.evaluate("([k, v]) => window[k].SetText(v)", [k, str(v or "")])
+    last_box = pg.locator("#CallFormPanel_contentSplitter_CallToolPanel_" + enter_in + "_I")
+    if last_box.is_visible():
+        last_box.press("Enter")
+    else:
+        pg.focus("#CallFormPanel_contentSplitter_CallToolPanel_" + enter_in + "_I")
+        pg.keyboard.press("Enter")
+    # wait for the answer: rows appear, or the grid settles on no rows for 5 s
+    quiet = 0
+    for _ in range(90):
+        pg.wait_for_timeout(500)
+        busy, n = pg.evaluate("() => [grd.InCallback(), document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]').length]")
+        if busy: quiet = 0; continue
+        if n: break
+        quiet += 1
+        if quiet >= 10: break
+    rows = []
+    pages = pg.evaluate("() => grd.GetPageCount()") or 0
+    for i in range(max(1, pages)):
+        if i:
+            pg.evaluate("(n) => grd.GotoPage(n)", i)
+            pg.wait_for_timeout(800)
+            pg.wait_for_function("() => !grd.InCallback()", timeout=45000)
+        for t in pg.evaluate(_IDX2_READ):
+            if len(t) >= len(_IDX2_COLS):
+                rows.append(dict(zip(_IDX2_COLS, t)))
+        if i >= 9: break                                     # 10 pages x 100 is plenty for one name
+    return rows
+
+
+def _idx2_bp(s):
+    m = _re_re.match(r"\s*(\w+)\s*@\s*(\w+)", s or "")
+    return (m.group(1).lstrip("0"), m.group(2).lstrip("0")) if m else (None, None)
+
+
+def _idx2_same_person(row_name, last, first):
+    n = _re_re.sub(r"[^A-Z ]", " ", (row_name or "").upper()).split()
+    return len(n) >= 2 and n[0] == last and (n[1] == first or (len(first) > 1 and n[1].startswith(first) and len(n[1]) <= len(first) + 1))
+
+
+def _idx2_words(s):
+    return set(w for w in _re_re.findall(r"[A-Z0-9]+", (s or "").upper()) if len(w) >= 2 and w not in ("DISTRICT", "ADDITIONAL", "AND", "THE", "OF"))
+
+
+_DEBT_RE = _re_re.compile(r"DEED OF TRUST|MORTGAGE|JUDG|LIEN|LIS PENDENS|FINANCING|UCC|ABSTRACT")
+_REL_RE = _re_re.compile(r"RELEASE|SATISFACTION|RECONVEY")
+_ESTATE_RE = _re_re.compile(r"WILL|ESTATE|ADMINISTRATION|FIDUCIARY|APPRAISEMENT|SETTLEMENT|HEIRSHIP|DEATH|TRANSFER ON DEATH")
+
+
+def idx2_owner_report(county, last, first, book=None, page=None, log=None):
+    last, first = last.upper().strip(), first.upper().strip()
+    url = IDX2_URLS[county]
+    p, browser = get_playwright_browser()
+    try:
+        pg = browser.new_page()
+        pg.goto(url, wait_until="networkidle", timeout=60000)
+        pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
+        rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
+        mine = [r for r in rows if _idx2_same_person(r["name"], last, first)]
+        other_names = sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))
+        # debts and releases
+        debts, releases = [], []
+        for r in mine:
+            d = r["doc"].upper()
+            if _REL_RE.search(d) or d.startswith("REL"): releases.append(r)
+            elif _DEBT_RE.search(d) and r["role"] in ("DEBTOR", "GRANTOR", ""): debts.append(r)
+        out_debts = []
+        for dbt in debts:
+            b, pgno = _idx2_bp(dbt["bookpage"])
+            hit, how = None, None
+            for rel in releases:
+                nums = _re_re.findall(r"\d+", rel["desc"])
+                pairs = set(zip(nums, nums[1:]))
+                if b and (b, pgno) in set((x.lstrip("0"), y.lstrip("0")) for x, y in pairs):
+                    hit, how = rel, "release names this book/page"; break
+            if not hit:
+                for rel in releases:
+                    same_cred = (_idx2_words(rel["other"]) & _idx2_words(dbt["other"])) - {"WV", "STATE", "BANK"}
+                    if same_cred and rel["date"][-4:] >= dbt["date"][-4:]:
+                        hit, how = rel, "same creditor, later release (check)"; break
+            out_debts.append({"type": dbt["doc"], "date": dbt["date"], "bookpage": dbt["bookpage"], "creditor": dbt["other"],
+                              "desc": dbt["desc"], "released": bool(hit), "release": hit and {"bookpage": hit["bookpage"], "date": hit["date"], "how": how}})
+        estate = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "name": r["name"], "desc": r["desc"]} for r in mine if _ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"]]
+        spouses = [{"spouse": r["other"], "date": r["date"], "desc": r["desc"]} for r in mine if "MARRIAGE" in r["doc"].upper()]
+        deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r["other"], "desc": r["desc"]}
+                 for r in mine if _re_re.search(r"DEED|TRANSFER ON DEATH", r["doc"].upper()) and "TRUST" not in r["doc"].upper()]
+        # chain of title back from the deed at book/page
+        chain = []
+        if book and page:
+            bp = _idx2_search(pg, 2, {"txtBook": str(book), "txtPage": str(page)}, "txtPage")
+            cur = [r for r in bp if "DEED" in r["doc"].upper() and "TRUST" not in r["doc"].upper() and r["role"] == "GRANTEE"]
+            seen = set()
+            for step in range(4):
+                if not cur: break
+                d = cur[0]
+                chain.append({"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d["other"], "grantee": d["name"], "desc": d["desc"]})
+                seller = _re_re.sub(r"[^A-Z ]", " ", (d["other"] or "").upper()).split()
+                if len(seller) < 2 or " ".join(seller[:2]) in seen: break
+                seen.add(" ".join(seller[:2]))
+                srows = [r for r in _idx2_search(pg, 0, {"txtLname": seller[0], "txtFname": seller[1], "txtMname": ""}, "txtFname")
+                         if _idx2_same_person(r["name"], seller[0], seller[1])]
+                want = _idx2_words(d["desc"])
+                prior = sorted([r for r in srows if "DEED" in r["doc"].upper() and "TRUST" not in r["doc"].upper() and r["role"] == "GRANTEE"
+                                and len(_idx2_words(r["desc"]) & want) >= 2], key=lambda r: r["date"][-4:] + r["date"][:5], reverse=True)
+                if prior:
+                    cur = prior; continue
+                inherit = [r for r in srows if _re_re.search(r"WILL|ESTATE|ADMINISTRATION|FIDUCIARY|HEIRSHIP|TRANSFER ON DEATH", r["doc"].upper())]
+                if inherit:
+                    rank = lambda r: next((i for i, k in enumerate(["WILL", "TRANSFER ON DEATH", "HEIRSHIP", "ADMINISTRATION", "ESTATE", "FIDUCIARY"]) if k in r["doc"].upper()), 9)
+                    w = sorted(inherit, key=rank)[0]
+                    chain.append({"date": w["date"], "type": w["doc"], "bookpage": w["bookpage"], "grantor": "(estate)", "grantee": w["name"], "desc": w["desc"],
+                                  "note": "seller appears as executor/heir - likely inherited; earlier deeds may be before the computer index"})
+                break
+        return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
+                "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "spouses": spouses,
+                "deeds": deeds, "chain": chain, "other_names_skipped": other_names[:30]}
+    finally:
+        try: browser.close()
+        except Exception: pass
+        try: p.stop()
+        except Exception: pass
+
+
+def _idx2_run(job, county, last, first, book, page):
+    IDX2_JOBS[job] = {"state": "running"}
+    try:
+        IDX2_JOBS[job] = {"state": "done", "report": idx2_owner_report(county, last, first, book, page)}
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        IDX2_JOBS[job] = {"state": "failed", "error": str(e)}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
