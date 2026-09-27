@@ -2886,13 +2886,27 @@ class Handler(BaseHTTPRequestHandler):
             county = (g("county") or "MARSHALL").upper()
             last, first = _re_re.sub(r"[^A-Za-z' -]", "", g("last")), _re_re.sub(r"[^A-Za-z' -]", "", g("first"))
             book, pg_ = _re_re.sub(r"\W", "", g("book")), _re_re.sub(r"\W", "", g("page"))
+            if county not in IDX2_URLS and county in IDX2_SURVEY and county not in ("BERKELEY", "PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"):
+                IDX2_URLS[county] = IDX2_SURVEY[county]
             if county not in IDX2_URLS or not last or not first:
-                return self.respond({"error": "county (Marshall only for now), last and first are required"})
+                return self.respond({"error": "county (an IDX county), last and first are required"})
             import uuid
             job = uuid.uuid4().hex[:12]
             IDX2_JOBS[job] = {"state": "queued"}
             _og_threading.Thread(target=_idx2_run, args=(job, county, last, first, book or None, pg_ or None, g("desc")[:200] or None), daemon=True).start()
             return self.respond({"job": job, "check": "/idx-owner-result?job=" + job})
+
+        if path == "/idx-county-test":
+            # Every IDX county: name search + one image (background). ?county=MARSHALL,WOOD to limit
+            from urllib.parse import parse_qs, urlparse
+            only = [c.strip().upper() for c in (parse_qs(urlparse(self.path).query).get("county", [""])[0]).split(",") if c.strip()]
+            if IDX2_COUNTY_TEST.get("state") == "running":
+                return self.respond({"status": "already running"})
+            _og_threading.Thread(target=run_idx2_county_test, args=(only or None,), daemon=True).start()
+            return self.respond({"status": "started", "check": "/idx-county-test-status"})
+
+        if path == "/idx-county-test-status":
+            return self.respond(IDX2_COUNTY_TEST)
 
         if path == "/ai-ready":
             # yes/no only - never the key itself
@@ -4233,13 +4247,56 @@ IDX2_SURVEY = {
     "TUCKER": "https://us5.courthousecomputersystems.com/TuckerWV/", "WETZEL": "http://www.wetzelcountywv.us/WEBInquiry/Default.aspx",
 }
 IDX2_JOBS = {}
-_IDX2_COLS = ["index", "image", "flag", "status", "date", "doc", "bookpage", "pages", "role", "name", "role2", "other", "desc", "cross", "instrument"]
-# each row's cells, plus its own scanned-image number (rows without an image have none)
-_IDX2_READ = """() => [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(tr => {
-  const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.replace(/\\s+/g, ' ').trim());
-  const b = tr.querySelector('[id*="ScannedButton"]'); const m = b && b.id.match(/(\\d+)\\s*$/);
-  return cells.slice(0, 15).concat([m ? m[1] : '']); })"""
-_IDX2_COLS = _IDX2_COLS + ["image_id"]
+# Columns are found by their header names: the newer page (Marshall) has Index/Sub2/Other/Cross Date,
+# the older one (Wirt...) does not - there the other party is read from the Names panel of a clicked row.
+_IDX2_HDR = {"Index": "index", "Image": "image", "Flag": "flag", "Status": "status", "Date": "date", "Document": "doc",
+             "Book Page": "bookpage", "Pages": "pages", "Sub": "role", "Name": "name", "Sub2": "role2", "Other": "other",
+             "Description": "desc", "Cross Date": "cross", "Instrument": "instrument"}
+_IDX2_READ = """() => { const g = grd.GetMainElement();
+  const hdr = [...g.querySelectorAll('[id*="_col"]')].filter(e => /_col\\d+$/.test(e.id)).map(e => e.innerText.trim());
+  const rows = [...g.querySelectorAll('tr[id*="_DXDataRow"]')].map(tr => {
+    const cells = [...tr.querySelectorAll(':scope > td')].map(td => td.innerText.replace(/\\s+/g, ' ').trim());
+    const b = tr.querySelector('[id*="ScannedButton"]'); const m = b && b.id.match(/(\\d+)\\s*$/);
+    return {cells, img: m ? m[1] : '', rid: tr.id}; });
+  return {hdr, rows}; }"""
+_IDX2_NAMES = """() => window.grdNames ? [...grdNames.GetMainElement().querySelectorAll('tr[id*="_DXDataRow"]')].map(tr => [...tr.querySelectorAll('td')].map(t => t.innerText.trim())) : []"""
+_IDX2_NEEDS_PARTY = _re_re.compile(r"DEED|TRUST|MORTGAGE|JUDG|LIEN|RELEASE|REL |WILL|ESTATE|HEIRSHIP|TRANSFER ON DEATH|LIS PENDENS")
+
+
+def _idx2_rows(pg):
+    """Current grid page as dicts keyed like the newer layout (+ image_id); older layout: other party filled in by clicking."""
+    got = pg.evaluate(_IDX2_READ)
+    hdr = [_IDX2_HDR.get(h, h.lower()) for h in got["hdr"]]
+    out = []
+    for r in got["rows"]:
+        cells = r["cells"]
+        if len(cells) < len(hdr): continue
+        d = {k: "" for k in _IDX2_HDR.values()}
+        d.update({hdr[i]: cells[i] for i in range(len(hdr))})
+        d["image_id"], d["_rid"] = r["img"], r["rid"]
+        d["desc"] = _re_re.sub(r"^Description\s+", "", d.get("desc", ""))
+        out.append(d)
+    if "other" not in hdr:
+        clicks = 0
+        for d in out:
+            if clicks >= 60 or not _IDX2_NEEDS_PARTY.search(d["doc"].upper() + " "): continue
+            clicks += 1
+            try:
+                prev = pg.evaluate(_IDX2_NAMES)
+                pg.locator("#" + d["_rid"]).locator("td").nth(3).click()
+                names = prev
+                for _ in range(20):                               # wait for the Names panel to show THIS row
+                    pg.wait_for_timeout(250)
+                    if pg.evaluate("() => (window.grdNames && grdNames.InCallback()) || grd.InCallback()"): continue
+                    names = pg.evaluate(_IDX2_NAMES)
+                    if names != prev and names: break
+                others = [n[1] for n in names if len(n) >= 2 and n[0] and n[0] != d["role"]]
+                d["other"] = "; ".join(others[:6])
+                d["role2"] = next((n[0] for n in names if len(n) >= 2 and n[0] != d["role"]), "")
+            except Exception:
+                pass
+    return out
+
 
 # One scanned page as a JPEG the size Claude reads best (long side 1568 px), drawn in the page itself.
 _IDX2_SHRINK = """() => { const i = [...document.images].find(i => i.naturalWidth > 1000); if (!i) return null;
@@ -4249,11 +4306,16 @@ _IDX2_SHRINK = """() => { const i = [...document.images].find(i => i.naturalWidt
   return c.toDataURL('image/jpeg', 0.85).split(',')[1]; }"""
 
 
+def _idx2_base(url):
+    """Folder of the search page (Image.aspx sits next to Default.aspx)."""
+    return _re_re.sub(r"/default\.aspx$", "", url.rstrip("/"), flags=_re_re.I)
+
+
 def _idx2_pages(ctx, base_url, image_id, want=2):
     """First `want` pages of one recorded document, as base64 JPEGs."""
     ip = ctx.new_page()
     try:
-        ip.goto(base_url.rstrip("/") + "/Image.aspx?control=" + str(image_id), wait_until="networkidle", timeout=60000)
+        ip.goto(_idx2_base(base_url) + "/Image.aspx?control=" + str(image_id), wait_until="networkidle", timeout=60000)
         out = []
         for n in range(want):
             ip.wait_for_function("() => [...document.images].some(i => i.naturalWidth > 1000 && i.complete)", timeout=30000)
@@ -4350,9 +4412,7 @@ def _idx2_search(pg, mode, fields, enter_in):
             pg.evaluate("(n) => grd.GotoPage(n)", i)
             pg.wait_for_timeout(800)
             pg.wait_for_function("() => !grd.InCallback()", timeout=45000)
-        for t in pg.evaluate(_IDX2_READ):
-            if len(t) >= len(_IDX2_COLS):
-                rows.append(dict(zip(_IDX2_COLS, t)))
+        rows.extend(_idx2_rows(pg))
         if i >= 9: break                                     # 10 pages x 100 is plenty for one name
     return rows
 
@@ -4523,6 +4583,62 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 "deeds": deeds, "chain": chain, "sold": new_owner, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
+        try: browser.close()
+        except Exception: pass
+        try: p.stop()
+        except Exception: pass
+
+
+IDX2_COUNTY_TEST = {"state": "idle", "results": {}}
+
+
+def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
+    """One county: does the name search work here, and does a document image open without a login?"""
+    out = {"url": url}
+    ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    try:
+        pg = ctx.new_page()
+        pg.goto(url, wait_until="networkidle", timeout=60000)
+        pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
+        rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
+        out["rows"] = len(rows)
+        out["search"] = "works" if rows else "no rows"
+        years = sorted(set(r["date"][-4:] for r in rows if _re_re.match(r"\d\d/\d\d/\d{4}", r["date"] or "")))
+        if years: out["years"] = years[0] + "-" + years[-1]
+        with_img = [r for r in rows if r.get("image_id")]
+        out["rows_with_image"] = len(with_img)
+        if with_img:
+            ip = ctx.new_page()
+            ip.goto(_idx2_base(url) + "/Image.aspx?control=" + with_img[0]["image_id"], wait_until="networkidle", timeout=60000)
+            try:
+                ip.wait_for_function("() => [...document.images].some(i => i.naturalWidth > 1000)", timeout=20000)
+                out["image"] = "opens without login"
+            except Exception:
+                txt = ip.evaluate("() => document.body.innerText.slice(0, 300)")
+                out["image"] = "login needed" if _re_re.search(r"log ?in|password|account|subscri", txt, _re_re.I) else "did not open"
+                out["image_page_text"] = _re_re.sub(r"\s+", " ", txt)[:160]
+    except Exception as e:
+        out["search"] = "failed"
+        out["error"] = str(e)[:200]
+    finally:
+        try: ctx.close()
+        except Exception: pass
+    return out
+
+
+def run_idx2_county_test(counties=None):
+    IDX2_COUNTY_TEST.update({"state": "running", "results": {}, "started": _re_dt.utcnow().isoformat() + "Z"})
+    p, browser = get_playwright_browser()
+    try:
+        for county, url in IDX2_SURVEY.items():
+            if counties and county not in counties: continue
+            if county in ("BERKELEY", "PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"): continue   # not the IDX product / closed
+            IDX2_COUNTY_TEST["current"] = county
+            IDX2_COUNTY_TEST["results"][county] = _idx2_county_test_one(browser, county, url)
+            __import__("time").sleep(2)                          # gentle
+    finally:
+        IDX2_COUNTY_TEST["state"] = "done"
+        IDX2_COUNTY_TEST.pop("current", None)
         try: browser.close()
         except Exception: pass
         try: p.stop()
