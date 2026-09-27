@@ -4668,7 +4668,7 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
         try:   # what the page offers (for counties laid out differently)
             out["page"] = {"url": pg.url[:120], "title": pg.title()[:60],
                            "modes": pg.evaluate("() => typeof cboKey !== 'undefined' ? [...Array(cboKey.GetItemCount()).keys()].map(i => cboKey.GetItem(i).text) : null"),
-                           "text": pg.evaluate("() => document.body.innerText.replace(/\s+/g, ' ').slice(0, 300)")}
+                           "text": pg.evaluate(r"() => document.body.innerText.replace(/\s+/g, ' ').slice(0, 300)")}
         except Exception: pass
     finally:
         try: ctx.close()
@@ -4878,7 +4878,8 @@ SAO = {"state": "idle", "done": 0, "none": 0, "failed": 0, "last": None}
 
 def _sao_pdf_text(data):
     import io, pypdf
-    return "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(data)).pages)
+    t = "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(data)).pages)
+    return t.replace("\x00", "").replace("\ufffd", "")      # the database refuses null characters
 
 
 def _sao_open_images(pg, year, county, cert):
@@ -4980,7 +4981,16 @@ def sao_loop():
                     res = sao_read_cert(ctx, pg, job)
                 except Exception as e:
                     res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": str(e)[:300]}
-                _fz_rpc("sao_save", {"p": res})
+                try:
+                    _fz_rpc("sao_save", {"p": res})
+                except Exception as e:
+                    body = ""
+                    try: body = e.read().decode("utf-8", "replace")[:300]
+                    except Exception: pass
+                    print(f"[sao] save refused {job['county']} {job['cert']}: {e} {body}", flush=True)
+                    res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": ("save refused: " + body)[:300]}
+                    try: _fz_rpc("sao_save", {"p": res})
+                    except Exception: pass
                 SAO[res["status"] if res["status"] in ("done", "none", "failed") else "done"] = SAO.get(res["status"], 0) + 1
                 SAO["last"] = f"{job['county']} {job['cert']} {res['status']}"
                 _t.sleep(1.5)                                  # gentle between certificates
