@@ -4404,10 +4404,11 @@ def _idx2_open(pg, county, url):
             raise RuntimeError(f"{county} needs a login - no IDX_{county}_USER / IDX_{county}_PASS on the server")
         pg.locator("#popLogin_LoginPanel_pan_txtUser_I").fill(user)
         pg.locator("#popLogin_LoginPanel_pan_txtPassword_I").fill(pw)
-        pg.locator("#popLogin_LoginPanel_pan_btnOK_I").click()
+        pg.locator("#popLogin_LoginPanel_pan_txtPassword_I").press("Enter")   # the OK button's input is hidden; Enter signs in
+        pg.wait_for_timeout(2500)
         pg.wait_for_load_state("networkidle", timeout=60000)
-        if pg.locator("#popLogin_LoginPanel_pan_txtUser_I").count() and pg.locator("#popLogin_LoginPanel_pan_txtUser_I").is_visible():
-            raise RuntimeError(f"{county} login was refused")
+        if "invalid user or password" in (pg.evaluate("() => document.body.innerText") or "").lower():
+            raise RuntimeError(f"{county} login was refused - check IDX_{county}_USER / IDX_{county}_PASS")
         if "Login.aspx" in pg.url:
             pg.goto(url, wait_until="networkidle", timeout=60000)
     pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
@@ -4517,7 +4518,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
     p, browser = get_playwright_browser()
     reads = {"n": 0}
     try:
-        ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+        ctx = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)   # Mercer's certificate is misconfigured
         pg = ctx.new_page()
         _idx2_open(pg, county, url)
 
@@ -4637,7 +4638,7 @@ IDX2_COUNTY_TEST = {"state": "idle", "results": {}}
 def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
     """One county: does the name search work here, and does a document image open without a login?"""
     out = {"url": url}
-    ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    ctx = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)   # Mercer's certificate is misconfigured
     try:
         pg = ctx.new_page()
         _idx2_open(pg, county, url)
