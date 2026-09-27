@@ -5352,10 +5352,10 @@ def fernando_chat_one():
     return True
 
 
-def fernando_chat_loop():
+def fernando_chat_loop(n=0):
     """💬 A worker only for staff questions (the other workers also take them, between searches)."""
     import time as _t
-    _t.sleep(20)
+    _t.sleep(20 + 3 * n)
     while True:
         try:
             worked = fernando_chat_one()
@@ -5878,7 +5878,8 @@ if __name__ == '__main__':
     if os.environ.get("SUPABASE_SECRET_KEY"):
         for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
             _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
-        _og_threading.Thread(target=fernando_chat_loop, daemon=True).start()          # 💬 questions answered at once
+        for _q in range(int(os.environ.get("FERNANDO_CHAT_WORKERS", "2"))):   # 💬 question-only workers (2 = two staff asking at once)
+            _og_threading.Thread(target=fernando_chat_loop, args=(_q,), daemon=True).start()
         if os.environ.get("SAO_READER", "1") == "1":
             for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP); 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
