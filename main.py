@@ -4425,13 +4425,14 @@ def _idx2_search(pg, mode, fields, enter_in):
     pg.locator(_IDX2_P + enter_in + "_I").press("Enter")
     # wait for THIS search's answer: the site went busy and came back, or the rows changed
     seen_busy, quiet = False, 0
-    for _ in range(90):
+    for _ in range(180):                                      # up to 90 s: big counties answer slowly ("Thinking...")
         pg.wait_for_timeout(500)
-        busy, now = pg.evaluate("() => [grd.InCallback(), [...document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]')].map(t => t.innerText).join('|')]")
+        busy, now = pg.evaluate("""() => [grd.InCallback() || [...document.querySelectorAll('[class*="LoadingPanel"], [id*="LoadingPanel"]')].some(e => e.offsetParent && e.offsetWidth > 0),
+                                         [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(t => t.innerText).join('|')]""")
         if busy: seen_busy = True; quiet = 0; continue
         if now != before or (seen_busy and now): break
         quiet += 1
-        if quiet >= 12: break                                 # 6 s of nothing: same answer / no rows
+        if quiet >= (20 if seen_busy else 30): break          # 10-15 s of nothing at all: no rows / same answer
     rows = []
     pages = pg.evaluate("() => grd.GetPageCount()") or 0
     for i in range(max(1, pages)):
