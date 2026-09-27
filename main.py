@@ -2914,7 +2914,7 @@ class Handler(BaseHTTPRequestHandler):
             out["avg_response_s"] = round(sum(r) / len(r), 2) if r else None
             out["max_response_s"] = max(r) if r else None
             out["avg_cert_s"] = round(sum(c) / len(c), 1) if c else None
-            out["readers"] = int(os.environ.get("SAO_THREADS", "1"))
+            out["readers"] = int(os.environ.get("SAO_THREADS", "2"))
             return self.respond(out)
 
         if path == "/fernando-status":
@@ -5902,6 +5902,13 @@ def sao_loop(n=0):
         try:
             if _t.time() < SAO.get("pause_until", 0):
                 SAO["state"] = "paused - the site pushed back"; _t.sleep(60); continue
+            if n >= 1:
+                # the extra reader(s) only at night (8 pm - 7 am Eastern, the site is quiet), and not after the site
+                # pushed back - then only one reader until the next night
+                hr = _re_dt.utcnow().hour
+                if not (0 <= hr < 11) or _t.time() < SAO.get("extra_off_until", 0):
+                    SAO.setdefault("extra", {})[n] = "resting (daytime or after a pushback)"; _t.sleep(300); continue
+                SAO.setdefault("extra", {})[n] = "reading"
             if done_here >= 150: site, done_here = SaoHttp(), 0     # a fresh session now and then
             job = _fz_rpc("sao_claim", {})
             if not job:
@@ -5921,6 +5928,7 @@ def sao_loop(n=0):
                     res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": "the site hangs on this certificate - tried again later"}
                 else:
                     SAO["pause_until"] = _t.time() + 1800
+                    SAO["extra_off_until"] = _t.time() + 12 * 3600          # back to one reader until the next night
                     SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']}")
                     print(f"[sao] pushback: {e} - all readers pause 30 min", flush=True)
                     res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site pushed back: {e}"}
@@ -6117,6 +6125,6 @@ if __name__ == '__main__':
         for _q in range(int(os.environ.get("FERNANDO_CHAT_WORKERS", "2"))):   # 💬 question-only workers (2 = two staff asking at once)
             _og_threading.Thread(target=fernando_chat_loop, args=(_q,), daemon=True).start()
         if os.environ.get("SAO_READER", "1") == "1":
-            for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP); 3 slowed the site down (2026-09-27)
+            for _s in range(int(os.environ.get("SAO_THREADS", "2"))):   # 🧾 State Auditor documents (plain HTTP): 1 by day, 2 at night; 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
