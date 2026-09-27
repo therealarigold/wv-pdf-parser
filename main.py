@@ -5631,7 +5631,8 @@ The question may come from speech-to-text: no punctuation, fillers ("uh"), and m
 is the one they mean. A NAME can be a client (bidder), a person on a surplus case (owner / heir), an owner or person on a
 title search, or someone the State served - use find_person, which searches all of them. "Cases", "surplus", "filed to court",
 "hired us" mean surplus cases - use overview for counts and lists. Never answer "I don't have a tool"; if something is truly
-not in the data, say what you can do instead.
+not in the data, say what you can do instead. Never say you could not find someone unless find_person (or the name search
+already done above) actually came back empty - and then say what you searched and offer to try another spelling.
 Start with ONE short sentence that answers the question directly (it may be read aloud), then the details. Never show raw
 field names (paid_us, owes_us, liens_found_on_property_still_open...) - say it in words. "Owes us" (our $500 per lien) and
 "liens found on the property" are different things - never mix them.
@@ -5807,9 +5808,30 @@ _FZG_CERT_RE = _re_re.compile(r"\b(20\d\d)\s*-?\s*C\s*-?\s*(\d{1,6})\b", _re_re.
 _FZG_BIDDER_RE = _re_re.compile(r"\b(?:(?:bidder|client|buyer)\s*#?\s*(\d{2,5})|#?(\d{4}))\b", _re_re.I)
 
 
+_FZG_NAME_AFTER = _re_re.compile(r"\b(?:for|with|about|of|to|on|named|called|client|owner|heir|mr|mrs|ms)\s+((?:[A-Za-z][A-Za-z'.-]+\s*){1,3})", _re_re.I)
+_FZG_NOT_NAME = set("""the a an this that these those my our his her their it its status surplus case cases court county job jobs title search searches
+ticket tickets client clients bidder money owe owes owed us we you me him them what whats where when how much many all any some please thanks thank
+now today tomorrow yesterday been already filed file hired stage next open cert certificate related lien liens heir heirs owner owners
+fernando hey hi uh um ok okay and or but so just can could would tell show give list""".split())
+
+
+def _fzg_name_guesses(text):
+    """Name-like words a spoken question points at ("status for Bambi", "where are we with julian kennedy")."""
+    out = []
+    for m in _FZG_NAME_AFTER.findall(text or ""):
+        words = [w for w in _re_re.findall(r"[A-Za-z][A-Za-z'.-]+", m) if w.lower() not in _FZG_NOT_NAME]
+        if words and len(" ".join(words)) >= 3: out.append(" ".join(words[:3]))
+    return list(dict.fromkeys(out))[:2]
+
+
 def _fzg_prefetch(text):
     """The records a question obviously points at, looked up before the first model call (saves a round trip)."""
     got = {}
+    for nm in _fzg_name_guesses(text):
+        try:
+            hits = _fz_rpc("fz_find", {"p_name": nm}) or []
+            got["name search '" + nm + "' (clients, surplus people, title-search owners/persons, State-served)"] = hits[:25] or "nothing found under that name"
+        except Exception: pass
     for y, n in _FZG_CERT_RE.findall(text or "")[:3]:
         cert = f"{y}-C-{int(n):06d}"
         try: got["cert " + cert] = _fz_rpc("fz_cert", {"p_query": cert, "p_county": None})
@@ -5935,6 +5957,9 @@ def _fzh_cases():
         {"q": "is the crosscountry loan on marshall 2025-C-000012 still open", "must": [r"Cross ?Country"]},
         {"q": "hey fernando thanks", "max_total_s": 30},
         {"q": "can you tell me the status for bambi", "must": [r"(Hardy|2023-C-000017)", r"filed"]},
+        {"q": "Hey Fernando can you tell me what's the status of the surplus related to Bambi", "must": [r"(Hardy|2023-C-000017)", r"filed"]},
+        {"q": "how many cases we have that a store place that I've already been filed to the court",
+         "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'surplus'}) or {}).get('counts_by_stage') or {}).get('filed', 0)}\b"], "must_not": [r"don.t have a tool"]},
         {"q": "how many cases have already been filed to the court", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'surplus'}) or {}).get('counts_by_stage') or {}).get('filed', 0)}\b"],
          "must_not": [r"don.t have a tool"]},
         {"q": "uh how many a store place cases did we hire", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'surplus'}) or {}).get('counts_by_stage') or {}).get('retained', 0)}\b"]},
