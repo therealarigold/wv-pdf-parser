@@ -5150,6 +5150,8 @@ Rules (from the office owner):
    dead too) - also in the WV county where they lived or died, if the obituary says so (use search_person with county).
 4. A life estate: the deed that created it names the remaindermen - find and read it when you can.
 5. Never invent a name, date, book/page or address. Say what you checked. Keep it short.
+6. For every person, record where they live (lives_in: city, state) - obituaries say "Karen Warsinsky of Georgia",
+   "Harriet Prager of McMechen" - so staff can find their address. A full street address only when a paper gives one.
 
 Use the tools, then call report_heirs once. The summary is for office ladies, plain English, like:
 "Gladys died 8/9/2012 (obituary). Daughters: Harriet Prager (died 2016, will 107/592 - serve her executrix + heirs), Rosetta
@@ -5165,7 +5167,9 @@ _FZH_REPORT = {"name": "report_heirs", "description": "Your finished heir tracin
         "people": {"type": "array", "items": {"type": "object", "properties": {
             "name": {"type": "string"}, "relation": {"type": "string", "description": "e.g. daughter of Gladys Brandon"},
             "status": {"type": "string", "enum": ["to serve", "serve the estate / executor", "possible heir - check", "deceased - see their heirs"]},
-            "address": {"type": "string"}, "evidence": {"type": "string", "description": "book/page, obituary, lease..."}},
+            "lives_in": {"type": "string", "description": "city, state where they live, e.g. 'McMechen, WV' (from the obituary or a paper); empty if unknown"},
+            "address": {"type": "string", "description": "full street address - ONLY when a recorded paper or the obituary gives one"},
+            "evidence": {"type": "string", "description": "book/page, obituary, lease..."}},
             "required": ["name", "relation", "status", "evidence"]}},
         "check": {"type": "array", "items": {"type": "string"}, "description": "things staff should still look up"}},
         "required": ["summary", "people"]}}
