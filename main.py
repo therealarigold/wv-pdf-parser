@@ -5225,6 +5225,58 @@ def fernando_heirs(county, cert, owner, descr, rep, log=print):
         sites.close()
 
 
+# 🏢 A company's WV Secretary of State page, pasted by staff (they search the SOS site themselves - it has bot
+# protection, so Fernando never searches it). Read into: status, registered agent, addresses, officers.
+_FZCO_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    "name": {"type": "string"}, "entity_type": {"type": "string"}, "sos_id": {"type": "string"},
+    "status": {"type": "string", "description": "e.g. Active, Dissolved, Revoked, Administratively Dissolved"},
+    "status_date": {"type": "string"}, "formed": {"type": "string"}, "home_state": {"type": "string", "description": "state of formation if not WV"},
+    "principal_office": {"type": "string"}, "mailing_address": {"type": "string"},
+    "agent_name": {"type": "string"}, "agent_address": {"type": "string"},
+    "officers": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {
+        "role": {"type": "string"}, "name": {"type": "string"}, "address": {"type": "string"}}, "required": ["role", "name", "address"]}},
+    "not_a_company_page": {"type": "boolean", "description": "true when the pasted text is not a company's detail page"}},
+    "required": ["name", "entity_type", "sos_id", "status", "status_date", "formed", "home_state", "principal_office", "mailing_address",
+                 "agent_name", "agent_address", "officers", "not_a_company_page"]}
+
+
+def fernando_company_read(job):
+    import anthropic
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key: raise RuntimeError("ANTHROPIC_API_KEY not set on the server")
+    client = anthropic.Anthropic(api_key=key)
+    msg = client.messages.create(
+        model="claude-opus-5", max_tokens=3000,
+        messages=[{"role": "user", "content":
+            "This text was copied by a person from the West Virginia Secretary of State's business search - one company's detail "
+            "page. Fill in each field exactly as written (full addresses with ZIP). Leave a field empty when it is not on the page; "
+            "never guess. officers = every officer / member / manager / director / organizer listed, with their address.\n\n"
+            + job["body"][:40000]}],
+        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+        extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": _FZCO_SCHEMA}}, "fallbacks": "default"})
+    _ai_log(msg, "fernando_company")
+    text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+    try: co = json.loads(text)
+    except Exception:
+        m = _re_re.search(r"\{.*\}", text, _re_re.S); co = json.loads(m.group(0)) if m else {"not_a_company_page": True}
+    if co.get("not_a_company_page") or not co.get("name"):
+        return ("That doesn't look like a company's page from the Secretary of State. Open the company's details there "
+                "(click its name in the search results), press Ctrl+A then Ctrl+C on that page, and paste it here."), None
+    st = (co.get("status") or "").upper()
+    gone = any(w in st for w in ("DISSOLV", "REVOK", "TERMINAT", "INACTIVE", "WITHDRAW", "CANCEL", "FORFEIT"))
+    lines = [f"{co['name']} — {co.get('entity_type') or 'company'}, status: {co.get('status') or 'not shown'}"
+             + (f" ({co['status_date']})" if co.get("status_date") else "") + (f", formed {co['formed']}" if co.get("formed") else "") + "."]
+    if co.get("agent_name"): lines.append(f"Registered agent: {co['agent_name']}" + (f", {co['agent_address']}" if co.get("agent_address") else "") + ".")
+    else: lines.append("No registered agent on the page.")
+    if co.get("principal_office"): lines.append(f"Principal office: {co['principal_office']}.")
+    if co.get("mailing_address") and co.get("mailing_address") != co.get("principal_office"): lines.append(f"Mailing address: {co['mailing_address']}.")
+    if co.get("home_state") and co["home_state"].upper() not in ("WV", "WEST VIRGINIA"):
+        lines.append(f"Formed in {co['home_state']} - also check that state's Secretary of State for its home office and agent.")
+    if gone: lines.append("⚠ The company is no longer active - serve its officers / members too (listed below).")
+    if co.get("officers"): lines.append("Officers / members: " + "; ".join(f"{o['name']} ({o['role']})" for o in co["officers"][:12]) + ".")
+    co["inactive"] = gone
+    return " ".join(lines), co
+
 def fernando_chat_one():
     job = _fz_rpc("fernando_chat_claim", {})
     if not job: return False
@@ -5232,8 +5284,13 @@ def fernando_chat_one():
     _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_chat", job["county"], job["cert"]
     FERNANDO.setdefault("working", {})[tag] = _re_dt.utcnow().isoformat() + "Z"
     try:
-        text = fernando_chat_answer(job, log=lambda m: print(m, flush=True))
-        _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered"})
+        if job.get("kind") == "company":
+            _AI_CTX.feature = "fernando_company"
+            text, co = fernando_company_read(job)
+            _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered", "p_result": {"company": co} if co else None})
+        else:
+            text = fernando_chat_answer(job, log=lambda m: print(m, flush=True))
+            _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered"})
         FERNANDO["chats"] = FERNANDO.get("chats", 0) + 1
     except Exception as e:
         import traceback; traceback.print_exc()
