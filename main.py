@@ -4247,6 +4247,7 @@ IDX2_SURVEY = {
     "WYOMING": "http://129.71.205.79/",
     "RANDOLPH": "http://129.71.117.90/",           # free IDX (the paid Fidlar service is separate)
     "CALHOUN": "http://129.71.205.140/IDXSearch/",  # found by Ari (not linked from the county site)
+    "RALEIGH": "http://129.71.206.131/",            # needs the office's account (IDX_RALEIGH_USER / _PASS)
     # not the IDX product
     "BERKELEY": "https://search.berkeleydeeds.com/NameSearch.php", "PUTNAM": "https://recordhub.cottsystems.com/PutnamWV",
     "TUCKER": "https://us5.courthousecomputersystems.com/TuckerWV/", "WETZEL": "http://www.wetzelcountywv.us/WEBInquiry/Default.aspx",
@@ -4386,6 +4387,26 @@ _IDX2_P = "#CallFormPanel_contentSplitter_CallToolPanel_"
 _IDX2_MODES = {0: "Individual", 2: "Book & Page"}
 
 
+def _idx2_open(pg, county, url):
+    """Open a county's IDX search page; sign in first where the county requires an account.
+    The username / password are Render secrets IDX_<COUNTY>_USER / IDX_<COUNTY>_PASS (set by the office, never in code)."""
+    pg.goto(url, wait_until="networkidle", timeout=60000)
+    if pg.locator("#popLogin_LoginPanel_pan_txtUser_I").count():
+        user = os.environ.get(f"IDX_{county}_USER", "").strip()
+        pw = os.environ.get(f"IDX_{county}_PASS", "").strip()
+        if not (user and pw):
+            raise RuntimeError(f"{county} needs a login - no IDX_{county}_USER / IDX_{county}_PASS on the server")
+        pg.locator("#popLogin_LoginPanel_pan_txtUser_I").fill(user)
+        pg.locator("#popLogin_LoginPanel_pan_txtPassword_I").fill(pw)
+        pg.locator("#popLogin_LoginPanel_pan_btnOK_I").click()
+        pg.wait_for_load_state("networkidle", timeout=60000)
+        if pg.locator("#popLogin_LoginPanel_pan_txtUser_I").count() and pg.locator("#popLogin_LoginPanel_pan_txtUser_I").is_visible():
+            raise RuntimeError(f"{county} login was refused")
+        if "Login.aspx" in pg.url:
+            pg.goto(url, wait_until="networkidle", timeout=60000)
+    pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
+
+
 def _idx2_search(pg, mode, fields, enter_in):
     """mode: 0 Individual, 2 Book & Page. fields: {'txtLname': 'MOAG', ...}. Typed like a person would."""
     label = _IDX2_MODES[mode]
@@ -4491,8 +4512,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
     try:
         ctx = browser.new_context(viewport={"width": 1280, "height": 900})
         pg = ctx.new_page()
-        pg.goto(url, wait_until="networkidle", timeout=60000)
-        pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
+        _idx2_open(pg, county, url)
 
         def read_item(kind, item):
             if item.get("read") is not None: return item["read"]
@@ -4613,8 +4633,7 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     try:
         pg = ctx.new_page()
-        pg.goto(url, wait_until="networkidle", timeout=60000)
-        pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
+        _idx2_open(pg, county, url)
         rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
         out["rows"] = len(rows)
         out["search"] = "works" if rows else "no rows"
