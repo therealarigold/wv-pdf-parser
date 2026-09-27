@@ -2886,7 +2886,7 @@ class Handler(BaseHTTPRequestHandler):
             county = (g("county") or "MARSHALL").upper()
             last, first = _re_re.sub(r"[^A-Za-z' -]", "", g("last")), _re_re.sub(r"[^A-Za-z' -]", "", g("first"))
             book, pg_ = _re_re.sub(r"\W", "", g("book")), _re_re.sub(r"\W", "", g("page"))
-            if county not in IDX2_URLS and county in IDX2_SURVEY and county not in ("BERKELEY", "PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"):
+            if county not in IDX2_URLS and county in IDX2_SURVEY and county not in ("PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"):
                 IDX2_URLS[county] = IDX2_SURVEY[county]
             if county not in IDX2_URLS or not last or not first:
                 return self.respond({"error": "county (an IDX county), last and first are required"})
@@ -4250,8 +4250,9 @@ IDX2_SURVEY = {
     "RALEIGH": "http://129.71.206.131/",            # needs the office's account (IDX_RALEIGH_USER / _PASS) - probably Raleigh, confirm after login
     "MERCER": "https://inquiry.mercerclerkwv.com/",  # needs the office's account (IDX_MERCER_USER / _PASS)
     "KANAWHA": "https://kanawhawv.compiled-technologies.com/",  # needs the office's account (IDX_KANAWHA_USER / _PASS)
+    "BERKELEY": "https://records.berkeleywv.org/",   # IDX with the office's account (IDX_BERKELEY_USER / _PASS)
     # not the IDX product
-    "BERKELEY": "https://search.berkeleydeeds.com/NameSearch.php", "PUTNAM": "https://recordhub.cottsystems.com/PutnamWV",
+    "PUTNAM": "https://recordhub.cottsystems.com/PutnamWV",
     "TUCKER": "https://us5.courthousecomputersystems.com/TuckerWV/", "WETZEL": "http://www.wetzelcountywv.us/WEBInquiry/Default.aspx",
 }
 IDX2_JOBS = {}
@@ -4670,7 +4671,7 @@ def run_idx2_county_test(counties=None):
     try:
         for county, url in IDX2_SURVEY.items():
             if counties and county not in counties: continue
-            if county in ("BERKELEY", "PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"): continue   # not the IDX product / closed
+            if county in ("PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"): continue   # not the IDX product / closed
             IDX2_COUNTY_TEST["current"] = county
             p, browser = get_playwright_browser()                # a fresh browser per county (the server's one-process browser does not survive reuse)
             try:
