@@ -2908,6 +2908,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/idx-county-test-status":
             return self.respond(IDX2_COUNTY_TEST)
 
+        if path == "/sao-status":
+            return self.respond(SAO)
+
         if path == "/fernando-status":
             return self.respond(FERNANDO)
 
@@ -4662,6 +4665,11 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
     except Exception as e:
         out["search"] = "failed"
         out["error"] = str(e)[:200]
+        try:   # what the page offers (for counties laid out differently)
+            out["page"] = {"url": pg.url[:120], "title": pg.title()[:60],
+                           "modes": pg.evaluate("() => typeof cboKey !== 'undefined' ? [...Array(cboKey.GetItemCount()).keys()].map(i => cboKey.GetItem(i).text) : null"),
+                           "text": pg.evaluate("() => document.body.innerText.replace(/\s+/g, ' ').slice(0, 300)")}
+        except Exception: pass
     finally:
         try: ctx.close()
         except Exception: pass
@@ -4752,6 +4760,237 @@ def fernando_loop(n=0):
         except Exception as e:
             print(f"[fernando] {e}", flush=True); worked = False
         _t.sleep(5 if worked else 60)                  # gentle: one certificate at a time
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 📄 STATE AUDITOR DOCUMENTS (wvsao.gov > County Collections > View Images) - typed PDFs, read as text
+# APPROVAL LETTER: bid, taxes/fees, amount due, surplus, buyer, taxpayer, sale date. NTR LETTER: each addressee
+# and address, every named party, title-work cost, total to redeem, dates. CERTIFIED MAIL: delivered on / where.
+# Office use only (State Auditor terms: individual use, no resale / paid access without a contract).
+# ═════════════════════════════════════════════════════════════════════════════
+import re as _sao_re
+
+_SAO_MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august",
+                                            "september", "october", "november", "december"], 1)}
+
+
+def _sao_money(s):
+    try: return float(s.replace("$", "").replace(",", "").strip())
+    except Exception: return None
+
+
+def _sao_date(text):
+    """'26th day of July, 2024' / 'July 26, 2024' / '02/26/2025' -> '2024-07-26'."""
+    t = (text or "").strip()
+    m = _sao_re.search(r"(\d{1,2})(?:st|nd|rd|th)?\s+day\s+of\s+([A-Za-z]+)\s*,?\s*(\d{4})", t)
+    if m and m.group(2).lower() in _SAO_MONTHS: return f"{m.group(3)}-{_SAO_MONTHS[m.group(2).lower()]:02d}-{int(m.group(1)):02d}"
+    m = _sao_re.search(r"([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", t)
+    if m and m.group(1).lower() in _SAO_MONTHS: return f"{m.group(3)}-{_SAO_MONTHS[m.group(1).lower()]:02d}-{int(m.group(2)):02d}"
+    m = _sao_re.search(r"(\d{2})/(\d{2})/(\d{4})", t)
+    if m: return f"{m.group(3)}-{m.group(1)}-{m.group(2)}"
+    return None
+
+
+def _sao_block(text, start, stops):
+    """Lines after `start` until a line matching one of `stops` (name + address blocks)."""
+    i = text.find(start)
+    if i < 0: return []
+    out = []
+    for line in text[i + len(start):].split("\n"):
+        l = line.strip()
+        if not l: continue
+        if any(_sao_re.search(s, l) for s in stops): break
+        out.append(l)
+    return out
+
+
+def sao_parse_approval(t):
+    flat = _sao_re.sub(r"\s+", " ", t or "")
+    def amt(label):
+        m = _sao_re.search(_sao_re.escape(label) + r"[^$]{0,40}?\$\s*(-?[\d,]+\.\d\d)", flat)
+        return _sao_money(m.group(1)) if m else None
+    out = {
+        "sale_date": _sao_date(flat[flat.find("on this"):][:60]) if "on this" in flat else None,
+        "delinquent_taxes": amt("Delinquent Taxes:"), "interest": amt("Interest on Delinquent Taxes"),
+        "subsequent_taxes": amt("Subsequent Taxes:"), "back_taxes": amt("Back Taxes:"),
+        "certification_fee": amt("Certification Fee"), "publication_fee": amt("Publication Fee"), "auditor_fee": amt("Auditor's Fee"),
+        "courthouse_fee": amt("Courthouse Facility Improvement Fund"),
+        "bid": amt("Amount of Bid"), "amount_due": amt("Amount Due"), "surplus": amt("Surplus"),
+    }
+    tp = _sao_block(t, "Taxpayer:", [r"^\{", r"^\d{4} \d{4} \d{4}", r"Delinquent Taxes"])
+    if tp: out["taxpayer"], out["taxpayer_address"] = tp[0], ", ".join(tp[1:4])
+    pu = _sao_block(t, "Purchaser:", [r"^\{", r"^Page \d"])
+    if pu: out["purchaser"], out["purchaser_address"] = pu[0], ", ".join(pu[1:4])
+    return {k: v for k, v in out.items() if v not in (None, "")}
+
+
+def sao_parse_ntr(t):
+    """Addressees (name + address at the top of each letter copy), every named party, amounts and dates."""
+    people, seen = [], set()
+    for m in _sao_re.finditer(r"(?:^|\n)\s*((?:[^\n]+\n){2,5}?)\s*West Virginia State Auditor's\s*\n\s*Office County Collections", t or ""):
+        lines = [l.strip() for l in m.group(1).strip().split("\n") if l.strip()]
+        lines = [l for l in lines if not l.startswith("{") and "[NTR LETTER]" not in l]
+        if len(lines) < 2 or len(lines) > 5: continue
+        name, addr = lines[0], ", ".join(lines[1:])
+        if "West Virginia State Auditor" in name or name.startswith("("): continue
+        key = (name.upper(), addr.upper())
+        if key in seen: continue
+        seen.add(key); people.append({"name": name, "address": addr})
+    flat = _sao_re.sub(r"\s+", " ", t or "")
+    named = []
+    m = _sao_re.search(r"To:\s*(.+?),?\s*or heirs at law", flat)
+    if m:
+        for n in _sao_re.split(r",\s*", m.group(1)):
+            n = n.strip()
+            if n and n.upper() not in [x.upper() for x in named]: named.append(n)
+    out = {"addressees": people, "named": named}
+    m = _sao_re.search(r"Given under my hand\s+([A-Za-z]+\s+\d{1,2},\s*\d{4})", flat)
+    if m: out["ntr_date"] = _sao_date(m.group(1))
+    m = _sao_re.search(r"redeem at any time before\s+([A-Za-z]+\s+\d{1,2},\s*\d{4})", flat)
+    if m: out["redeem_by"] = _sao_date(m.group(1))
+    m = _sao_re.search(r"deed for such real estate will be made on or after\s+([A-Za-z]+\s+\d{1,2},\s*\d{4})", flat)
+    if m: out["deed_on_or_after"] = _sao_date(m.group(1))
+    m = _sao_re.search(r"will be as follows:\s*((?:\$\s*[\d,]+\.\d\d\s*){4,8})", flat)
+    if m:
+        vals = [_sao_money(x) for x in _sao_re.findall(r"\$\s*([\d,]+\.\d\d)", m.group(1))]
+        out["redeem_lines"] = vals
+        if vals: out["redeem_total"] = max(vals)
+        if len(vals) >= 4: out["title_work_cost"] = vals[3]      # "Amount paid for Title Examination, notice ..., service ..."
+    return out
+
+
+def sao_parse_mail(t):
+    flat = _sao_re.sub(r"\s+", " ", t or "")
+    out = {}
+    m = _sao_re.search(r"item number\s+([\d ]{20,})", flat)
+    if m: out["tracking"] = m.group(1).replace(" ", "")[:22]
+    m = _sao_re.search(r"delivered on\s+(\d{2}/\d{2}/\d{4})\s+at\s+([\d:]+\s*[ap]\.?m\.?)\s+in\s+(.+?)\.\s", flat)
+    if m: out.update({"delivered_on": _sao_date(m.group(1)), "delivered_at": m.group(3).strip()})
+    elif _sao_re.search(r"(return|unclaimed|undeliverable|refused)", flat, _sao_re.I): out["not_delivered"] = True
+    return out
+
+
+_SAO_NEWSPAPER = _sao_re.compile(r"\b(NEWS|ECHO|TIMES|HERALD|GAZETTE|JOURNAL|REGISTER|INTELLIGENCER|TRIBUNE|DAILY|RECORD|COURIER|DEMOCRAT|REPUBLICAN|PRESS|LEDGER|CHRONICLE|SENTINEL|ENQUIRER|MAIL|POST)\b")
+SAO_URL = "https://www.wvsao.gov/CountyCollections/Default"
+SAO_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+SAO = {"state": "idle", "done": 0, "none": 0, "failed": 0, "last": None}
+
+
+def _sao_pdf_text(data):
+    import io, pypdf
+    return "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(data)).pages)
+
+
+def _sao_open_images(pg, year, county, cert):
+    """County Collections search for one certificate, then its 'View Images' page. Returns the document labels, or None."""
+    pg.goto(SAO_URL, wait_until="networkidle", timeout=60000)
+    with pg.expect_navigation(timeout=60000):
+        pg.select_option('select[name="ctl00$FixedWidthContent$YearDD"]', value=str(year))
+    pg.wait_for_load_state("networkidle")
+    val = pg.evaluate("(c) => { const o = [...document.querySelector('select[name=\"ctl00$FixedWidthContent$CountyDD\"]').options].find(o => o.text.trim().toUpperCase() === c); return o ? o.value : null; }", county.upper())
+    if not val: raise ValueError(f"county {county} not in the {year} list")
+    pg.select_option('select[name="ctl00$FixedWidthContent$CountyDD"]', value=val)
+    pg.fill('input[name="ctl00$FixedWidthContent$CertTB"]', cert.split("-")[-1])
+    with pg.expect_navigation(timeout=60000):
+        pg.click('input[name="ctl00$FixedWidthContent$SearchBTN"]')
+    pg.wait_for_load_state("networkidle")
+    link = pg.evaluate("""(cert) => { const tr = [...document.querySelectorAll('tr')].find(r => r.innerText.includes(cert) && [...r.querySelectorAll('a')].some(a => /View Images/i.test(a.innerText)));
+                          if (!tr) return null; const a = [...tr.querySelectorAll('a')].find(a => /View Images/i.test(a.innerText)); return a.id || a.getAttribute('href'); }""", cert)
+    if not link: return None
+    with pg.expect_navigation(timeout=60000):
+        pg.evaluate("(cert) => { const tr = [...document.querySelectorAll('tr')].find(r => r.innerText.includes(cert) && [...r.querySelectorAll('a')].some(a => /View Images/i.test(a.innerText))); [...tr.querySelectorAll('a')].find(a => /View Images/i.test(a.innerText)).click(); }", cert)
+    pg.wait_for_load_state("networkidle")
+    labels = pg.evaluate("""() => { const t = (document.querySelector('main') || document.body).innerText; const part = t.split(/\\nImages\\n/)[1] || t.split('Images')[1] || '';
+                            return part.split('\\n').map(s => s.trim()).filter(s => s && !/new tab/i.test(s) && s !== 'View'); }""")
+    btns = pg.evaluate("() => [...document.querySelectorAll('input[value=\"View\"]')].map(b => b.name)")
+    return list(zip(labels[:len(btns)], btns))
+
+
+def _sao_fetch(ctx, pg, btn):
+    """One document (the 'View' button posts the page; the PDF is then served at Document.aspx)."""
+    form = pg.evaluate("(n) => { const f = document.forms[0]; const d = Object.fromEntries(new FormData(f)); d[n] = 'View'; return d; }", btn)
+    ctx.request.post("https://www.wvsao.gov/CountyCollections/CTS/CTSImages", form=form, timeout=60000)
+    r = ctx.request.get("https://www.wvsao.gov/CountyCollections/CTS/Document.aspx", timeout=60000)
+    if "pdf" not in (r.headers.get("content-type") or ""): raise ValueError("not a PDF")
+    return r.body()
+
+
+def sao_read_cert(ctx, pg, job):
+    county, cert, year, wv = job["county"], job["cert"], job.get("year"), job.get("wv_status") or ""
+    docs = _sao_open_images(pg, year, county, cert)
+    if docs is None: return {"county": county, "cert": cert, "status": "none", "error": "no 'View Images' for this certificate"}
+    out = {"county": county, "cert": cert, "status": "done", "docs": [d[0] for d in docs], "people": [], "texts": []}
+    want_notice = wv in ("DEEDED", "SOLD", "CANCELED")
+    seen = {}
+    for label, btn in docs:
+        L = label.upper()
+        kind = "approval" if "APPROVAL" in L else "ntr" if "NTR" in L else "mail" if "CERTIFIED MAIL" in L else None
+        if not kind or (kind != "approval" and not want_notice): continue
+        idx = seen.get(L, 0); seen[L] = idx + 1
+        try:
+            text = _sao_pdf_text(_sao_fetch(ctx, pg, btn))
+        except Exception as e:
+            out.setdefault("doc_errors", []).append(f"{label}: {str(e)[:80]}"); continue
+        out["texts"].append({"label": L, "idx": idx, "text": text[:60000]})
+        if kind == "approval" and "sale" not in out:
+            s = sao_parse_approval(text); out["sale"] = s
+            if s.get("taxpayer"): out["people"].append({"name": s["taxpayer"], "address": s.get("taxpayer_address", ""), "source": "taxpayer", "doc_date": s.get("sale_date")})
+            if s.get("purchaser"): out["people"].append({"name": s["purchaser"], "address": s.get("purchaser_address", ""), "source": "purchaser", "doc_date": s.get("sale_date")})
+        elif kind == "ntr":
+            n = sao_parse_ntr(text)
+            ntr = out.setdefault("ntr", {"letters": [], "named": []})
+            ntr["letters"].append({k: v for k, v in n.items() if k not in ("addressees", "named")})
+            for nm in n.get("named", []):
+                if nm.upper() not in [x.upper() for x in ntr["named"]]: ntr["named"].append(nm)
+            for a in n.get("addressees", []):
+                src = "newspaper" if _SAO_NEWSPAPER.search(a["name"].upper()) else "NTR addressee"
+                out["people"].append({"name": a["name"], "address": a["address"], "source": src, "doc_date": n.get("ntr_date")})
+        elif kind == "mail":
+            m = sao_parse_mail(text)
+            if m: out.setdefault("mail", []).append(m)
+        __import__("time").sleep(0.7)                       # gentle between documents
+    if "ntr" in out:
+        for nm in out["ntr"]["named"]:
+            if nm.upper() not in [p["name"].upper() for p in out["people"]]:
+                out["people"].append({"name": nm, "address": "", "source": "NTR named"})
+        letters = out["ntr"]["letters"]
+        last = max(letters, key=lambda l: l.get("ntr_date") or "") if letters else {}
+        out["ntr"].update({k: last.get(k) for k in ("ntr_date", "redeem_by", "deed_on_or_after", "redeem_total", "title_work_cost") if last.get(k) is not None})
+    if "sale" not in out: out["error"] = "no approval letter read" + ("; " + "; ".join(out.get("doc_errors", [])) if out.get("doc_errors") else "")
+    return out
+
+
+def sao_loop():
+    """🧾 Reads the State Auditor documents of every sold certificate, one at a time (sao_cert queue)."""
+    import time as _t
+    _t.sleep(90)
+    from playwright.sync_api import sync_playwright
+    while True:
+        p = browser = None
+        try:
+            p, browser = get_playwright_browser()
+            ctx = browser.new_context(user_agent=SAO_UA)
+            pg = ctx.new_page()
+            for _ in range(150):                               # fresh browser every 150 certificates
+                job = _fz_rpc("sao_claim", {})
+                if not job:
+                    SAO["state"] = "idle"; _t.sleep(300); break
+                SAO.update({"state": "working", "current": f"{job['county']} {job['cert']}"})
+                try:
+                    res = sao_read_cert(ctx, pg, job)
+                except Exception as e:
+                    res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": str(e)[:300]}
+                _fz_rpc("sao_save", {"p": res})
+                SAO[res["status"] if res["status"] in ("done", "none", "failed") else "done"] = SAO.get(res["status"], 0) + 1
+                SAO["last"] = f"{job['county']} {job['cert']} {res['status']}"
+                _t.sleep(1.5)                                  # gentle between certificates
+        except Exception as e:
+            print(f"[sao] {e}", flush=True); _t.sleep(60)
+        finally:
+            try: browser and browser.close()
+            except Exception: pass
+            try: p and p.stop()
+            except Exception: pass
 
 
 def _idx2_run(job, county, last, first, book, page, desc=None):
@@ -4920,4 +5159,6 @@ if __name__ == '__main__':
     if os.environ.get("SUPABASE_SECRET_KEY"):
         for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
             _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
+        if os.environ.get("SAO_READER", "1") == "1":
+            _og_threading.Thread(target=sao_loop, daemon=True).start()   # 🧾 State Auditor documents
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
