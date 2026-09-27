@@ -4318,7 +4318,7 @@ def _idx2_rows(pg):
 
 
 # One scanned page as a JPEG the size Claude reads best (long side 1568 px), drawn in the page itself.
-_IDX2_SHRINK = """() => { const i = [...document.images].find(i => i.naturalWidth > 1000); if (!i) return null;
+_IDX2_SHRINK = """() => { const i = [...document.images].filter(i => i.naturalWidth > 1000 && i.naturalHeight > 600).sort((a, b) => b.naturalWidth * b.naturalHeight - a.naturalWidth * a.naturalHeight)[0]; if (!i) return null;
   const k = Math.min(1, 1568 / Math.max(i.naturalWidth, i.naturalHeight)); const c = document.createElement('canvas');
   c.width = Math.round(i.naturalWidth * k); c.height = Math.round(i.naturalHeight * k);
   const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(i, 0, 0, c.width, c.height);
@@ -4328,6 +4328,86 @@ _IDX2_SHRINK = """() => { const i = [...document.images].find(i => i.naturalWidt
 def _idx2_base(url):
     """Folder of the search page (Image.aspx sits next to Default.aspx)."""
     return _re_re.sub(r"/default\.aspx$", "", url.rstrip("/"), flags=_re_re.I)
+
+
+_IDX2_BIG_IMG = "() => { const i = [...document.images].find(i => i.naturalWidth > 1000 && i.naturalHeight > 600 && i.complete); return i ? i.src : null; }"
+
+
+def _idx2_pick(ip, combo, text):
+    """Choose an item of a DevExpress combo by (partial) text; returns the chosen text or None."""
+    return ip.evaluate("""([c, t]) => { const cb = window[c]; if (!cb) return null; t = t.toUpperCase();
+        let hit = -1; for (let k = 0; k < cb.GetItemCount(); k++) { const x = cb.GetItem(k).text.toUpperCase().trim();
+          if (x === t) { hit = k; break; } if (hit < 0 && x.indexOf(t) >= 0) hit = k; }
+        if (hit < 0) return null; cb.SetSelectedIndex(hit); return cb.GetItem(hit).text; }""", [combo, text])
+
+
+def _idx2_items(ip, combo, limit=400):
+    return ip.evaluate("([c, n]) => { const cb = window[c]; if (!cb) return []; const o = []; for (let k = 0; k < Math.min(cb.GetItemCount(), n); k++) o.push(cb.GetItem(k).text); return o; }", [combo, limit])
+
+
+def _idx2_wait_new_image(ip, old=None, timeout=40000):
+    ip.wait_for_function("(old) => { const i = [...document.images].find(i => i.naturalWidth > 1000 && i.naturalHeight > 600 && i.complete); return i && i.src !== old; }", arg=old, timeout=timeout)
+
+
+def _idx2_book_images(ctx, base_url, book_type, book, page, want=2):
+    """Pages of a recorded book by book / page (the IDX 'Image Search') - also the old books that are not in the computer
+    index. book_type e.g. 'DEED BOOK', 'DEED OF TRUST BOOK', 'WILL BOOK', 'RELEASE BOOK'. Returns base64 JPEGs, [] if none."""
+    ip = ctx.new_page()
+    try:
+        ip.goto(_idx2_base(base_url) + "/Image.aspx", wait_until="networkidle", timeout=60000)
+        ip.wait_for_function("() => typeof cboBook !== 'undefined' && typeof txtBook !== 'undefined'", timeout=30000)
+        if not _idx2_pick(ip, "cboBook", book_type): raise ValueError(f"no '{book_type}' in this county's image search")
+        mb = _re_re.match(r"\s*([A-Za-z]*)\s*(\d+)\s*([A-Za-z]*)", str(book)); mp = _re_re.match(r"\s*(\d+)\s*([A-Za-z]*)", str(page))
+        if not (mb and mp): raise ValueError("book and page must be numbers")
+        ip.evaluate("""([b, bs, p, ps]) => { txtBook.SetText(b); txtBookSuffix.SetText(bs); txtPage.SetText(p); txtPageSuffix.SetText(ps);
+                        window.customCommand = 'Search';
+                        window.setTimeout("__doPostBack(document.getElementsByClassName('viewerPanel')[0].id, 'Search')", 0); }""",
+                    [mb.group(2), mb.group(3) or "", mp.group(1), mp.group(2) or ""])
+        try: _idx2_wait_new_image(ip)
+        except Exception: return []
+        out = []
+        for n in range(max(1, min(want, 6))):
+            out.append(ip.evaluate(_IDX2_SHRINK))
+            if n + 1 >= want: break
+            old = ip.evaluate(_IDX2_BIG_IMG)
+            nxt = ip.locator("[id$='_rc_T0G0I4']")
+            if not nxt.count(): break
+            nxt.first.click()
+            try: _idx2_wait_new_image(ip, old, 30000)
+            except Exception: break
+        return [x for x in out if x]
+    finally:
+        ip.close()
+
+
+def _idx2_vault(ctx, base_url, book_name=None, volume=None, page=None):
+    """The old handwritten index books (the IDX 'Vault'). No book_name: the list of books; no volume: its volumes;
+    no page: its pages; all three: that page as a base64 JPEG. Returns (list or image, note)."""
+    ip = ctx.new_page()
+    try:
+        ip.goto(_idx2_base(base_url) + "/Vault.aspx", wait_until="networkidle", timeout=60000)
+        ip.wait_for_function("() => typeof cboBook !== 'undefined' && typeof CallVaultPanel !== 'undefined'", timeout=30000)
+        if not book_name: return _idx2_items(ip, "cboBook"), "index books"
+        chosen = _idx2_pick(ip, "cboBook", book_name)
+        if not chosen: return _idx2_items(ip, "cboBook"), f"no book like '{book_name}' - these are the books"
+        ip.evaluate("() => CallVaultPanel.PerformCallback('BookName')")
+        ip.wait_for_function("() => cboBookNo.GetItemCount() > 0 && !CallVaultPanel.InCallback()", timeout=30000)
+        if not volume: return _idx2_items(ip, "cboBookNo"), f"volumes of {chosen} (usually by the first letters of the surname)"
+        vol = _idx2_pick(ip, "cboBookNo", volume)
+        if not vol: return _idx2_items(ip, "cboBookNo"), f"no volume '{volume}' - these are the volumes of {chosen}"
+        ip.evaluate("() => CallVaultPanel.PerformCallback('Book')")
+        ip.wait_for_function("() => cboPageNo.GetItemCount() > 0 && !CallVaultPanel.InCallback()", timeout=30000)
+        if page in (None, ""):
+            pages = _idx2_items(ip, "cboPageNo", 2000)
+            return pages[:40] + (["…"] if len(pages) > 80 else []) + pages[-40:], f"{len(pages)} pages in {chosen} {vol} (page 0 / the first pages are usually the book's own name guide)"
+        pg_txt = _idx2_pick(ip, "cboPageNo", str(page))
+        if not pg_txt: return [], f"no page {page} in {chosen} {vol}"
+        old = ip.evaluate(_IDX2_BIG_IMG)
+        ip.evaluate("() => { window.customCommand = 'Page'; window.setTimeout(\"__doPostBack(document.getElementsByClassName('viewerPanel')[0].id, 'Page')\", 0); }")
+        _idx2_wait_new_image(ip, old)
+        return ip.evaluate(_IDX2_SHRINK), f"{chosen}, volume {vol}, page {pg_txt}"
+    finally:
+        ip.close()
 
 
 def _idx2_pages(ctx, base_url, image_id, want=2):
@@ -4360,7 +4440,8 @@ _IDX2_ASK = {
         "beneficiaries": "array", "real_estate_mentioned": "string"}),
     "deed": ("a recorded deed", {
         "grantors": "array", "grantees": "array", "grantee_mailing_address": "string", "property_address": "string",
-        "legal_description_short": "string", "prior_deed_reference": "string", "consideration": "string", "tax_ids": "array"}),
+        "legal_description_short": "string", "prior_deed_reference": "string", "consideration": "string", "tax_ids": "array",
+        "deed_date": "string"}),
 }
 
 
@@ -4654,6 +4735,32 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 item["read"] = {"error": str(e)[:200]}
             return item["read"]
 
+        def old_chain(ref, said, steps=4):
+            """Older than the computer index: open the deed book page itself (Image Search), read it, and follow its own
+            'being the same property ... Book X Page Y' back, up to `steps` deeds."""
+            for _ in range(steps):
+                entry = {"date": "", "type": "DEED (older than the computer index)", "bookpage": f"{ref[0]} @ {ref[1]}",
+                         "grantor": "", "grantee": "", "desc": said, "found_by": "named in the deed text"}
+                chain.append(entry)
+                if not read or reads["n"] >= max_reads: return
+                try:
+                    imgs = _idx2_book_images(ctx, url, "DEED BOOK", ref[0], ref[1], 3)
+                except Exception as e:
+                    entry["old_book"] = f"image search failed: {str(e)[:80]}"; return
+                if not imgs:
+                    entry["old_book"] = "no scanned page in the county's image search"; return
+                reads["n"] += 1
+                try: rd2 = _idx2_read_doc("deed", imgs)
+                except Exception as e: rd2 = {"error": str(e)[:200]}
+                entry.update({"read": rd2, "pages_read": len(imgs), "type": "DEED (old book, read from the scanned page)",
+                              "found_by": "old deed book page (read by Fernando)", "date": (rd2 or {}).get("deed_date") or "",
+                              "grantor": "; ".join((rd2 or {}).get("grantors") or []), "grantee": "; ".join((rd2 or {}).get("grantees") or [])})
+                m2 = _re_re.search(r"Book\s+(?:No\.?\s*)?(\d+)\s*,?\s*(?:at\s+)?Page\s+(?:No\.?\s*)?(\d+)", (rd2 or {}).get("prior_deed_reference") or "", _re_re.I)
+                if not m2: return
+                nref = (m2.group(1).lstrip("0"), m2.group(2).lstrip("0"))
+                if nref == ref: return
+                ref, said = nref, rd2.get("prior_deed_reference")
+
         seen_people = {}
         def person(l, f):
             if (l, f) not in seen_people:
@@ -4703,6 +4810,25 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             if not cur and not found_deed:
                 bp_check = {"bookpage": f"{want_bp[0]} @ {want_bp[1]}",
                             "found": sorted(set(f'{r["doc"]}: {r["name"]}' for r in bp))[:6] or ["nothing at this book/page in the computer index"]}
+                if not bp and read and reads["n"] < max_reads:
+                    # older than the computer index: the deed book page itself, read by Fernando
+                    try:
+                        imgs = _idx2_book_images(ctx, url, "DEED BOOK", want_bp[0], want_bp[1], 3)
+                    except Exception:
+                        imgs = []
+                    if imgs:
+                        reads["n"] += 1
+                        rd0b = _idx2_read_doc("deed", imgs)
+                        bp_check["old_book"] = rd0b
+                        gs = " ".join((rd0b or {}).get("grantees") or []).upper()
+                        if last and last in gs:
+                            # it is the owner's own deed: start the chain there and follow it back
+                            chain.append({"date": rd0b.get("deed_date") or "", "type": "DEED (old book, read from the scanned page)",
+                                          "bookpage": bp_check["bookpage"], "grantor": "; ".join(rd0b.get("grantors") or []),
+                                          "grantee": "; ".join(rd0b.get("grantees") or []), "desc": rd0b.get("legal_description_short") or "",
+                                          "read": rd0b, "found_by": "book/page given - old deed book page (read by Fernando)"})
+                            m3 = _re_re.search(r"Book\s+(?:No\.?\s*)?(\d+)\s*,?\s*(?:at\s+)?Page\s+(?:No\.?\s*)?(\d+)", rd0b.get("prior_deed_reference") or "", _re_re.I)
+                            if m3: old_chain((m3.group(1).lstrip("0"), m3.group(2).lstrip("0")), rd0b.get("prior_deed_reference"), 3)
             seen = set()
             for step in range(6):
                 if not cur: break
@@ -4722,8 +4848,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                             if _idx2_bp(r["bookpage"]) == ref and _idx2_is_deed(r) and r["role"] == "GRANTEE"]
                     if prow:
                         cur, how = prow, "named in the deed text"; continue
-                    chain.append({"date": "", "type": "DEED (older than the computer index)", "bookpage": f"{ref[0]} @ {ref[1]}",
-                                  "grantor": "", "grantee": "", "desc": rd.get("prior_deed_reference"), "found_by": "named in the deed text"})
+                    old_chain(ref, rd.get("prior_deed_reference"))
                     break
                 # 2. the seller's own purchase with a similar description
                 srows = person(sl, sf)
@@ -5005,6 +5130,17 @@ _FZC_TOOLS = [
      "input_schema": {"type": "object", "properties": {"last_name": {"type": "string"}, "first_name": {"type": "string"}, "county": {"type": "string"}}, "required": ["last_name"]}},
     {"name": "lookup_book_page", "description": "What is recorded at a book and page in the county's computer index (type, date, parties, description).",
      "input_schema": {"type": "object", "properties": {"book": {"type": "string"}, "page": {"type": "string"}}, "required": ["book", "page"]}},
+    {"name": "old_book_page", "description": "Open a page of any recorded book by book and page number, straight from the county's scanned books "
+        "(also OLD books that are not in the computer index; handwriting is fine - read it yourself). book_type: DEED BOOK, DEED OF TRUST BOOK, "
+        "WILL BOOK, RELEASE BOOK, JUDGEMENT BOOK, SETTLEMENT BOOK, APPRAISEMENT BOOK, PLAT BOOK, MISC BOOK, LAND BOOKS (TRACT LAND)...",
+     "input_schema": {"type": "object", "properties": {"book_type": {"type": "string"}, "book": {"type": "string"}, "page": {"type": "string"},
+                      "pages": {"type": "integer", "description": "how many pages from there, 1-4 (default 2)"}, "county": {"type": "string"}}, "required": ["book_type", "book", "page"]}},
+    {"name": "old_index_book", "description": "The county's OLD HANDWRITTEN INDEX BOOKS (the 'Vault'): Grantee / Grantor Index to Deeds, Deed of Trust "
+        "index, Will Index, Release Index, Appraisement & Settlement, Fiduciary... Use it to find a name from before the computer index. "
+        "Call with no book_name to list the books, with book_name to list its volumes (by surname letters), with volume to list its pages, "
+        "and with page to see that page (read the handwriting yourself; the first pages of a volume are usually its own name guide).",
+     "input_schema": {"type": "object", "properties": {"book_name": {"type": "string"}, "volume": {"type": "string"}, "page": {"type": "string"},
+                      "county": {"type": "string"}}}},
     {"name": "read_document", "description": "Open the scanned images of the document recorded at a book/page so you can read it yourself "
         "(parties, addresses, amounts, the 'being the same property' clause, release wording). Costly - only when the answer is on the page.",
      "input_schema": {"type": "object", "properties": {"book": {"type": "string"}, "page": {"type": "string"},
@@ -5072,7 +5208,24 @@ class _FzcSites:
 
 
 def _fzc_tool(sites, name, args, budget):
-    site = sites.get(args.get("county")) if name in ("search_person", "lookup_book_page", "read_document") else None
+    site = sites.get(args.get("county")) if name in ("search_person", "lookup_book_page", "read_document", "old_book_page", "old_index_book") else None
+    if name == "old_book_page":
+        if budget["reads"] >= 8: return "Page reading limit for this question reached (8)."
+        site.page()                                                    # signed in (when the county needs it)
+        imgs = _idx2_book_images(site.ctx, site.url, args.get("book_type") or "DEED BOOK", args.get("book"), args.get("page"), max(1, min(4, int(args.get("pages") or 2))))
+        if not imgs: return f"No scanned page for {args.get('book_type')} {args.get('book')} page {args.get('page')} in this county's image search."
+        budget["reads"] += 1
+        return [{"type": "text", "text": f"{args.get('book_type')} {args.get('book')} page {args.get('page')} - {len(imgs)} page(s):"}] + \
+               [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in imgs]
+    if name == "old_index_book":
+        site.page()
+        if args.get("page") not in (None, ""):
+            if budget["reads"] >= 8: return "Page reading limit for this question reached (8)."
+            budget["reads"] += 1
+        got, note = _idx2_vault(site.ctx, site.url, args.get("book_name"), args.get("volume"), args.get("page"))
+        if isinstance(got, str):
+            return [{"type": "text", "text": note + ":"}, {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": got}}]
+        return _re_json.dumps({"note": note, "items": got})
     if name == "search_person":
         last, first = (args.get("last_name") or "").upper().strip(), (args.get("first_name") or "").upper().strip()
         if not last: return "Give a last name."
@@ -5124,6 +5277,8 @@ def _fz_step_words(name, args, county):
         return f"🔎 In the {c} county index, looking up {who.title() or 'a name'}…"
     if name == "lookup_book_page": return f"📚 In the {c} county index, checking book {args.get('book')} page {args.get('page')}…"
     if name == "read_document": return f"📄 Reading the document at book {args.get('book')} page {args.get('page')} ({c})…"
+    if name == "old_book_page": return f"📜 Opening the old {str(args.get('book_type') or 'deed book').lower()} {args.get('book')} page {args.get('page')} ({c})…"
+    if name == "old_index_book": return f"📒 Looking in the old handwritten index books ({c}){': ' + args.get('book_name').title() if args.get('book_name') else ''}…"
     return "🤔 Working on it…"
 
 
