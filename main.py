@@ -5366,6 +5366,7 @@ def _fz_step_words(name, args, county):
     if name == "buyer_spend": return "💵 Looking at the buyers' spending…"
     if name == "surplus_estimate": return "💰 Working out the surplus per person…"
     if name == "history": return "🕘 Looking at who changed and opened it…"
+    if name == "propose_action": return "✍ Preparing that change for you to confirm…"
     return "🤔 Working on it…"
 
 
@@ -5616,7 +5617,12 @@ Plain text only: no ** bold, no tables. When staff ask to OPEN something, give t
   job:          https://portal.annelabes.com/index.html#job=<job_id>
   client:       https://portal.annelabes.com/index.html#client=<bidder>
 (ids come from client_summary / cert_lookup). Surplus per heir: use surplus_estimate and always say
-"estimate - confirm with the attorney"."""
+"estimate - confirm with the attorney".
+When staff tell you to CHANGE something (move a surplus case to a stage, add a note, set a title search status), you never
+change it yourself: look it up first (cert_lookup), then call propose_action - staff get a ✓ Confirm button and it is saved
+under their own name. If more than one record could match (two Bob Smiths), ask which one instead of proposing.
+Surplus stages in order: mailed, contacted, retained (they hired us), filed (in court), granted / appealed / denied, received,
+distributed (closes it), declined (closes it). Title search statuses: progress, complete, verified, filed."""
 _FZG_GO_LIVE = {"name": "go_live", "description": "Call this ONLY when the answer needs a LIVE county index search or reading document "
     "images / old books / the web (our own data is not enough). Say in 'reason' what you will look up. It takes 1-3 minutes and costs more.",
     "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}, "county": {"type": "string"}}, "required": ["reason"]}}
@@ -5639,6 +5645,15 @@ _FZG_DATA_TOOLS.append(
      "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "cert": {"type": "string"}, "heirs": {"type": "integer"},
                       "shares": {"type": "array", "items": {"type": "number"}}, "names": {"type": "array", "items": {"type": "string"}}},
                       "required": ["county", "cert"]}})
+_FZG_DATA_TOOLS.append(
+    {"name": "propose_action", "description": "Propose ONE change for staff to confirm (never applied by you). kind: surplus_stage (change.stage), "
+        "surplus_note (change.note), ts_status (change.status), ts_note (change.note). Target the record by county + cert (as found with cert_lookup).",
+     "input_schema": {"type": "object", "properties": {
+        "kind": {"type": "string", "enum": ["surplus_stage", "surplus_note", "ts_status", "ts_note"]},
+        "county": {"type": "string"}, "cert": {"type": "string"},
+        "stage": {"type": "string", "enum": ["mailed", "contacted", "retained", "filed", "appealed", "granted", "denied", "received", "distributed", "declined"]},
+        "status": {"type": "string", "enum": ["progress", "complete", "verified", "filed"]},
+        "note": {"type": "string"}}, "required": ["kind", "county", "cert"]}})
 _FZG_OWNER_TOOLS = [
     {"name": "history", "description": "Owners only: who changed this certificate's ticket / job / surplus case (what, when) and who opened it.",
      "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "cert": {"type": "string"}}, "required": ["county", "cert"]}},
@@ -5654,7 +5669,53 @@ def _fzg_tools(role):
     return t
 
 
-def _fzg_tool_fn(role):
+_FZG_STAGE_WORDS = {"mailed": "Mailed", "contacted": "Contacted", "retained": "Hired us (retained)", "filed": "Filed in court",
+                    "appealed": "Appealed", "granted": "Granted", "denied": "Denied (closes it)", "received": "Money received",
+                    "distributed": "Distributed (closes it)", "declined": "Declined (closes it)"}
+
+
+def _fzg_propose(args, actions):
+    """Check the target exists, then keep the proposal for the ✓ Confirm button (applied later as the staff member)."""
+    kind, county, cert = args.get("kind"), (args.get("county") or "").strip(), (args.get("cert") or "").strip()
+    rows = _fz_rpc("fz_cert", {"p_query": cert, "p_county": county or None}) or []
+    rows = [r for r in rows if r.get("cert") == cert.upper() or len(rows) == 1]
+    if len(rows) != 1: return f"I found {len(rows)} records for {county} {cert} - ask which one before proposing."
+    r = rows[0]
+    who = ((r.get("state") or {}).get("taxpayer") or (r.get("job") or {}).get("assessedName") or "").split("\n")[0].title()
+    target = {"county": r["county"], "cert": r["cert"]}
+    if kind in ("surplus_stage", "surplus_note"):
+        sc = r.get("surplus")
+        if not sc: return f"There is no surplus case for {r['county']} {r['cert']}."
+        target["case_key"] = f"{sc.get('year')}|{str(sc.get('county') or '').upper()}|{sc.get('cert_number')}"
+        if kind == "surplus_stage":
+            st = args.get("stage")
+            if st not in _FZG_STAGE_WORDS: return "Say which stage."
+            label = f"Move {who or 'the case'} ({r['county']} {r['cert']}) from {sc.get('stage') or 'new'} to {_FZG_STAGE_WORDS[st]}"
+            change = {"stage": st}
+        else:
+            if not args.get("note"): return "Say what the note should say."
+            label = f"Add a note to the surplus case {r['county']} {r['cert']}: \"{args['note'][:160]}\""
+            change = {"note": args["note"][:2000]}
+    elif kind in ("ts_status", "ts_note"):
+        t = r.get("ticket")
+        if not t: return f"There is no title search ticket for {r['county']} {r['cert']}."
+        target["ts_id"] = t.get("id")
+        if kind == "ts_status":
+            if args.get("status") not in ("progress", "complete", "verified", "filed"): return "Say which status."
+            label = f"Set the title search {r['county']} {r['cert']} from {t.get('status')} to {args['status']}"
+            change = {"status": args["status"]}
+        else:
+            if not args.get("note"): return "Say what the note should say."
+            label = f"Add to the title search notes {r['county']} {r['cert']}: \"{args['note'][:160]}\""
+            change = {"note": args["note"][:2000]}
+    else:
+        return "Unknown kind."
+    actions.append({"id": f"a{len(actions) + 1}", "label": label, "kind": kind, "target": target, "change": change})
+    return f"Proposed (staff will see a ✓ Confirm button): {label}"
+
+
+def _fzg_tool_fn(role, actions=None):
+    if actions is None: actions = []
     def fn(sites, name, args, budget):
         if name == "client_summary": return _re_json.dumps(_fz_rpc("fz_client", {"p_who": args.get("who") or ""}), ensure_ascii=False)[:100000]
         if name == "cert_lookup": return _re_json.dumps(_fz_rpc("fz_cert", {"p_query": args.get("query") or "", "p_county": args.get("county") or None}), ensure_ascii=False)[:60000]
@@ -5664,6 +5725,8 @@ def _fzg_tool_fn(role):
             return _re_json.dumps(_fz_rpc("fz_history", {"p_county": args.get("county") or "", "p_cert": args.get("cert") or ""}), ensure_ascii=False)[:30000]
         if name == "surplus_estimate":
             return _fzg_surplus(args)
+        if name == "propose_action":
+            return _fzg_propose(args, actions)
         if name == "buyer_spend":
             if role != "owner": return "Only owners can see buyer spending."
             return _re_json.dumps(_fz_rpc("fz_buyer_spend", {"p_limit": max(5, min(80, int(args.get("limit") or 40)))}), ensure_ascii=False)[:40000]
@@ -5724,10 +5787,11 @@ def fernando_gchat_one():
             if merged and merged[-1]["role"] == m["role"]: merged[-1]["content"] += "\n\n" + m["content"]
             else: merged.append(m)
         progress("👀 Looking at our records…")
+        actions = []
         sites = _FzcSites(None)
         try:
             out = _fz_agent(_FZG_SYSTEM, merged, _fzg_tools(role) + [_FZG_GO_LIVE], sites, "fernando_general", max_steps=10,
-                            progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=_fzg_tool_fn(role), tag=f"gchat {mid}")
+                            progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}")
             if isinstance(out, dict) and "__stop__" in out:
                 why = (out["__stop__"] or {}).get("reason") or "a live county search"
                 county = (out["__stop__"] or {}).get("county")
@@ -5737,11 +5801,11 @@ def fernando_gchat_one():
                 out = _fz_agent(_FZG_SYSTEM + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
                                 merged + [{"role": "assistant", "content": f"(I need a live look: {why})"}, {"role": "user", "content": "Go ahead."}],
                                 _fzg_tools(role) + live, sites, "fernando_general", max_steps=14, progress=progress,
-                                model="claude-opus-5", tool_fn=_fzg_tool_fn(role), tag=f"gchat {mid}")
+                                model="claude-opus-5", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}")
         finally:
             sites.close()
         text = out if isinstance(out, str) else "Sorry - I lost my train of thought. Please ask again."
-        _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": text[:8000], "p_status": "answered"})
+        _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": text[:8000], "p_status": "answered", "p_actions": actions or None})
     except Exception as e:
         import traceback; traceback.print_exc()
         try: _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": str(e)[:300], "p_status": "failed"})
