@@ -2908,6 +2908,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/idx-county-test-status":
             return self.respond(IDX2_COUNTY_TEST)
 
+        if path == "/fernando-status":
+            return self.respond(FERNANDO)
+
         if path == "/ai-ready":
             # yes/no only - never the key itself
             return self.respond({"anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())})
@@ -4513,6 +4516,16 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r["other"], "desc": r["desc"]}
                  for r in mine if _idx2_is_deed(r)]
 
+        # no book/page given: the owner's own purchase of this property (similar description, else the latest)
+        found_deed = None
+        if not (book and page):
+            buys = [r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"]
+            want = _idx2_words(desc or "")
+            sim = sorted([r for r in buys if len(_idx2_words(r["desc"]) & want) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
+            pick = sim or sorted(buys, key=lambda r: _idx2_day(r["date"]), reverse=True)
+            if pick:
+                book, page = _idx2_bp(pick[0]["bookpage"])
+                found_deed = {"bookpage": pick[0]["bookpage"], "how": "similar description" if sim else "owner's latest purchase (check)"}
         # chain of title back from the deed at book/page
         chain = []
         if book and page:
@@ -4580,7 +4593,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             if not x["released"]: read_item("debt", x)
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
                 "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "spouses": spouses,
-                "deeds": deeds, "chain": chain, "sold": new_owner, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
+                "deeds": deeds, "chain": chain, "sold": new_owner, "owner_deed_found": found_deed, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
         try: browser.close()
@@ -4628,21 +4641,88 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
 
 def run_idx2_county_test(counties=None):
     IDX2_COUNTY_TEST.update({"state": "running", "results": {}, "started": _re_dt.utcnow().isoformat() + "Z"})
-    p, browser = get_playwright_browser()
     try:
         for county, url in IDX2_SURVEY.items():
             if counties and county not in counties: continue
             if county in ("BERKELEY", "PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"): continue   # not the IDX product / closed
             IDX2_COUNTY_TEST["current"] = county
-            IDX2_COUNTY_TEST["results"][county] = _idx2_county_test_one(browser, county, url)
+            p, browser = get_playwright_browser()                # a fresh browser per county (the server's one-process browser does not survive reuse)
+            try:
+                IDX2_COUNTY_TEST["results"][county] = _idx2_county_test_one(browser, county, url)
+            finally:
+                try: browser.close()
+                except Exception: pass
+                try: p.stop()
+                except Exception: pass
             __import__("time").sleep(2)                          # gentle
     finally:
         IDX2_COUNTY_TEST["state"] = "done"
         IDX2_COUNTY_TEST.pop("current", None)
-        try: browser.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 🤖 FERNANDO THE TITLE ABSTRACTOR - works the fernando_run queue, one certificate at a time
+# ═════════════════════════════════════════════════════════════════════════════
+FERNANDO = {"state": "idle", "done": 0, "last": None}
+_FZ_COMPANY = _re_re.compile(r"\b(LLC|L L C|INC|CORP|CORPORATION|COMPANY|CO|BANK|TRUST|TRUSTEE|CHURCH|ASSOCIATION|ASSN|PARTNERSHIP|LP|LLP|LTD|PROPERTIES|HOLDINGS|ENTERPRISES|INVESTMENTS|GROUP|FOUNDATION|CITY OF|COUNTY|STATE OF|BOARD)\b")
+
+
+def fernando_owner_name(owner):
+    """'WRIGHT DENNIS L & MELINDA A' -> ('WRIGHT', 'DENNIS', notes). Companies -> (None, None, reason)."""
+    o = _re_re.sub(r"\s+", " ", (owner or "").upper()).strip()
+    if not o: return None, None, "no owner name"
+    if _FZ_COMPANY.search(o): return None, None, "company owner - company (Firm) search not built yet"
+    notes = []
+    if _re_re.search(r"\bEST\b|\bESTATE\b|\bDEC(D|EASED)?\b|\bHEIRS\b", o): notes.append("owner listed as an estate / deceased")
+    first_person = _re_re.split(r"\s*&\s*|\s+AND\s+|\s+ET\s*AL\b|\s+ETAL\b|,", o)[0]
+    words = [w for w in _re_re.sub(r"[^A-Z' ]", " ", first_person).split() if w not in ("EST", "ESTATE", "HEIRS", "JR", "SR", "II", "III", "MRS", "MR", "DR")]
+    if len(words) < 2: return None, None, "could not read a last and first name"
+    return words[0], words[1], "; ".join(notes)
+
+
+def _fz_rpc(name, args):
+    req = _re_ur.Request(f"{_RE_SUPABASE_URL}/rest/v1/rpc/{name}", data=_re_json.dumps(args).encode(), headers=_RE_HEADERS, method="POST")
+    with _re_ur.urlopen(req, timeout=60) as r:
+        body = r.read()
+        return _re_json.loads(body) if body else None
+
+
+def fernando_work_one():
+    run = _fz_rpc("fernando_claim", {})
+    if not run: return False
+    county, cert = run["county"], run["cert"]
+    FERNANDO.update({"state": "working", "current": f"{county} {cert}"})
+    try:
+        if county not in IDX2_URLS:
+            if county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
+            else: raise ValueError("no IDX address for " + county)
+        last, first, note = fernando_owner_name(run.get("owner"))
+        if not last:
+            _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "skipped", "p_reason": note})
+            return True
+        rep = idx2_owner_report(county, last, first, run.get("book"), run.get("page"), desc=run.get("descr"))
+        rep["owner_note"] = note
+        rep["searched_as"] = f"{last} {first}"
+        _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "done", "p_report": rep})
+        FERNANDO["done"] += 1
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        try: _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "failed", "p_reason": str(e)[:300]})
         except Exception: pass
-        try: p.stop()
-        except Exception: pass
+    finally:
+        FERNANDO.update({"state": "idle", "last": f"{county} {cert}"}); FERNANDO.pop("current", None)
+    return True
+
+
+def fernando_loop():
+    import time as _t
+    _t.sleep(30)                                       # let the server start first
+    while True:
+        try:
+            worked = fernando_work_one()
+        except Exception as e:
+            print(f"[fernando] {e}", flush=True); worked = False
+        _t.sleep(5 if worked else 60)                  # gentle: one certificate at a time
 
 
 def _idx2_run(job, county, last, first, book, page, desc=None):
@@ -4808,4 +4888,6 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     print(f'WV Tax Lien API running on port {port} — 55 counties CAMA enabled')
     ensure_chromium()
+    if os.environ.get("SUPABASE_SECRET_KEY"):
+        _og_threading.Thread(target=fernando_loop, daemon=True).start()   # 🤖 Fernando
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
