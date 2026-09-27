@@ -2894,6 +2894,10 @@ class Handler(BaseHTTPRequestHandler):
             _og_threading.Thread(target=_idx2_run, args=(job, county, last, first, book or None, pg_ or None), daemon=True).start()
             return self.respond({"job": job, "check": "/idx-owner-result?job=" + job})
 
+        if path == "/ai-ready":
+            # yes/no only - never the key itself
+            return self.respond({"anthropic_key_set": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())})
+
         if path == "/idx-owner-result":
             from urllib.parse import parse_qs, urlparse
             job = (parse_qs(urlparse(self.path).query).get("job", [""])[0])
@@ -4230,8 +4234,85 @@ IDX2_SURVEY = {
 }
 IDX2_JOBS = {}
 _IDX2_COLS = ["index", "image", "flag", "status", "date", "doc", "bookpage", "pages", "role", "name", "role2", "other", "desc", "cross", "instrument"]
-_IDX2_READ = """() => [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(tr =>
-  [...tr.querySelectorAll('td')].map(td => td.innerText.replace(/\\s+/g, ' ').trim()))"""
+# each row's cells, plus its own scanned-image number (rows without an image have none)
+_IDX2_READ = """() => [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(tr => {
+  const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.replace(/\\s+/g, ' ').trim());
+  const b = tr.querySelector('[id*="ScannedButton"]'); const m = b && b.id.match(/(\\d+)\\s*$/);
+  return cells.slice(0, 15).concat([m ? m[1] : '']); })"""
+_IDX2_COLS = _IDX2_COLS + ["image_id"]
+
+# One scanned page as a JPEG the size Claude reads best (long side 1568 px), drawn in the page itself.
+_IDX2_SHRINK = """() => { const i = [...document.images].find(i => i.naturalWidth > 1000); if (!i) return null;
+  const k = Math.min(1, 1568 / Math.max(i.naturalWidth, i.naturalHeight)); const c = document.createElement('canvas');
+  c.width = Math.round(i.naturalWidth * k); c.height = Math.round(i.naturalHeight * k);
+  const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(i, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.85).split(',')[1]; }"""
+
+
+def _idx2_pages(ctx, base_url, image_id, want=2):
+    """First `want` pages of one recorded document, as base64 JPEGs."""
+    ip = ctx.new_page()
+    try:
+        ip.goto(base_url.rstrip("/") + "/Image.aspx?control=" + str(image_id), wait_until="networkidle", timeout=60000)
+        out = []
+        for n in range(want):
+            ip.wait_for_function("() => [...document.images].some(i => i.naturalWidth > 1000 && i.complete)", timeout=30000)
+            out.append(ip.evaluate(_IDX2_SHRINK))
+            total = ip.evaluate("() => +((document.body.innerText.match(/\\d+ of (\\d+)/) || [])[1] || 1)")
+            if n + 1 >= min(want, total): break
+            ip.evaluate("() => { window.__old = [...document.images].find(i => i.naturalWidth > 1000).src; }")
+            ip.get_by_text("Next", exact=True).first.click()
+            ip.wait_for_function("() => { const i = [...document.images].find(i => i.naturalWidth > 1000); return i && i.src !== window.__old && i.complete; }", timeout=30000)
+        return [x for x in out if x]
+    finally:
+        ip.close()
+
+
+# What to pull out of each kind of document (Claude reads the scanned pages).
+_IDX2_ASK = {
+    "debt": ("a recorded deed of trust, mortgage, lien or judgment", {
+        "lender_or_creditor": "string", "lender_address": "string", "trustee": "string", "trustee_address": "string",
+        "borrowers": "array", "amount": "string", "loan_number": "string", "property_address": "string", "tax_ids": "array"}),
+    "will": ("a recorded will or estate paper", {
+        "deceased": "string", "will_date": "string", "executor": "string", "executor_address": "string",
+        "beneficiaries": "array", "real_estate_mentioned": "string"}),
+    "deed": ("a recorded deed", {
+        "grantors": "array", "grantees": "array", "grantee_mailing_address": "string", "property_address": "string",
+        "legal_description_short": "string", "prior_deed_reference": "string", "consideration": "string"}),
+}
+
+
+def _idx2_read_doc(kind, images):
+    """Read scanned pages with Claude; returns the fields asked for (blank when not on the pages)."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        return {"error": "ANTHROPIC_API_KEY not set on the server"}
+    what, fields = _IDX2_ASK[kind]
+    props = {k: ({"type": "array", "items": {"type": "string"}} if t == "array" else {"type": "string"}) for k, t in fields.items()}
+    schema = {"type": "object", "properties": props, "required": list(fields), "additionalProperties": False}
+    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in images]
+    content.append({"type": "text", "text":
+        f"These are the first pages of {what} from a West Virginia county clerk's record room (the 'Stolen Copy' "
+        "watermark marks an unofficial copy; ignore it). Fill in each field exactly as written on the pages, "
+        "including full mailing addresses with ZIP codes. Leave a field empty when it is not on these pages - "
+        "do not guess. prior_deed_reference = the 'being the same property conveyed by ... in Deed Book X page Y' "
+        "clause, if present."})
+    import anthropic
+    client = anthropic.Anthropic(api_key=key)
+    msg = client.messages.create(
+        model="claude-opus-5", max_tokens=4000,
+        messages=[{"role": "user", "content": content}],
+        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+        extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+                    "fallbacks": "default"})
+    if getattr(msg, "stop_reason", "") == "refusal":
+        return {"error": "declined to read"}
+    text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+    try:
+        return json.loads(text)
+    except Exception:
+        m = _re_re.search(r"\{.*\}", text, _re_re.S)
+        return json.loads(m.group(0)) if m else {"error": "unreadable answer"}
 
 
 def _idx2_search(pg, mode, fields, enter_in):
@@ -4300,12 +4381,13 @@ _REL_RE = _re_re.compile(r"RELEASE|SATISFACTION|RECONVEY")
 _ESTATE_RE = _re_re.compile(r"WILL|ESTATE|ADMINISTRATION|FIDUCIARY|APPRAISEMENT|SETTLEMENT|HEIRSHIP|DEATH|TRANSFER ON DEATH")
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None):
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True):
     last, first = last.upper().strip(), first.upper().strip()
     url = IDX2_URLS[county]
     p, browser = get_playwright_browser()
     try:
-        pg = browser.new_page()
+        ctx = browser.new_context()
+        pg = ctx.new_page()
         pg.goto(url, wait_until="networkidle", timeout=60000)
         pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
         rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
@@ -4332,7 +4414,8 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None):
                     if same_cred and rel["date"][-4:] >= dbt["date"][-4:]:
                         hit, how = rel, "same creditor, later release (check)"; break
             out_debts.append({"type": dbt["doc"], "date": dbt["date"], "bookpage": dbt["bookpage"], "creditor": dbt["other"],
-                              "desc": dbt["desc"], "released": bool(hit), "release": hit and {"bookpage": hit["bookpage"], "date": hit["date"], "how": how}})
+                              "desc": dbt["desc"], "released": bool(hit), "release": hit and {"bookpage": hit["bookpage"], "date": hit["date"], "how": how},
+                              "image_id": dbt.get("image_id") or None})
         estate = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "name": r["name"], "desc": r["desc"]} for r in mine if _ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"]]
         spouses = [{"spouse": r["other"], "date": r["date"], "desc": r["desc"]} for r in mine if "MARRIAGE" in r["doc"].upper()]
         deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r["other"], "desc": r["desc"]}
@@ -4346,7 +4429,8 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None):
             for step in range(4):
                 if not cur: break
                 d = cur[0]
-                chain.append({"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d["other"], "grantee": d["name"], "desc": d["desc"]})
+                chain.append({"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d["other"], "grantee": d["name"], "desc": d["desc"],
+                              "image_id": d.get("image_id") or None})
                 seller = _re_re.sub(r"[^A-Z ]", " ", (d["other"] or "").upper()).split()
                 if len(seller) < 2 or " ".join(seller[:2]) in seen: break
                 seen.add(" ".join(seller[:2]))
@@ -4362,11 +4446,23 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None):
                     rank = lambda r: next((i for i, k in enumerate(["WILL", "TRANSFER ON DEATH", "HEIRSHIP", "ADMINISTRATION", "ESTATE", "FIDUCIARY"]) if k in r["doc"].upper()), 9)
                     w = sorted(inherit, key=rank)[0]
                     chain.append({"date": w["date"], "type": w["doc"], "bookpage": w["bookpage"], "grantor": "(estate)", "grantee": w["name"], "desc": w["desc"],
-                                  "note": "seller appears as executor/heir - likely inherited; earlier deeds may be before the computer index"})
+                                  "note": "seller appears as executor/heir - likely inherited; earlier deeds may be before the computer index",
+                                  "image_id": w.get("image_id") or None, "kind": "will"})
                 break
+        # 📄 read the scanned documents that matter: open debts, the owner's deed, a will in the chain (max 5)
+        todo = [("debt", x) for x in out_debts if not x["released"] and x.get("image_id")]
+        todo += [(c.get("kind") or "deed", c) for c in chain if c.get("image_id")]
+        for kind, item in todo[:5] if read else []:
+            try:
+                imgs = _idx2_pages(ctx, url, item["image_id"], 2)
+                item["pages_read"] = len(imgs)
+                item["read"] = _idx2_read_doc(kind, imgs) if imgs else {"error": "no image"}
+            except Exception as e:
+                item["read"] = {"error": str(e)[:200]}
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
                 "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "spouses": spouses,
-                "deeds": deeds, "chain": chain, "other_names_skipped": other_names[:30]}
+                "deeds": deeds, "chain": chain, "other_names_skipped": other_names[:30],
+                "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
         try: browser.close()
         except Exception: pass
