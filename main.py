@@ -5371,7 +5371,7 @@ def _fz_step_words(name, args, county):
 
 
 def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag="", progress=None,
-              model="claude-opus-5", stop_tool=None, tool_fn=None):
+              model="claude-opus-5", stop_tool=None, tool_fn=None, on_text=None):
     """Claude with our index tools (+ web search). Returns the final text, or the input of final_tool when given."""
     import anthropic
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -5390,13 +5390,26 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
             kw["tools"], kw["tool_choice"] = [final_tool], {"type": "tool", "name": final_tool["name"]}
         elif not last_round and tools:
             kw["tools"] = tools
+        def _call(kw):
+            if not on_text: return client.messages.create(**kw)
+            import time as _tm
+            got, last = "", 0.0
+            with client.messages.stream(**kw) as st:
+                for ev in st:
+                    if getattr(ev, "type", "") == "content_block_delta" and getattr(ev.delta, "type", "") == "text_delta":
+                        got += ev.delta.text
+                        if _tm.time() - last > 0.6: on_text(got); last = _tm.time()
+                m_ = st.get_final_message()
+            if any(getattr(b, "type", "") == "tool_use" for b in m_.content): on_text("")      # it was only a lead-in to a look-up
+            elif got: on_text(got)
+            return m_
         try:
-            msg = client.messages.create(**kw)
+            msg = _call(kw)
         except anthropic.BadRequestError as e:
             if "web_search_20260209" not in str(e): raise
             kw["tools"] = [dict(t, type="web_search_20250305") if t.get("name") == "web_search" else t for t in kw.get("tools", [])]
             tools = [dict(t, type="web_search_20250305") if t.get("name") == "web_search" else t for t in tools]
-            msg = client.messages.create(**kw)
+            msg = _call(kw)
         _ai_log(msg, feature)
         stop = getattr(msg, "stop_reason", "")
         if stop == "refusal": return None if final_tool else "Sorry — I can't help with that one."
@@ -5611,6 +5624,9 @@ thing first, simple "-" bullets if needed, no tables or headings. Say where each
 letter, county index bank, page bank). Never invent a number, name, date or book/page. If the data does not say, say so.
 Money: a lien costs the client $500; "owed" = $500 per lien minus what was paid. Dates in MM/DD/YYYY.
 This is office-only information - never suggest sending it to a client unless asked.
+Start with ONE short sentence that answers the question directly (it may be read aloud), then the details. Never show raw
+field names (paid_us, owes_us, liens_found_on_property_still_open...) - say it in words. "Owes us" (our $500 per lien) and
+"liens found on the property" are different things - never mix them.
 Plain text only: no ** bold, no tables. When staff ask to OPEN something, give the full link on its own line:
   title search: https://portal.annelabes.com/attorney.html#ts=<ticket_id>
   surplus case: https://portal.annelabes.com/surplus.html#case=<surplus id>
@@ -5766,6 +5782,26 @@ def _fzg_surplus(args):
                            "note": "estimate - confirm with the attorney; our costs come out of our fee, never out of the family's share"})
 
 
+_FZG_CERT_RE = _re_re.compile(r"\b(20\d\d)\s*-?\s*C\s*-?\s*(\d{1,6})\b", _re_re.I)
+_FZG_BIDDER_RE = _re_re.compile(r"\b(?:bidder|client|buyer)?\s*#?\s*(\d{4})\b", _re_re.I)
+
+
+def _fzg_prefetch(text):
+    """The records a question obviously points at, looked up before the first model call (saves a round trip)."""
+    got = {}
+    for y, n in _FZG_CERT_RE.findall(text or "")[:3]:
+        cert = f"{y}-C-{int(n):06d}"
+        try: got["cert " + cert] = _fz_rpc("fz_cert", {"p_query": cert, "p_county": None})
+        except Exception: pass
+    for b in dict.fromkeys(m for m in _FZG_BIDDER_RE.findall(text or "") if not m.startswith("20")):
+        try:
+            c = _fz_rpc("fz_client", {"p_who": b})
+            if c and (c.get("totals") or {}).get("jobs"): got["client " + b] = c
+        except Exception: pass
+        if len(got) >= 3: break
+    return got
+
+
 def fernando_gchat_one():
     job = _fz_rpc("fernando_gchat_claim", {})
     if not job: return False
@@ -5783,17 +5819,24 @@ def fernando_gchat_one():
             msgs.append({"role": "user" if h["role"] == "staff" else "assistant", "content": (f"{h.get('author')}: " if h["role"] == "staff" else "") + h["body"]})
         import datetime as _dtm
         today = (_dtm.datetime.utcnow() - _dtm.timedelta(hours=4)).strftime("%A %m/%d/%Y")    # Eastern time, close enough for a date
-        msgs.append({"role": "user", "content": f"(Today is {today}.)\n{job.get('author') or 'Office'} ({role}): {job['body']}"})
+        pre = _fzg_prefetch(job["body"])
+        pre_txt = ("\n\nAlready looked up for this question (no need to call the tool again for these):\n" +
+                   _re_json.dumps(pre, ensure_ascii=False)[:90000]) if pre else ""
+        msgs.append({"role": "user", "content": f"(Today is {today}.)\n{job.get('author') or 'Office'} ({role}): {job['body']}{pre_txt}"})
         merged = []
         for m in msgs:
             if merged and merged[-1]["role"] == m["role"]: merged[-1]["content"] += "\n\n" + m["content"]
             else: merged.append(m)
-        progress("👀 Looking at our records…")
+        progress("👀 Got it - looking at our records…")
         actions = []
+        def on_text(t):
+            try: _fz_rpc("fernando_gchat_stream", {"p_id": mid, "p_body": t})
+            except Exception: pass
         sites = _FzcSites(None)
         try:
             out = _fz_agent(_FZG_SYSTEM, merged, _fzg_tools(role) + [_FZG_GO_LIVE], sites, "fernando_general", max_steps=10,
-                            progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}")
+                            progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}",
+                            on_text=on_text)
             if isinstance(out, dict) and "__stop__" in out:
                 why = (out["__stop__"] or {}).get("reason") or "a live county search"
                 county = (out["__stop__"] or {}).get("county")
@@ -5803,7 +5846,7 @@ def fernando_gchat_one():
                 out = _fz_agent(_FZG_SYSTEM + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
                                 merged + [{"role": "assistant", "content": f"(I need a live look: {why})"}, {"role": "user", "content": "Go ahead."}],
                                 _fzg_tools(role) + live, sites, "fernando_general", max_steps=14, progress=progress,
-                                model="claude-opus-5", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}")
+                                model="claude-opus-5", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}", on_text=on_text)
         finally:
             sites.close()
         text = out if isinstance(out, str) else "Sorry - I lost my train of thought. Please ask again."
@@ -5831,7 +5874,7 @@ def fernando_chat_loop(n=0):
                 worked = fernando_gchat_one()
             except Exception as e:
                 print(f"[fernando-gchat] {e}", flush=True); worked = False
-        _t.sleep(2 if worked else 5)
+        _t.sleep(1 if worked else 1.5)
 
 
 def fernando_loop(n=0):
