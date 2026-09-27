@@ -4906,6 +4906,11 @@ def fernando_work_one():
         rep = idx2_owner_report(county, last, first, run.get("book"), run.get("page"), desc=run.get("descr"), middle=fernando_owner_middle(run.get("owner")))
         rep["owner_note"] = note
         rep["searched_as"] = f"{last} {first}"
+        if fernando_needs_heirs(run.get("owner"), rep):
+            try:
+                rep["heirs"] = fernando_heirs(county, cert, run.get("owner"), run.get("descr"), rep, log=lambda m: print(m, flush=True))
+            except Exception as e:
+                rep["heirs_error"] = str(e)[:300]
         _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "done", "p_report": rep})
         FERNANDO["done"] += 1
     except Exception as e:
@@ -4942,6 +4947,8 @@ You can use tools to check the county's computer index and read recorded documen
 answer when a tool can settle it; say what you checked (document type, book/page, date) so staff can find it. The
 computer index usually starts in the 1970s-1990s; anything older is only in the paper books - say "check the books"
 instead of guessing. You cannot call anyone or see paper books. Never invent a book/page, name, date or amount.
+You can also search the web (obituaries, a company's current address). Give the link for anything you found on the web,
+and say whether it matches our papers (date, town, family names) or is only "possible, not confirmed".
 
 You only advise: you cannot change the ticket, and you must not say you did. Tell them what to add, fix or remove and why.
 Answer in plain, friendly English, short (a few sentences or a short list), most important thing first. No markdown
@@ -4949,8 +4956,9 @@ headings or tables; plain text with simple "-" bullets if needed. Sign nothing."
 
 _FZC_TOOLS = [
     {"name": "search_person", "description": "Search the county's computer index for every recorded paper under a person or company name "
-        "(deeds, deeds of trust, releases, judgments, liens, wills, estate papers, marriages, O&G leases). For a company put the whole name in last_name.",
-     "input_schema": {"type": "object", "properties": {"last_name": {"type": "string"}, "first_name": {"type": "string"}}, "required": ["last_name"]}},
+        "(deeds, deeds of trust, releases, judgments, liens, wills, estate papers, marriages, O&G leases). For a company put the whole name in last_name. "
+        "county: another WV county to search instead (e.g. where a survivor died) - leave empty for this certificate's county.",
+     "input_schema": {"type": "object", "properties": {"last_name": {"type": "string"}, "first_name": {"type": "string"}, "county": {"type": "string"}}, "required": ["last_name"]}},
     {"name": "lookup_book_page", "description": "What is recorded at a book and page in the county's computer index (type, date, parties, description).",
      "input_schema": {"type": "object", "properties": {"book": {"type": "string"}, "page": {"type": "string"}}, "required": ["book", "page"]}},
     {"name": "read_document", "description": "Open the scanned images of the document recorded at a book/page so you can read it yourself "
@@ -4998,7 +5006,29 @@ class _FzcCounty:
         except Exception: pass
 
 
-def _fzc_tool(site, name, args, budget):
+# counties Fernando may not search automatically (site terms / captcha / not working yet)
+_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "WETZEL", "MERCER"}
+_FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
+
+
+class _FzcSites:
+    """The county index sites one conversation may use, opened on first use; closed together."""
+    def __init__(self, home):
+        self.home, self.open = home, {}
+
+    def get(self, county=None):
+        c = _re_re.sub(r"\s*COUNTY\s*$", "", (county or self.home or "").upper().strip()) or self.home
+        if c in _FZ_NO_AUTO or not (c in IDX2_URLS or c in IDX2_SURVEY):
+            raise ValueError(f"{c} County's index can't be searched automatically")
+        if c not in self.open: self.open[c] = _FzcCounty(c)
+        return self.open[c]
+
+    def close(self):
+        for x in self.open.values(): x.close()
+
+
+def _fzc_tool(sites, name, args, budget):
+    site = sites.get(args.get("county")) if name in ("search_person", "lookup_book_page", "read_document") else None
     if name == "search_person":
         last, first = (args.get("last_name") or "").upper().strip(), (args.get("first_name") or "").upper().strip()
         if not last: return "Give a last name."
@@ -5026,11 +5056,57 @@ def _fzc_tool(site, name, args, budget):
     return "Unknown tool."
 
 
-def fernando_chat_answer(job, log=print):
-    """Answer one staff message; returns the reply text."""
+def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag=""):
+    """Claude with our index tools (+ web search). Returns the final text, or the input of final_tool when given."""
     import anthropic
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key: raise RuntimeError("ANTHROPIC_API_KEY not set on the server")
+    client = anthropic.Anthropic(api_key=key)
+    budget = {"reads": 0}
+    tools = list(tools) + ([final_tool] if final_tool else [])
+    for step in range(max_steps):
+        last_round = step >= max_steps - 2
+        kw = dict(model="claude-opus-5", max_tokens=4000, system=system, messages=msgs,
+                  extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+                  extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
+        if last_round and final_tool:
+            kw["tools"], kw["tool_choice"] = [final_tool], {"type": "tool", "name": final_tool["name"]}
+        elif not last_round and tools:
+            kw["tools"] = tools
+        try:
+            msg = client.messages.create(**kw)
+        except anthropic.BadRequestError as e:
+            if "web_search_20260209" not in str(e): raise
+            kw["tools"] = [dict(t, type="web_search_20250305") if t.get("name") == "web_search" else t for t in kw.get("tools", [])]
+            tools = [dict(t, type="web_search_20250305") if t.get("name") == "web_search" else t for t in tools]
+            msg = client.messages.create(**kw)
+        _ai_log(msg, feature)
+        stop = getattr(msg, "stop_reason", "")
+        if stop == "refusal": return None if final_tool else "Sorry — I can't help with that one."
+        blocks = [b.model_dump(mode="json", exclude_none=True) for b in msg.content]
+        msgs.append({"role": "assistant", "content": blocks})
+        if stop == "pause_turn": continue                       # the web search wants to keep going
+        uses = [b for b in blocks if b.get("type") == "tool_use"]
+        fin = next((u for u in uses if final_tool and u["name"] == final_tool["name"]), None)
+        if fin: return fin.get("input") or {}
+        if not uses:
+            if final_tool:                                      # he answered in words: ask for the form
+                msgs.append({"role": "user", "content": f"Now fill in {final_tool['name']}."}); continue
+            return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip() or "Sorry — I lost my train of thought. Please ask again."
+        results = []
+        for u in uses:
+            try:
+                out = _fzc_tool(sites, u["name"], u.get("input") or {}, budget)
+            except Exception as e:
+                out = f"That did not work: {str(e)[:200]}"
+            log(f"[{feature}] {tag} {u['name']} {u.get('input')}")
+            results.append({"type": "tool_result", "tool_use_id": u["id"], "content": out})
+        msgs.append({"role": "user", "content": results})
+    return None if final_tool else "Sorry — this one took too many steps. Please ask a narrower question."
+
+
+def fernando_chat_answer(job, log=print):
+    """Answer one staff message; returns the reply text."""
     county = job["county"]
     can_search = bool(job.get("searchable")) and (county in IDX2_URLS or county in IDX2_SURVEY)
     run = job.get("run") or {}
@@ -5053,41 +5129,67 @@ def fernando_chat_answer(job, log=print):
             merged[-1]["content"] += "\n\n" + m["content"]
         else: merged.append(m)
     msgs = merged
-    client = anthropic.Anthropic(api_key=key)
-    site, budget = _FzcCounty(county) if can_search else None, {"reads": 0}
+    sites = _FzcSites(county if can_search else None)
     try:
-        for step in range(12):
-            last_round = step >= 10
-            kw = dict(model="claude-opus-5", max_tokens=3000, system=_FZC_SYSTEM, messages=msgs,
-                      extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
-                      extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
-            if can_search and not last_round: kw["tools"] = _FZC_TOOLS
-            msg = client.messages.create(**kw)
-            _ai_log(msg, "fernando_chat")
-            if getattr(msg, "stop_reason", "") == "refusal":
-                return "Sorry — I can't help with that one."
-            blocks = []
-            for b in msg.content:                        # only the fields the API takes back
-                t = getattr(b, "type", "")
-                if t == "text": blocks.append({"type": "text", "text": b.text})
-                elif t == "tool_use": blocks.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
-            uses = [b for b in blocks if b.get("type") == "tool_use"]
-            if not uses:
-                text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
-                return text or "Sorry — I lost my train of thought. Please ask again."
-            msgs.append({"role": "assistant", "content": [b for b in blocks if b.get("type") in ("text", "tool_use")]})
-            results = []
-            for u in uses:
-                try:
-                    out = _fzc_tool(site, u["name"], u.get("input") or {}, budget)
-                except Exception as e:
-                    out = f"That did not work: {str(e)[:200]}"
-                log(f"[fernando-chat] {county} {job['cert']} {u['name']} {u.get('input')}")
-                results.append({"type": "tool_result", "tool_use_id": u["id"], "content": out})
-            msgs.append({"role": "user", "content": results})
-        return "Sorry — this one took too many steps. Please ask a narrower question."
+        return _fz_agent(_FZC_SYSTEM, msgs, (_FZC_TOOLS if can_search else []) + [_FZ_WEB_SEARCH], sites, "fernando_chat",
+                         max_steps=12, log=log, tag=f"{county} {job['cert']}")
     finally:
-        if site: site.close()
+        sites.close()
+
+
+_FZH_SYSTEM = """You are Fernando, the title abstractor of a West Virginia tax-lien office. Before the tax deed the office must
+serve the Notice to Redeem on everyone with an interest - when an owner is dead, that means the heirs / devisees or the
+estate's executor. Your job now: trace the HEIRS for one certificate and report who must be served.
+
+Rules (from the office owner):
+1. When the owner is ET AL, a life tenant, or dead: also look at the OTHER parties on the same lease / deed - but ONLY when it is
+   the SAME piece (same acreage / description as the certificate). Leases can list unrelated people from other tracts - skip those.
+2. For a death index or estate paper: search the web for the obituary (name + year / date of death). Accept it only when the date,
+   town, or family names match our papers; otherwise list it as "possible, not confirmed". Always give the link.
+3. For each survivor named in the obituary: search the county index for their own will / estate / appraisal papers (they may be
+   dead too) - also in the WV county where they lived or died, if the obituary says so (use search_person with county).
+4. A life estate: the deed that created it names the remaindermen - find and read it when you can.
+5. Never invent a name, date, book/page or address. Say what you checked. Keep it short.
+
+Use the tools, then call report_heirs once. The summary is for office ladies, plain English, like:
+"Gladys died 8/9/2012 (obituary). Daughters: Harriet Prager (died 2016, will 107/592 - serve her executrix + heirs), Rosetta
+Amsbaugh (on the lease), Karen Warsinsky of Georgia (not on the lease; may be an heir). Check the deed that created Gladys's life estate." """
+
+_FZH_REPORT = {"name": "report_heirs", "description": "Your finished heir tracing for this certificate.",
+    "input_schema": {"type": "object", "properties": {
+        "summary": {"type": "string", "description": "2-6 plain sentences for staff"},
+        "obituaries": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "url": {"type": "string"}, "died": {"type": "string"}, "town": {"type": "string"},
+            "confirmed": {"type": "boolean"}, "why": {"type": "string", "description": "what matches our papers, or why not confirmed"}},
+            "required": ["name", "url", "confirmed", "why"]}},
+        "people": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "relation": {"type": "string", "description": "e.g. daughter of Gladys Brandon"},
+            "status": {"type": "string", "enum": ["to serve", "serve the estate / executor", "possible heir - check", "deceased - see their heirs"]},
+            "address": {"type": "string"}, "evidence": {"type": "string", "description": "book/page, obituary, lease..."}},
+            "required": ["name", "relation", "status", "evidence"]}},
+        "check": {"type": "array", "items": {"type": "string"}, "description": "things staff should still look up"}},
+        "required": ["summary", "people"]}}
+
+_FZH_TRIGGER = _re_re.compile(r"\bET\s*ALS?\b|\bETALS?\b|\bHEIRS?\b|\bEST(ATE)?\b|\bDEC(D|EASED)?\b|\bLIFE\b|\bL/E\b|\bTENANT\b")
+
+
+def fernando_needs_heirs(owner, rep):
+    """ET AL / estate / deceased / life tenant owners, or a death / estate paper for the owner."""
+    return bool(_FZH_TRIGGER.search((owner or "").upper()) or (rep or {}).get("estate"))
+
+
+def fernando_heirs(county, cert, owner, descr, rep, log=print):
+    small = {k: rep.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "bookpage_check", "sold", "property", "owner_note")}
+    msgs = [{"role": "user", "content":
+        f"Certificate {cert}, {county} County, WV. Owner on the tax ticket: {owner}\nProperty on the certificate: {descr or '(no description)'}\n\n"
+        f"Your county-index search of the owner so far:\n{_re_json.dumps(small, ensure_ascii=False)[:30000]}\n\n"
+        "Trace the heirs and who must be served, then call report_heirs."}]
+    sites = _FzcSites(county)
+    try:
+        return _fz_agent(_FZH_SYSTEM, msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_heirs", final_tool=_FZH_REPORT,
+                         max_steps=16, log=log, tag=f"{county} {cert}")
+    finally:
+        sites.close()
 
 
 def fernando_chat_one():

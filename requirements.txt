@@ -1,5 +1,5 @@
 pdfplumber==0.11.4
 playwright==1.49.0
 openpyxl==3.1.2
-anthropic==0.40.0
+anthropic==0.125.0
 pypdf==6.19.0
