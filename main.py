@@ -2914,7 +2914,7 @@ class Handler(BaseHTTPRequestHandler):
             out["avg_response_s"] = round(sum(r) / len(r), 2) if r else None
             out["max_response_s"] = max(r) if r else None
             out["avg_cert_s"] = round(sum(c) / len(c), 1) if c else None
-            out["readers"] = int(os.environ.get("SAO_THREADS", "3"))
+            out["readers"] = int(os.environ.get("SAO_THREADS", "1"))
             return self.respond(out)
 
         if path == "/fernando-status":
@@ -5502,7 +5502,13 @@ class SaoHttp:
         except urllib.error.HTTPError as e:
             if e.code in (403, 429, 503): raise SaoBlocked(f"HTTP {e.code}")
             raise
-        SAO.setdefault("resp", []).append(round(__import__("time").time() - t0, 2)); SAO["resp"] = SAO["resp"][-200:]
+        took = round(__import__("time").time() - t0, 2)
+        SAO.setdefault("resp", []).append(took); SAO["resp"] = SAO["resp"][-200:]
+        # the site slowing right down is pushback too: 3 answers in a row slower than 25 s -> everyone pauses
+        SAO["slow_run"] = SAO.get("slow_run", 0) + 1 if took > 25 else 0
+        if SAO["slow_run"] >= 3:
+            SAO["slow_run"] = 0
+            raise SaoBlocked(f"site very slow ({took:.0f} s answers)")
         if "html" in ctype:
             low = raw[:20000].decode("utf-8", "replace").lower()
             if any(w in low for w in ("captcha", "access denied", "request rejected", "too many requests", "unusual traffic")):
@@ -5815,6 +5821,6 @@ if __name__ == '__main__':
         for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
             _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
         if os.environ.get("SAO_READER", "1") == "1":
-            for _s in range(int(os.environ.get("SAO_THREADS", "3"))):   # 🧾 State Auditor documents, 3 readers (plain HTTP)
+            for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP); 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
