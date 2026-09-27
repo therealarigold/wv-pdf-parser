@@ -4782,15 +4782,202 @@ def fernando_work_one():
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 💬 ASK FERNANDO: staff write to him on a ticket in plain words; he answers when a worker is free.
+# He sees the ticket (as the staff member saw it), the conversation so far and his own search, and can search the
+# county index, look up a book/page and read the document images. Advice only - he never changes the ticket.
+# ─────────────────────────────────────────────────────────────────────────────
+_FZC_SYSTEM = """You are Fernando, the title abstractor of a small West Virginia tax-lien office. The office buys tax lien
+certificates at the county tax sales and, before the deed, must find and serve with the Notice to Redeem everyone with an
+interest in the property: the owner(s), heirs of a dead owner, spouses, co-owners, lenders / lienholders with an open deed
+of trust, mortgage, judgment or lien (and their trustees), and anyone the owner sold to. Staff build a "title search"
+ticket for each certificate: the chain of deeds, the debts (open or released), and the people to serve.
+
+A staff member is writing to you about ONE ticket. They write like they talk - short, typos, half sentences. Work out what
+they mean from the ticket; if it is truly unclear, ask them one short question back instead of guessing.
+
+You can use tools to check the county's computer index and read recorded documents (scanned images). Check before you
+answer when a tool can settle it; say what you checked (document type, book/page, date) so staff can find it. The
+computer index usually starts in the 1970s-1990s; anything older is only in the paper books - say "check the books"
+instead of guessing. You cannot call anyone or see paper books. Never invent a book/page, name, date or amount.
+
+You only advise: you cannot change the ticket, and you must not say you did. Tell them what to add, fix or remove and why.
+Answer in plain, friendly English, short (a few sentences or a short list), most important thing first. No markdown
+headings or tables; plain text with simple "-" bullets if needed. Sign nothing."""
+
+_FZC_TOOLS = [
+    {"name": "search_person", "description": "Search the county's computer index for every recorded paper under a person or company name "
+        "(deeds, deeds of trust, releases, judgments, liens, wills, estate papers, marriages, O&G leases). For a company put the whole name in last_name.",
+     "input_schema": {"type": "object", "properties": {"last_name": {"type": "string"}, "first_name": {"type": "string"}}, "required": ["last_name"]}},
+    {"name": "lookup_book_page", "description": "What is recorded at a book and page in the county's computer index (type, date, parties, description).",
+     "input_schema": {"type": "object", "properties": {"book": {"type": "string"}, "page": {"type": "string"}}, "required": ["book", "page"]}},
+    {"name": "read_document", "description": "Open the scanned images of the document recorded at a book/page so you can read it yourself "
+        "(parties, addresses, amounts, the 'being the same property' clause, release wording). Costly - only when the answer is on the page.",
+     "input_schema": {"type": "object", "properties": {"book": {"type": "string"}, "page": {"type": "string"},
+                      "pages": {"type": "integer", "description": "how many pages to read, 1-4 (default 2)"}}, "required": ["book", "page"]}},
+]
+
+
+def _fzc_trim(x, depth=0):
+    """The ticket without screenshots / uploads / huge blobs."""
+    if isinstance(x, dict):
+        return {k: _fzc_trim(v, depth + 1) for k, v in x.items() if not str(k).startswith("_") and k not in ("attachments", "files", "images", "pdf", "photos")}
+    if isinstance(x, list):
+        return [_fzc_trim(v, depth + 1) for v in x[:200]]
+    if isinstance(x, str) and len(x) > 6000:
+        return x[:6000] + " …[cut]"
+    return x
+
+
+def _fzc_row(r):
+    return {k: r.get(k, "") for k in ("doc", "date", "bookpage", "name", "role", "other", "desc") if r.get(k)}
+
+
+class _FzcCounty:
+    """One county's index site, opened only when a tool needs it."""
+    def __init__(self, county):
+        self.county, self.pw, self.browser, self.ctx, self.pg = county, None, None, None, None
+        self.url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
+
+    def page(self):
+        if not self.pg:
+            self.pw, self.browser = get_playwright_browser()
+            self.ctx = self.browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+            self.pg = self.ctx.new_page()
+            _idx2_open(self.pg, self.county, self.url)
+        return self.pg
+
+    def close(self):
+        try:
+            if self.browser: self.browser.close()
+        except Exception: pass
+        try:
+            if self.pw: self.pw.stop()
+        except Exception: pass
+
+
+def _fzc_tool(site, name, args, budget):
+    if name == "search_person":
+        last, first = (args.get("last_name") or "").upper().strip(), (args.get("first_name") or "").upper().strip()
+        if not last: return "Give a last name."
+        rows = _idx2_search(site.page(), 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname" if first else "txtLname")
+        out = [_fzc_row(r) for r in rows]
+        names = sorted(set(r.get("name", "") for r in rows))
+        return _re_json.dumps({"found": len(out), "names_seen": names[:40], "rows": out[:150],
+                               "note": "only the first 150 rows" if len(out) > 150 else ""})
+    if name in ("lookup_book_page", "read_document"):
+        book, page = str(args.get("book") or "").strip(), str(args.get("page") or "").strip()
+        if not (book and page): return "Give a book and a page."
+        want = (book.lstrip("0"), page.lstrip("0"))
+        rows = [r for r in _idx2_search(site.page(), 2, {"txtBook": book, "txtPage": page}, "txtPage") if _idx2_bp(r["bookpage"]) == want]
+        if name == "lookup_book_page":
+            return _re_json.dumps({"rows": [_fzc_row(r) for r in rows]}) if rows else f"Nothing at book {book} page {page} in the computer index (often older than the index)."
+        if budget["reads"] >= 5: return "Document reading limit for this question reached (5)."
+        img = next((r.get("image_id") for r in rows if r.get("image_id")), None)
+        if not img: return f"No scanned image for book {book} page {page} in the computer index."
+        budget["reads"] += 1
+        n = max(1, min(4, int(args.get("pages") or 2)))
+        imgs = _idx2_pages(site.ctx, site.url, img, n)
+        if not imgs: return "The image would not open."
+        return [{"type": "text", "text": f"Book {book} page {page}: " + "; ".join(f"{r['doc']} {r['date']}" for r in rows[:3]) + f" - {len(imgs)} page(s):"}] + \
+               [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in imgs]
+    return "Unknown tool."
+
+
+def fernando_chat_answer(job, log=print):
+    """Answer one staff message; returns the reply text."""
+    import anthropic
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key: raise RuntimeError("ANTHROPIC_API_KEY not set on the server")
+    county = job["county"]
+    can_search = bool(job.get("searchable")) and (county in IDX2_URLS or county in IDX2_SURVEY)
+    run = job.get("run") or {}
+    ctx_text = (f"Certificate {job['cert']}, {county} County, WV.\n"
+                f"THE TICKET (as {job.get('author') or 'the staff member'} sees it now):\n{_re_json.dumps(_fzc_trim(job.get('ticket') or {}), ensure_ascii=False)[:60000]}\n\n"
+                f"YOUR OWN EARLIER INDEX SEARCH of this certificate ({run.get('status') or 'none'}{', ' + str(run.get('finished_at'))[:10] if run.get('finished_at') else ''}):\n"
+                f"{_re_json.dumps(run.get('report') or {}, ensure_ascii=False)[:30000]}\n\n"
+                + ("You can search this county's index with the tools." if can_search else
+                   "You can NOT search this county's index (not connected) - answer from the ticket and your earlier search, and say what staff should look up themselves."))
+    msgs = [{"role": "user", "content": ctx_text + "\n\n(The conversation on this ticket follows.)"},
+            {"role": "assistant", "content": "Understood - I have the ticket and my earlier search in front of me."}]
+    for h in job.get("history") or []:
+        if h["role"] == "staff": msgs.append({"role": "user", "content": f"{h.get('author') or 'Staff'}: {h['body']}"})
+        else: msgs.append({"role": "assistant", "content": h["body"]})
+    msgs.append({"role": "user", "content": f"{job.get('author') or 'Staff'}: {job['body']}"})
+    # the API wants user/assistant turns to alternate: merge neighbours with the same role
+    merged = []
+    for m in msgs:
+        if merged and merged[-1]["role"] == m["role"] and isinstance(m["content"], str) and isinstance(merged[-1]["content"], str):
+            merged[-1]["content"] += "\n\n" + m["content"]
+        else: merged.append(m)
+    msgs = merged
+    client = anthropic.Anthropic(api_key=key)
+    site, budget = _FzcCounty(county) if can_search else None, {"reads": 0}
+    try:
+        for step in range(12):
+            last_round = step >= 10
+            kw = dict(model="claude-opus-5", max_tokens=3000, system=_FZC_SYSTEM, messages=msgs,
+                      extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+                      extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
+            if can_search and not last_round: kw["tools"] = _FZC_TOOLS
+            msg = client.messages.create(**kw)
+            if getattr(msg, "stop_reason", "") == "refusal":
+                return "Sorry — I can't help with that one."
+            blocks = []
+            for b in msg.content:                        # only the fields the API takes back
+                t = getattr(b, "type", "")
+                if t == "text": blocks.append({"type": "text", "text": b.text})
+                elif t == "tool_use": blocks.append({"type": "tool_use", "id": b.id, "name": b.name, "input": b.input})
+            uses = [b for b in blocks if b.get("type") == "tool_use"]
+            if not uses:
+                text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+                return text or "Sorry — I lost my train of thought. Please ask again."
+            msgs.append({"role": "assistant", "content": [b for b in blocks if b.get("type") in ("text", "tool_use")]})
+            results = []
+            for u in uses:
+                try:
+                    out = _fzc_tool(site, u["name"], u.get("input") or {}, budget)
+                except Exception as e:
+                    out = f"That did not work: {str(e)[:200]}"
+                log(f"[fernando-chat] {county} {job['cert']} {u['name']} {u.get('input')}")
+                results.append({"type": "tool_result", "tool_use_id": u["id"], "content": out})
+            msgs.append({"role": "user", "content": results})
+        return "Sorry — this one took too many steps. Please ask a narrower question."
+    finally:
+        if site: site.close()
+
+
+def fernando_chat_one():
+    job = _fz_rpc("fernando_chat_claim", {})
+    if not job: return False
+    tag = f"💬 {job['county']} {job['cert']}"
+    FERNANDO.setdefault("working", {})[tag] = _re_dt.utcnow().isoformat() + "Z"
+    try:
+        text = fernando_chat_answer(job, log=lambda m: print(m, flush=True))
+        _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered"})
+        FERNANDO["chats"] = FERNANDO.get("chats", 0) + 1
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        try: _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": str(e)[:300], "p_status": "failed"})
+        except Exception: pass
+    finally:
+        FERNANDO.get("working", {}).pop(tag, None)
+    return True
+
+
 def fernando_loop(n=0):
     import time as _t
     _t.sleep(30 + 20 * n)                              # let the server start first; workers start a little apart
     while True:
         try:
-            worked = fernando_work_one()
+            worked = fernando_chat_one()                   # staff questions before searches
         except Exception as e:
-            print(f"[fernando] {e}", flush=True); worked = False
-        _t.sleep(5 if worked else 60)                  # gentle: one certificate at a time
+            print(f"[fernando-chat] {e}", flush=True); worked = False
+        try:
+            worked = fernando_work_one() or worked
+        except Exception as e:
+            print(f"[fernando] {e}", flush=True)
+        _t.sleep(5 if worked else 20)                  # gentle: one certificate at a time; a new question waits at most ~20 s
 
 
 # ═════════════════════════════════════════════════════════════════════════════
