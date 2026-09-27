@@ -5783,7 +5783,7 @@ def _fzg_surplus(args):
 
 
 _FZG_CERT_RE = _re_re.compile(r"\b(20\d\d)\s*-?\s*C\s*-?\s*(\d{1,6})\b", _re_re.I)
-_FZG_BIDDER_RE = _re_re.compile(r"\b(?:bidder|client|buyer)?\s*#?\s*(\d{4})\b", _re_re.I)
+_FZG_BIDDER_RE = _re_re.compile(r"\b(?:(?:bidder|client|buyer)\s*#?\s*(\d{2,5})|#?(\d{4}))\b", _re_re.I)
 
 
 def _fzg_prefetch(text):
@@ -5793,7 +5793,7 @@ def _fzg_prefetch(text):
         cert = f"{y}-C-{int(n):06d}"
         try: got["cert " + cert] = _fz_rpc("fz_cert", {"p_query": cert, "p_county": None})
         except Exception: pass
-    for b in dict.fromkeys(m for m in _FZG_BIDDER_RE.findall(text or "") if not m.startswith("20")):
+    for b in dict.fromkeys((a or c) for a, c in _FZG_BIDDER_RE.findall(text or "") if (a or c) and not (a or c).startswith("20")):
         try:
             c = _fz_rpc("fz_client", {"p_who": b})
             if c and (c.get("totals") or {}).get("jobs"): got["client " + b] = c
@@ -5858,6 +5858,133 @@ def fernando_gchat_one():
     finally:
         _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ✅ Quality test for the general Ask Fernando: real questions (spoken style too) answered by the real workers, checked
+# against the database. Start a run: insert into fz_harness_run default values  (or fz_harness_request() as an owner).
+# Results in fz_harness_run.results; test questions never show in anyone's bubble.
+# ─────────────────────────────────────────────────────────────────────────────
+_FZH_RAW = _re_re.compile(r"\b(paid_us|owes_us|part_paid_us|liens_found_on_property_still_open|fernando_items_to_check|job_id|ticket_id|client_owes_us_total|by_ticket_status)\b")
+
+
+def _fzh_money(n):
+    """'8000' -> a pattern that matches $8,000 / 8000 / $8,000.00"""
+    import math
+    alts = sorted({int(math.floor(float(n))), int(round(float(n)))})
+    return r"(?<![\d,.])\$?\s?(" + "|".join(f"{x:,}".replace(",", ",?") for x in alts) + r")(\.\d\d)?\b"
+
+
+def _fzh_cases():
+    c = lambda who: _fz_rpc("fz_client", {"p_who": who}) or {}
+    cert = lambda q, county=None: (_fz_rpc("fz_cert", {"p_query": q, "p_county": county}) or [{}])[0]
+    julian, arm, abba, perk, gold = c("5782"), c("344"), c("5904"), c("1372"), c("1339")
+    fay = cert("2022-C-000076", "FAYETTE")
+    fay_sc = fay.get("surplus") or {}
+    gross = float(fay_sc.get("surplus") or 0)
+    mar = cert("2025-C-000012", "MARSHALL")
+    owed = lambda x: (x.get("money") or {}).get("client_owes_us_total") or 0
+    no_ticket = sum(1 for j in (julian.get("needs_attention") or []) if j.get("title_search") == "no ticket")
+    gold_prog = ((gold.get("totals") or {}).get("by_ticket_status") or {}).get("progress", 0)
+    return [
+        {"q": "uh where are we with bidder 5782 what does he owe us", "must": [_fzh_money(owed(julian)), r"Julian"]},
+        {"q": "whats julien kenedy owe us", "must": [_fzh_money(owed(julian))]},
+        {"q": "how much does armstong land owe us", "must": [_fzh_money(owed(arm))]},
+        {"q": "does client 1948 owe us anything", "must": [r"Maxcell", r"(nothing|\$0\b|no(thing)? (money )?owed|paid( in full| up)?|doesn.t owe|does not owe|owes us nothing)"]},
+        {"q": "how many jobs does gold enterprises have", "must": [str((gold.get("totals") or {}).get("jobs"))]},
+        {"q": "how many title searches does gold enterprises have in progress", "must": [rf"\b{gold_prog}\b"]},
+        {"q": "what does abba energy owe us", "must": [_fzh_money(owed(abba))]},
+        {"q": "where are we with perkins oil and gas", "must": [_fzh_money(owed(perk))], "first_sentence_max_words": 35},
+        {"q": "list julian kennedy's jobs that have no title search yet", "must": [rf"\b{no_ticket}\b"]},
+        {"q": "how many liens did we find on julian kennedy's properties", "must": [r"lien"], "must_not": [_fzh_money(owed(julian)) + r"[^.\n]{0,40}lien"]},
+        {"q": "open julian kennedy", "must": [r"https://portal\.annelabes\.com/index\.html#client=\w+"]},
+        {"q": "open the title search for marshall 2025-C-000012", "must": [r"https://portal\.annelabes\.com/attorney\.html#ts=\w+"]},
+        {"q": "open the surplus case fayette 2022-C-000076", "must": [rf"https://portal\.annelabes\.com/surplus\.html#case={fay_sc.get('id')}\b"]},
+        {"q": "the owner on fayette 2022-C-000076 hired us, move it to the next stage", "actions": {"kind": "surplus_stage", "stage": "retained"}},
+        {"q": "we filed in court for fayette 2022-C-000076 today", "actions": {"kind": "surplus_stage", "stage": "filed"}},
+        {"q": "add a note on the fayette 2022-C-000076 surplus that he wants a call back tomorrow", "actions": {"kind": "surplus_note"}},
+        {"q": "what's the surplus on fayette 2022-C-000076 and how much would each of 3 heirs get",
+         "must": [r"estimate", r"attorney", _fzh_money(gross * 0.67 / 3)] if gross else [r"estimate"]},
+        {"q": "who changed marshall 2025-C-000012 and who opened it", "role": "manager", "must": [r"owner"], "must_not": [r"\b(Heather|Tyler|Nikki|Kenzie) (changed|opened|edited)"]},
+        {"q": "who changed marshall 2025-C-000012 and who opened it", "role": "owner", "must_not": [r"only owners"]},
+        {"q": "how much did wvtb spend in 2024", "role": "manager", "must": [r"owner"]},
+        {"q": "where are we with smith", "must": [r"\?"]},
+        {"q": "uh bambi parker whats going on with her", "must": [r"(Hardy|2023-C-000017)"]},
+        {"q": "who owns marshall 2025-C-000012 now", "must": [r"Teater"]},
+        {"q": "is the crosscountry loan on marshall 2025-C-000012 still open", "must": [r"Cross ?Country"]},
+        {"q": "hey fernando thanks", "max_total_s": 30},
+    ]
+
+
+def _fzh_check(case, ans, times):
+    body = (ans or {}).get("body") or ""
+    fails = []
+    for rx in case.get("must", []):
+        if not _re_re.search(rx, body, _re_re.I): fails.append(f"missing /{rx}/")
+    for rx in case.get("must_not", []):
+        if _re_re.search(rx, body, _re_re.I): fails.append(f"should not have /{rx}/")
+    if _FZH_RAW.search(body): fails.append("shows a raw field name: " + _FZH_RAW.search(body).group(0))
+    if "**" in body: fails.append("uses ** bold")
+    if case.get("actions"):
+        want = case["actions"]
+        acts = (ans or {}).get("actions") or []
+        if not any(a.get("kind") == want["kind"] and (not want.get("stage") or (a.get("change") or {}).get("stage") == want["stage"]) for a in acts):
+            fails.append(f"no proposed action {want}")
+    if case.get("first_sentence_max_words"):
+        first = _re_re.split(r"(?<=[.!?])\s", body.strip(), maxsplit=1)[0]
+        if len(first.split()) > case["first_sentence_max_words"]: fails.append(f"first sentence has {len(first.split())} words")
+    if times.get("total_s") is not None and times["total_s"] > case.get("max_total_s", 60): fails.append(f"slow: {times['total_s']} s")
+    if not body: fails.append("no answer")
+    return fails
+
+
+def fz_harness_run(run):
+    import time as _t
+    cases = _fzh_cases()
+    asked = []
+    for c in cases:
+        r = _fz_rpc("fz_harness_ask", {"p_body": c["q"], "p_role": c.get("role", "owner")})
+        asked.append((c, r["id"], _t.time()))
+    results, cost = [], 0.0
+    deadline = _t.time() + 25 * 60
+    pending = list(asked)
+    done = {}
+    while pending and _t.time() < deadline:
+        _t.sleep(3)
+        for item in list(pending):
+            c, mid, t0 = item
+            m = _fz_rpc("fz_harness_msg", {"p_id": mid}) or {}
+            st = (m.get("staff") or {}).get("status")
+            if st in ("answered", "failed"):
+                done[mid] = m; pending.remove(item)
+    for c, mid, t0 in asked:
+        m = done.get(mid) or {}
+        stf, ans = m.get("staff") or {}, m.get("answer") or {}
+        def secs(a, b):
+            try: return round((_re_dt.fromisoformat(b.replace("Z", "+00:00")) - _re_dt.fromisoformat(a.replace("Z", "+00:00"))).total_seconds(), 1)
+            except Exception: return None
+        times = {"pickup_s": secs(stf.get("created_at"), stf.get("started_at")) if stf.get("started_at") else None,
+                 "first_words_s": secs(stf.get("started_at"), ans.get("created_at")) if ans.get("created_at") and stf.get("started_at") else None,
+                 "total_s": secs(stf.get("started_at"), stf.get("done_at")) if stf.get("done_at") and stf.get("started_at") else None}
+        fails = _fzh_check(c, ans, times) if m else ["not answered in 25 minutes"]
+        cost += float(ans.get("cost_usd") or 0)
+        results.append({"q": c["q"], "role": c.get("role", "owner"), "ok": not fails, "fails": fails, **times,
+                        "cost_usd": ans.get("cost_usd"), "answer": (ans.get("body") or "")[:600]})
+    passed = sum(1 for r in results if r["ok"])
+    _fz_rpc("fz_harness_save", {"p_id": run["id"], "p": {"passed": passed, "failed": len(results) - passed, "cost_usd": round(cost, 4), "results": results}})
+    print(f"[harness] run {run['id']}: {passed}/{len(results)} passed, ${cost:.3f}", flush=True)
+
+
+def fz_harness_loop():
+    import time as _t
+    _t.sleep(60)
+    while True:
+        try:
+            run = _fz_rpc("fz_harness_claim", {})
+            if run: fz_harness_run(run)
+        except Exception as e:
+            print(f"[harness] {e}", flush=True)
+        _t.sleep(60)
 
 
 def fernando_chat_loop(n=0):
@@ -6399,6 +6526,7 @@ if __name__ == '__main__':
     if os.environ.get("SUPABASE_SECRET_KEY"):
         for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
             _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
+        _og_threading.Thread(target=fz_harness_loop, daemon=True).start()          # ✅ quality test runs when asked
         for _q in range(int(os.environ.get("FERNANDO_CHAT_WORKERS", "2"))):   # 💬 question-only workers (2 = two staff asking at once)
             _og_threading.Thread(target=fernando_chat_loop, args=(_q,), daemon=True).start()
         if os.environ.get("SAO_READER", "1") == "1":
