@@ -5364,6 +5364,8 @@ def _fz_step_words(name, args, county):
     if name == "cert_lookup": return f"🔎 Looking up {(args or {}).get('query')} in our records…"
     if name == "county_index_bank": return f"📚 Checking our county index bank for {(args or {}).get('name')}…"
     if name == "buyer_spend": return "💵 Looking at the buyers' spending…"
+    if name == "surplus_estimate": return "💰 Working out the surplus per person…"
+    if name == "history": return "🕘 Looking at who changed and opened it…"
     return "🤔 Working on it…"
 
 
@@ -5607,7 +5609,14 @@ something in plain words. Use the tools to look at the office's own data and ans
 thing first, simple "-" bullets if needed, no tables or headings. Say where each fact comes from (job, ticket, State Auditor
 letter, county index bank, page bank). Never invent a number, name, date or book/page. If the data does not say, say so.
 Money: a lien costs the client $500; "owed" = $500 per lien minus what was paid. Dates in MM/DD/YYYY.
-This is office-only information - never suggest sending it to a client unless asked."""
+This is office-only information - never suggest sending it to a client unless asked.
+Plain text only: no ** bold, no tables. When staff ask to OPEN something, give the full link on its own line:
+  title search: https://portal.annelabes.com/attorney.html#ts=<ticket_id>
+  surplus case: https://portal.annelabes.com/surplus.html#case=<surplus id>
+  job:          https://portal.annelabes.com/index.html#job=<job_id>
+  client:       https://portal.annelabes.com/index.html#client=<bidder>
+(ids come from client_summary / cert_lookup). Surplus per heir: use surplus_estimate and always say
+"estimate - confirm with the attorney"."""
 _FZG_GO_LIVE = {"name": "go_live", "description": "Call this ONLY when the answer needs a LIVE county index search or reading document "
     "images / old books / the web (our own data is not enough). Say in 'reason' what you will look up. It takes 1-3 minutes and costs more.",
     "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}, "county": {"type": "string"}}, "required": ["reason"]}}
@@ -5623,7 +5632,16 @@ _FZG_DATA_TOOLS = [
         "person or company name - instant, no live search.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "county": {"type": "string"}}, "required": ["name"]}},
 ]
+_FZG_DATA_TOOLS.append(
+    {"name": "surplus_estimate", "description": "What each heir / owner would get from a surplus: gross surplus (approval letter or our surplus "
+        "case), then with our contingent fee (retain) and with the buyout (assignment), split by the heirs. heirs = how many share it "
+        "(equal split), or shares = list of fractions if you can tell unequal WV intestacy shares (e.g. spouse / children).",
+     "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "cert": {"type": "string"}, "heirs": {"type": "integer"},
+                      "shares": {"type": "array", "items": {"type": "number"}}, "names": {"type": "array", "items": {"type": "string"}}},
+                      "required": ["county", "cert"]}})
 _FZG_OWNER_TOOLS = [
+    {"name": "history", "description": "Owners only: who changed this certificate's ticket / job / surplus case (what, when) and who opened it.",
+     "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "cert": {"type": "string"}}, "required": ["county", "cert"]}},
     {"name": "buyer_spend", "description": "Owners only: certificates bought and known prices per buyer per sale year (competitors' budgets).",
      "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
 ]
@@ -5638,14 +5656,51 @@ def _fzg_tools(role):
 
 def _fzg_tool_fn(role):
     def fn(sites, name, args, budget):
-        if name == "client_summary": return _re_json.dumps(_fz_rpc("fz_client", {"p_who": args.get("who") or ""}), ensure_ascii=False)[:60000]
+        if name == "client_summary": return _re_json.dumps(_fz_rpc("fz_client", {"p_who": args.get("who") or ""}), ensure_ascii=False)[:100000]
         if name == "cert_lookup": return _re_json.dumps(_fz_rpc("fz_cert", {"p_query": args.get("query") or "", "p_county": args.get("county") or None}), ensure_ascii=False)[:60000]
         if name == "county_index_bank": return _re_json.dumps(_fz_rpc("fz_idx_bank", {"p_name": args.get("name") or "", "p_county": args.get("county") or None}), ensure_ascii=False)[:40000]
+        if name == "history":
+            if role != "owner": return "Only owners can see the history."
+            return _re_json.dumps(_fz_rpc("fz_history", {"p_county": args.get("county") or "", "p_cert": args.get("cert") or ""}), ensure_ascii=False)[:30000]
+        if name == "surplus_estimate":
+            return _fzg_surplus(args)
         if name == "buyer_spend":
             if role != "owner": return "Only owners can see buyer spending."
             return _re_json.dumps(_fz_rpc("fz_buyer_spend", {"p_limit": max(5, min(80, int(args.get("limit") or 40)))}), ensure_ascii=False)[:40000]
         return _fzc_tool(sites, name, args, budget)
     return fn
+
+
+def _fzg_surplus(args):
+    """Ari's rules: 33% contingent fee (our costs come out of our third), or a buyout: the family gets assign% of the gross
+    in cash in about a week and we carry the risk. Per heir: retain = gross x (1 - fee) / heirs, buyout = gross x assign / heirs."""
+    rows = _fz_rpc("fz_cert", {"p_query": args.get("cert") or "", "p_county": args.get("county") or None}) or []
+    r = rows[0] if rows else {}
+    sc = r.get("surplus") or {}
+    sale = ((r.get("auditor") or {}).get("sale") or {})
+    gross = sc.get("surplus")
+    if gross in (None, "") and sale.get("bid") is not None and sale.get("amount_due") is not None:
+        gross = float(sale["bid"]) - float(sale["amount_due"])
+    if gross in (None, ""): return "No surplus amount known for that certificate (no approval letter read and no surplus case)."
+    gross = float(gross)
+    terms = _fz_rpc("fz_surplus_terms", {}) or {}
+    fee, assign = float(terms.get("fee_pct") or 33) / 100, float(terms.get("assign_pct") or 35) / 100
+    shares = [float(x) for x in (args.get("shares") or []) if x]
+    n = int(args.get("heirs") or 0) or (len(shares) or 1)
+    if not shares: shares = [1.0 / n] * n
+    tot = sum(shares) or 1.0
+    shares = [x / tot for x in shares]
+    names = list(args.get("names") or [])
+    people = []
+    for i, sh in enumerate(shares):
+        ret, buy = gross * (1 - fee) * sh, gross * assign * sh
+        people.append({"who": names[i] if i < len(names) else f"heir {i + 1}", "share": round(sh, 4), "retain_estimate": round(ret, 2),
+                       "buyout_estimate": round(buy, 2), "waiting_is_worth_more": round(ret - buy, 2)})
+    return _re_json.dumps({"county": r.get("county"), "cert": r.get("cert"), "gross_surplus": round(gross, 2),
+                           "source": "our surplus case" if sc.get("surplus") not in (None, "") else "State Auditor approval letter (bid - amount due)",
+                           "fee_pct": fee * 100, "assign_pct": assign * 100, "people": people,
+                           "surplus_case_id": sc.get("id"),
+                           "note": "estimate - confirm with the attorney; our costs come out of our fee, never out of the family's share"})
 
 
 def fernando_gchat_one():
