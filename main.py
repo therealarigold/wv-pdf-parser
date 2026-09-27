@@ -2891,7 +2891,7 @@ class Handler(BaseHTTPRequestHandler):
             import uuid
             job = uuid.uuid4().hex[:12]
             IDX2_JOBS[job] = {"state": "queued"}
-            _og_threading.Thread(target=_idx2_run, args=(job, county, last, first, book or None, pg_ or None), daemon=True).start()
+            _og_threading.Thread(target=_idx2_run, args=(job, county, last, first, book or None, pg_ or None, g("desc")[:200] or None), daemon=True).start()
             return self.respond({"job": job, "check": "/idx-owner-result?job=" + job})
 
         if path == "/ai-ready":
@@ -4315,39 +4315,34 @@ def _idx2_read_doc(kind, images):
         return json.loads(m.group(0)) if m else {"error": "unreadable answer"}
 
 
+_IDX2_P = "#CallFormPanel_contentSplitter_CallToolPanel_"
+_IDX2_MODES = {0: "Individual", 2: "Book & Page"}
+
+
 def _idx2_search(pg, mode, fields, enter_in):
-    """mode: 0 Individual, 2 Book & Page. fields: {'txtLname': 'MOAG', ...}."""
-    if mode == 0 and pg.evaluate("() => cboKey.GetSelectedIndex()") != 0:
-        # back to a name search: the name boxes stay hidden after Book & Page, so reload (opens on names)
-        pg.reload(wait_until="networkidle", timeout=60000)
-        pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
-    if pg.evaluate("() => cboKey.GetSelectedIndex()") != mode:
-        pg.evaluate("(i) => { cboKey.SetSelectedIndex(i); if (cboKey.RaiseSelectedIndexChanged) cboKey.RaiseSelectedIndexChanged(); }", mode)
+    """mode: 0 Individual, 2 Book & Page. fields: {'txtLname': 'MOAG', ...}. Typed like a person would."""
+    label = _IDX2_MODES[mode]
+    if pg.evaluate("() => cboKey.GetText()") != label:
+        # the real dropdown (switching from script leaves the new boxes hidden)
+        pg.locator(_IDX2_P + "cboKey_I").click()
+        pg.wait_for_timeout(600)
+        pg.get_by_text(label, exact=True).last.click()
         pg.wait_for_timeout(1500)
-    # real keystrokes (values set from script alone are not picked up by the name search)
-    # (Book & Page boxes stay hidden after switching from script, but take values set there)
     for k, v in fields.items():
-        box = pg.locator("#CallFormPanel_contentSplitter_CallToolPanel_" + k + "_I")
-        if box.is_visible():
-            box.click(); box.press("Control+a"); box.press("Delete")
-            if v: box.type(str(v), delay=20)
-        else:
-            pg.evaluate("([k, v]) => window[k].SetText(v)", [k, str(v or "")])
-    last_box = pg.locator("#CallFormPanel_contentSplitter_CallToolPanel_" + enter_in + "_I")
-    if last_box.is_visible():
-        last_box.press("Enter")
-    else:
-        pg.focus("#CallFormPanel_contentSplitter_CallToolPanel_" + enter_in + "_I")
-        pg.keyboard.press("Enter")
-    # wait for the answer: rows appear, or the grid settles on no rows for 5 s
-    quiet = 0
+        box = pg.locator(_IDX2_P + k + "_I")
+        box.click(); box.press("Control+a"); box.press("Delete")
+        if v: box.type(str(v), delay=20)
+    before = pg.evaluate("() => [...document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]')].map(t => t.innerText).join('|')")
+    pg.locator(_IDX2_P + enter_in + "_I").press("Enter")
+    # wait for THIS search's answer: the site went busy and came back, or the rows changed
+    seen_busy, quiet = False, 0
     for _ in range(90):
         pg.wait_for_timeout(500)
-        busy, n = pg.evaluate("() => [grd.InCallback(), document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]').length]")
-        if busy: quiet = 0; continue
-        if n: break
+        busy, now = pg.evaluate("() => [grd.InCallback(), [...document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]')].map(t => t.innerText).join('|')]")
+        if busy: seen_busy = True; quiet = 0; continue
+        if now != before or (seen_busy and now): break
         quiet += 1
-        if quiet >= 10: break
+        if quiet >= 12: break                                 # 6 s of nothing: same answer / no rows
     rows = []
     pages = pg.evaluate("() => grd.GetPageCount()") or 0
     for i in range(max(1, pages)):
@@ -4373,7 +4368,18 @@ def _idx2_same_person(row_name, last, first):
 
 
 def _idx2_words(s):
-    return set(w for w in _re_re.findall(r"[A-Z0-9]+", (s or "").upper()) if len(w) >= 2 and w not in ("DISTRICT", "ADDITIONAL", "AND", "THE", "OF"))
+    return set(w for w in _re_re.findall(r"[A-Z0-9]+", (s or "").upper().replace("LOTS", "LOT").replace(" LT ", " LOT ").replace("LTS", "LOT"))
+               if len(w) >= 2 and w not in ("DISTRICT", "ADDITIONAL", "AND", "THE", "OF", "PCLS", "PCL", "PARCELS", "PARCEL", "TRCT", "TRACT", "TRACTS", "AC", "LOT"))
+
+
+def _idx2_day(d):
+    m = _re_re.match(r"(\d\d)/(\d\d)/(\d{4})", d or "")
+    return m.group(3) + m.group(1) + m.group(2) if m else ""
+
+
+def _idx2_is_deed(r):
+    d = r["doc"].upper()
+    return ("DEED" in d or "TRANSFER ON DEATH" in d) and "TRUST" not in d
 
 
 _DEBT_RE = _re_re.compile(r"DEED OF TRUST|MORTGAGE|JUDG|LIEN|LIS PENDENS|FINANCING|UCC|ABSTRACT")
@@ -4381,87 +4387,140 @@ _REL_RE = _re_re.compile(r"RELEASE|SATISFACTION|RECONVEY")
 _ESTATE_RE = _re_re.compile(r"WILL|ESTATE|ADMINISTRATION|FIDUCIARY|APPRAISEMENT|SETTLEMENT|HEIRSHIP|DEATH|TRANSFER ON DEATH")
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True):
+def _idx2_debts(mine, since=None):
+    """Debts of one person, each matched to its release (by the book/page the release names, else same creditor)."""
+    debts, releases = [], []
+    for r in mine:
+        d = r["doc"].upper()
+        if _REL_RE.search(d) or d.startswith("REL"): releases.append(r)
+        elif _DEBT_RE.search(d) and r["role"] in ("DEBTOR", "GRANTOR", "") and (not since or _idx2_day(r["date"]) >= since): debts.append(r)
+    out = []
+    for dbt in debts:
+        b, pgno = _idx2_bp(dbt["bookpage"])
+        hit, how = None, None
+        for rel in releases:
+            nums = _re_re.findall(r"\d+", rel["desc"])
+            if b and (b, pgno) in set((x.lstrip("0"), y.lstrip("0")) for x, y in zip(nums, nums[1:])):
+                hit, how = rel, "release names this book/page"; break
+        if not hit:
+            for rel in releases:
+                same_cred = (_idx2_words(rel["other"]) & _idx2_words(dbt["other"])) - {"WV", "STATE", "BANK", "OF"}
+                if same_cred and _idx2_day(rel["date"]) >= _idx2_day(dbt["date"]):
+                    hit, how = rel, "same creditor, later release (check)"; break
+        out.append({"type": dbt["doc"], "date": dbt["date"], "bookpage": dbt["bookpage"], "creditor": dbt["other"],
+                    "desc": dbt["desc"], "released": bool(hit), "release": hit and {"bookpage": hit["bookpage"], "date": hit["date"], "how": how},
+                    "image_id": dbt.get("image_id") or None})
+    return out
+
+
+def _idx2_name(s):
+    n = _re_re.sub(r"[^A-Z ]", " ", (s or "").upper()).split()
+    return (n[0], n[1]) if len(n) >= 2 else (None, None)
+
+
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=8):
     last, first = last.upper().strip(), first.upper().strip()
     url = IDX2_URLS[county]
     p, browser = get_playwright_browser()
+    reads = {"n": 0}
     try:
-        ctx = browser.new_context()
+        ctx = browser.new_context(viewport={"width": 1280, "height": 900})
         pg = ctx.new_page()
         pg.goto(url, wait_until="networkidle", timeout=60000)
         pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
-        rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
-        mine = [r for r in rows if _idx2_same_person(r["name"], last, first)]
-        other_names = sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))
-        # debts and releases
-        debts, releases = [], []
-        for r in mine:
-            d = r["doc"].upper()
-            if _REL_RE.search(d) or d.startswith("REL"): releases.append(r)
-            elif _DEBT_RE.search(d) and r["role"] in ("DEBTOR", "GRANTOR", ""): debts.append(r)
-        out_debts = []
-        for dbt in debts:
-            b, pgno = _idx2_bp(dbt["bookpage"])
-            hit, how = None, None
-            for rel in releases:
-                nums = _re_re.findall(r"\d+", rel["desc"])
-                pairs = set(zip(nums, nums[1:]))
-                if b and (b, pgno) in set((x.lstrip("0"), y.lstrip("0")) for x, y in pairs):
-                    hit, how = rel, "release names this book/page"; break
-            if not hit:
-                for rel in releases:
-                    same_cred = (_idx2_words(rel["other"]) & _idx2_words(dbt["other"])) - {"WV", "STATE", "BANK"}
-                    if same_cred and rel["date"][-4:] >= dbt["date"][-4:]:
-                        hit, how = rel, "same creditor, later release (check)"; break
-            out_debts.append({"type": dbt["doc"], "date": dbt["date"], "bookpage": dbt["bookpage"], "creditor": dbt["other"],
-                              "desc": dbt["desc"], "released": bool(hit), "release": hit and {"bookpage": hit["bookpage"], "date": hit["date"], "how": how},
-                              "image_id": dbt.get("image_id") or None})
-        estate = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "name": r["name"], "desc": r["desc"]} for r in mine if _ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"]]
-        spouses = [{"spouse": r["other"], "date": r["date"], "desc": r["desc"]} for r in mine if "MARRIAGE" in r["doc"].upper()]
-        deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r["other"], "desc": r["desc"]}
-                 for r in mine if _re_re.search(r"DEED|TRANSFER ON DEATH", r["doc"].upper()) and "TRUST" not in r["doc"].upper()]
-        # chain of title back from the deed at book/page
-        chain = []
-        if book and page:
-            bp = _idx2_search(pg, 2, {"txtBook": str(book), "txtPage": str(page)}, "txtPage")
-            cur = [r for r in bp if "DEED" in r["doc"].upper() and "TRUST" not in r["doc"].upper() and r["role"] == "GRANTEE"]
-            seen = set()
-            for step in range(4):
-                if not cur: break
-                d = cur[0]
-                chain.append({"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d["other"], "grantee": d["name"], "desc": d["desc"],
-                              "image_id": d.get("image_id") or None})
-                seller = _re_re.sub(r"[^A-Z ]", " ", (d["other"] or "").upper()).split()
-                if len(seller) < 2 or " ".join(seller[:2]) in seen: break
-                seen.add(" ".join(seller[:2]))
-                srows = [r for r in _idx2_search(pg, 0, {"txtLname": seller[0], "txtFname": seller[1], "txtMname": ""}, "txtFname")
-                         if _idx2_same_person(r["name"], seller[0], seller[1])]
-                want = _idx2_words(d["desc"])
-                prior = sorted([r for r in srows if "DEED" in r["doc"].upper() and "TRUST" not in r["doc"].upper() and r["role"] == "GRANTEE"
-                                and len(_idx2_words(r["desc"]) & want) >= 2], key=lambda r: r["date"][-4:] + r["date"][:5], reverse=True)
-                if prior:
-                    cur = prior; continue
-                inherit = [r for r in srows if _re_re.search(r"WILL|ESTATE|ADMINISTRATION|FIDUCIARY|HEIRSHIP|TRANSFER ON DEATH", r["doc"].upper())]
-                if inherit:
-                    rank = lambda r: next((i for i, k in enumerate(["WILL", "TRANSFER ON DEATH", "HEIRSHIP", "ADMINISTRATION", "ESTATE", "FIDUCIARY"]) if k in r["doc"].upper()), 9)
-                    w = sorted(inherit, key=rank)[0]
-                    chain.append({"date": w["date"], "type": w["doc"], "bookpage": w["bookpage"], "grantor": "(estate)", "grantee": w["name"], "desc": w["desc"],
-                                  "note": "seller appears as executor/heir - likely inherited; earlier deeds may be before the computer index",
-                                  "image_id": w.get("image_id") or None, "kind": "will"})
-                break
-        # 📄 read the scanned documents that matter: open debts, the owner's deed, a will in the chain (max 5)
-        todo = [("debt", x) for x in out_debts if not x["released"] and x.get("image_id")]
-        todo += [(c.get("kind") or "deed", c) for c in chain if c.get("image_id")]
-        for kind, item in todo[:5] if read else []:
+
+        def read_item(kind, item):
+            if item.get("read") is not None: return item["read"]
+            if not read or not item.get("image_id") or reads["n"] >= max_reads: return None
+            reads["n"] += 1
             try:
                 imgs = _idx2_pages(ctx, url, item["image_id"], 2)
                 item["pages_read"] = len(imgs)
                 item["read"] = _idx2_read_doc(kind, imgs) if imgs else {"error": "no image"}
             except Exception as e:
                 item["read"] = {"error": str(e)[:200]}
+            return item["read"]
+
+        def person(l, f):
+            return [r for r in _idx2_search(pg, 0, {"txtLname": l, "txtFname": f, "txtMname": ""}, "txtFname") if _idx2_same_person(r["name"], l, f)]
+
+        rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
+        mine = [r for r in rows if _idx2_same_person(r["name"], last, first)]
+        other_names = sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))
+        out_debts = _idx2_debts(mine)
+        estate = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "name": r["name"], "desc": r["desc"]} for r in mine if _ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"]]
+        spouses = [{"spouse": r["other"], "date": r["date"], "desc": r["desc"]} for r in mine if "MARRIAGE" in r["doc"].upper()]
+        deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r["other"], "desc": r["desc"]}
+                 for r in mine if _idx2_is_deed(r)]
+
+        # chain of title back from the deed at book/page
+        chain = []
+        if book and page:
+            want_bp = (str(book).lstrip("0"), str(page).lstrip("0"))
+            bp = [r for r in _idx2_search(pg, 2, {"txtBook": str(book), "txtPage": str(page)}, "txtPage") if _idx2_bp(r["bookpage"]) == want_bp]
+            cur, how = [r for r in bp if _idx2_is_deed(r) and r["role"] == "GRANTEE"], "book/page given"
+            seen = set()
+            for step in range(6):
+                if not cur: break
+                d = cur[0]
+                entry = {"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d["other"], "grantee": d["name"],
+                         "desc": d["desc"], "image_id": d.get("image_id") or None, "found_by": how}
+                chain.append(entry)
+                rd = read_item("deed", entry) or {}
+                sl, sf = _idx2_name(d["other"])
+                if not sl or (sl, sf) in seen: break
+                seen.add((sl, sf))
+                # 1. the deed's own "being the same property ... Deed Book X, Page Y" clause
+                m = _re_re.search(r"Book\s+(?:No\.?\s*)?(\d+)\s*,?\s*(?:at\s+)?Page\s+(?:No\.?\s*)?(\d+)", rd.get("prior_deed_reference") or "", _re_re.I)
+                if m:
+                    ref = (m.group(1).lstrip("0"), m.group(2).lstrip("0"))
+                    prow = [r for r in _idx2_search(pg, 2, {"txtBook": m.group(1), "txtPage": m.group(2)}, "txtPage")
+                            if _idx2_bp(r["bookpage"]) == ref and _idx2_is_deed(r) and r["role"] == "GRANTEE"]
+                    if prow:
+                        cur, how = prow, "named in the deed text"; continue
+                    chain.append({"date": "", "type": "DEED (older than the computer index)", "bookpage": f"{ref[0]} @ {ref[1]}",
+                                  "grantor": "", "grantee": "", "desc": rd.get("prior_deed_reference"), "found_by": "named in the deed text"})
+                    break
+                # 2. the seller's own purchase with a similar description
+                srows = person(sl, sf)
+                want, sold_day = _idx2_words(d["desc"]), _idx2_day(d["date"])
+                buys = [r for r in srows if _idx2_is_deed(r) and r["role"] == "GRANTEE" and _idx2_day(r["date"]) <= sold_day]
+                similar = sorted([r for r in buys if len(_idx2_words(r["desc"]) & want) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
+                if similar:
+                    cur, how = similar, "seller's purchase, similar description"; continue
+                # 3. inherited
+                inherit = [r for r in srows if _re_re.search(r"WILL|ESTATE|ADMINISTRATION|FIDUCIARY|HEIRSHIP|TRANSFER ON DEATH", r["doc"].upper())]
+                if inherit:
+                    rank = lambda r: next((i for i, k in enumerate(["WILL", "TRANSFER ON DEATH", "HEIRSHIP", "ADMINISTRATION", "ESTATE", "FIDUCIARY"]) if k in r["doc"].upper()), 9)
+                    w = sorted(inherit, key=rank)[0]
+                    went = {"date": w["date"], "type": w["doc"], "bookpage": w["bookpage"], "grantor": "(estate)", "grantee": w["name"], "desc": w["desc"],
+                            "note": "seller appears as executor/heir - likely inherited", "image_id": w.get("image_id") or None, "kind": "will", "found_by": "seller's estate papers"}
+                    chain.append(went); read_item("will", went)
+                    break
+                # 4. the seller's last purchase before this sale (description differs - check)
+                if buys:
+                    cur, how = sorted(buys, key=lambda r: _idx2_day(r["date"]), reverse=True), "seller's last purchase before the sale (check)"; continue
+                break
+
+        # did the owner already sell it? (a later deed where the owner is the grantor, for this property)
+        prop_words = _idx2_words(desc or "") | (_idx2_words(chain[0]["desc"]) if chain else set())
+        bought = max([_idx2_day(r["date"]) for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"] or [""])
+        sales = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and _idx2_day(r["date"]) >= bought
+                        and len(_idx2_words(r["desc"]) & prop_words) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
+        new_owner = None
+        if sales:
+            s = sales[0]
+            new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"]}
+            bl, bf = _idx2_name(s["other"])
+            if bl:
+                new_owner["debts"] = _idx2_debts(person(bl, bf), since=_idx2_day(s["date"]))
+                for x in new_owner["debts"]:
+                    if not x["released"]: read_item("debt", x)
+        for x in out_debts:
+            if not x["released"]: read_item("debt", x)
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
                 "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "spouses": spouses,
-                "deeds": deeds, "chain": chain, "other_names_skipped": other_names[:30],
+                "deeds": deeds, "chain": chain, "sold": new_owner, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
         try: browser.close()
@@ -4470,10 +4529,10 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         except Exception: pass
 
 
-def _idx2_run(job, county, last, first, book, page):
+def _idx2_run(job, county, last, first, book, page, desc=None):
     IDX2_JOBS[job] = {"state": "running"}
     try:
-        IDX2_JOBS[job] = {"state": "done", "report": idx2_owner_report(county, last, first, book, page)}
+        IDX2_JOBS[job] = {"state": "done", "report": idx2_owner_report(county, last, first, book, page, desc=desc)}
     except Exception as e:
         import traceback; traceback.print_exc()
         IDX2_JOBS[job] = {"state": "failed", "error": str(e)}
