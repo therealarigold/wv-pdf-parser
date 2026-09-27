@@ -4485,8 +4485,14 @@ _FIRM_TAIL = {"LLC", "L", "C", "INC", "INCORPORATED", "CORP", "CORPORATION", "CO
 
 
 def _idx2_firm_core(name):
-    w = _re_re.sub(r"[^A-Z0-9& ]", " ", (name or "").upper().replace(".", "")).split()
-    return " ".join(x for x in w if x not in _FIRM_TAIL)
+    n = _re_re.split(r"\s+BY\s+|\s+C/O\s+|\s+ATTN\b", (name or "").upper())[0]      # "... LLC BY MARK A HUNT STATE AUDITOR"
+    out, run = [], False
+    for x in _re_re.sub(r"[^A-Z0-9& ]", " ", n.replace(".", "")).split():
+        single = len(x) == 1 and x.isalpha()
+        if single and run: out[-1] += x                           # "W V REAL ESTATE" = "WV REAL ESTATE", "L L C" = "LLC"
+        else: out.append(x)
+        run = single or (run and single)
+    return " ".join(x for x in out if x not in _FIRM_TAIL)
 
 
 def _idx2_same_firm(row_name, core):
