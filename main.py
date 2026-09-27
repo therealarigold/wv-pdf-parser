@@ -2909,7 +2909,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(IDX2_COUNTY_TEST)
 
         if path == "/sao-status":
-            return self.respond(SAO)
+            out = {k: v for k, v in SAO.items() if k not in ("resp", "secs")}
+            r, c = SAO.get("resp") or [], SAO.get("secs") or []
+            out["avg_response_s"] = round(sum(r) / len(r), 2) if r else None
+            out["max_response_s"] = max(r) if r else None
+            out["avg_cert_s"] = round(sum(c) / len(c), 1) if c else None
+            out["readers"] = int(os.environ.get("SAO_THREADS", "3"))
+            return self.respond(out)
 
         if path == "/fernando-status":
             return self.respond(FERNANDO)
@@ -5445,43 +5451,112 @@ def _sao_pdf_text(data):
     return t.replace("\x00", "").replace("\ufffd", "")      # the database refuses null characters
 
 
-def _sao_open_images(pg, year, county, cert):
-    """County Collections search for one certificate, then its 'View Images' page. Returns the document labels, or None."""
-    pg.goto(SAO_URL, wait_until="networkidle", timeout=60000)
-    with pg.expect_navigation(timeout=60000):
-        pg.select_option('select[name="ctl00$FixedWidthContent$YearDD"]', value=str(year))
-    pg.wait_for_load_state("networkidle")
-    val = pg.evaluate("(c) => { const o = [...document.querySelector('select[name=\"ctl00$FixedWidthContent$CountyDD\"]').options].find(o => o.text.trim().toUpperCase() === c); return o ? o.value : null; }", county.upper())
-    if not val: raise ValueError(f"county {county} not in the {year} list")
-    pg.select_option('select[name="ctl00$FixedWidthContent$CountyDD"]', value=val)
-    pg.fill('input[name="ctl00$FixedWidthContent$CertTB"]', cert.split("-")[-1])
-    with pg.expect_navigation(timeout=60000):
-        pg.click('input[name="ctl00$FixedWidthContent$SearchBTN"]')
-    pg.wait_for_load_state("networkidle")
-    link = pg.evaluate("""(cert) => { const tr = [...document.querySelectorAll('tr')].find(r => r.innerText.includes(cert) && [...r.querySelectorAll('a')].some(a => /View Images/i.test(a.innerText)));
-                          if (!tr) return null; const a = [...tr.querySelectorAll('a')].find(a => /View Images/i.test(a.innerText)); return a.id || a.getAttribute('href'); }""", cert)
-    if not link: return None
-    with pg.expect_navigation(timeout=60000):
-        pg.evaluate("(cert) => { const tr = [...document.querySelectorAll('tr')].find(r => r.innerText.includes(cert) && [...r.querySelectorAll('a')].some(a => /View Images/i.test(a.innerText))); [...tr.querySelectorAll('a')].find(a => /View Images/i.test(a.innerText)).click(); }", cert)
-    pg.wait_for_load_state("networkidle")
-    labels = pg.evaluate("""() => { const t = (document.querySelector('main') || document.body).innerText; const part = t.split(/\\nImages\\n/)[1] || t.split('Images')[1] || '';
-                            return part.split('\\n').map(s => s.trim()).filter(s => s && !/new tab/i.test(s) && s !== 'View'); }""")
-    btns = pg.evaluate("() => [...document.querySelectorAll('input[value=\"View\"]')].map(b => b.name)")
-    return list(zip(labels[:len(btns)], btns))
+class SaoBlocked(Exception):
+    """The site pushed back (403 / 429 / 503 or a block / captcha page): stop and slow down, never work around it."""
 
 
-def _sao_fetch(ctx, pg, btn):
-    """One document (the 'View' button posts the page; the PDF is then served at Document.aspx)."""
-    form = pg.evaluate("(n) => { const f = document.forms[0]; const d = Object.fromEntries(new FormData(f)); d[n] = 'View'; return d; }", btn)
-    ctx.request.post("https://www.wvsao.gov/CountyCollections/CTS/CTSImages", form=form, timeout=60000)
-    r = ctx.request.get("https://www.wvsao.gov/CountyCollections/CTS/Document.aspx", timeout=60000)
-    if "pdf" not in (r.headers.get("content-type") or ""): raise ValueError("not a PDF")
-    return r.body()
+class _SaoForm(__import__("html.parser").parser.HTMLParser):
+    """The page's form as a browser would post it back: hidden / text inputs, selects (+ option text), View buttons, text."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.fields, self.selects, self.cur, self.opt, self.views, self.action, self.text, self.skip = {}, {}, None, None, [], None, [], False
+
+    def handle_starttag(self, tag, a):
+        a = dict(a)
+        if tag == "form" and self.action is None: self.action = a.get("action")
+        elif tag == "input" and a.get("name"):
+            t = (a.get("type") or "text").lower()
+            if t in ("hidden", "text"): self.fields[a["name"]] = a.get("value") or ""
+            elif t == "submit" and (a.get("value") or "") == "View": self.views.append(a["name"])
+        elif tag == "select": self.cur = a.get("name"); self.selects[self.cur] = []
+        elif tag == "option" and self.cur is not None:
+            self.opt = [a.get("value"), "", "selected" in a]; self.selects[self.cur].append(self.opt)
+        elif tag in ("script", "style"): self.skip = True
+
+    def handle_endtag(self, tag):
+        if tag == "select": self.cur = None
+        elif tag == "option": self.opt = None
+        elif tag in ("script", "style"): self.skip = False
+        elif tag in ("tr", "br", "p", "div", "li", "td"): self.text.append("\n")
+
+    def handle_data(self, d):
+        if self.opt is not None: self.opt[1] += d
+        if not self.skip: self.text.append(d)
 
 
-def sao_read_cert(ctx, pg, job):
+class SaoHttp:
+    """County Collections without a browser (tested 2026-09-27: same documents and text as the browser reader, ~10 s a certificate)."""
+    def __init__(self):
+        import http.cookiejar
+        self.op = _re_ur.build_opener(_re_ur.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.op.addheaders = [("User-Agent", SAO_UA), ("Accept", "text/html,application/xhtml+xml,application/pdf,*/*"), ("Accept-Language", "en-US,en;q=0.9")]
+        self.url, self.html, self.form = None, "", None
+
+    def _go(self, url, data=None):
+        import urllib.parse, urllib.error
+        body = urllib.parse.urlencode(data).encode() if data is not None else None
+        t0 = __import__("time").time()
+        try:
+            with self.op.open(_re_ur.Request(url, data=body), timeout=60) as r:
+                raw, ctype, self.url = r.read(), r.headers.get("Content-Type", ""), r.geturl()
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429, 503): raise SaoBlocked(f"HTTP {e.code}")
+            raise
+        SAO.setdefault("resp", []).append(round(__import__("time").time() - t0, 2)); SAO["resp"] = SAO["resp"][-200:]
+        if "html" in ctype:
+            low = raw[:20000].decode("utf-8", "replace").lower()
+            if any(w in low for w in ("captcha", "access denied", "request rejected", "too many requests", "unusual traffic")):
+                raise SaoBlocked("block page")
+        return raw, ctype
+
+    def _page(self, url, data=None):
+        raw, _ = self._go(url, data)
+        self.html = raw.decode("utf-8", "replace")
+        self.form = _SaoForm(); self.form.feed(self.html)
+        return self.form
+
+    def _post(self, extra):
+        import urllib.parse
+        f = self.form
+        data = dict(f.fields)
+        for n, opts in f.selects.items():
+            sel = next((o for o in opts if o[2]), opts[0] if opts else None)
+            if sel: data[n] = sel[0]
+        data.update(extra)
+        return self._page(urllib.parse.urljoin(self.url, f.action or self.url), data)
+
+    def open_images(self, year, county, cert):
+        """Search one certificate, open its 'View Images'. Returns [(label, button)], or None when it has none."""
+        f = self._page(SAO_URL)
+        yr = next(n for n in f.selects if n.endswith("YearDD"))
+        f = self._post({yr: str(year), "__EVENTTARGET": yr, "__EVENTARGUMENT": ""})
+        cn = next(n for n in f.selects if n.endswith("CountyDD"))
+        val = next((o[0] for o in f.selects[cn] if o[1].strip().upper() == county.upper()), None)
+        if not val: raise ValueError(f"county {county} not in the {year} list")
+        cb = next(n for n in f.fields if n.endswith("CertTB"))
+        sb = _re_re.search(r'name="([^"]*SearchBTN)"', self.html).group(1)
+        self._post({yr: str(year), cn: val, cb: cert.split("-")[-1], sb: "Search", "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
+        h = self.html.replace("&#39;", "'")
+        i = h.find(">" + cert + "<")                                   # this certificate's row, then its View Images link
+        if i < 0: return None
+        m = _re_re.search(r"__doPostBack\('([^']*lblViewImages)','([^']*)'\)", h[i:i + 4000])
+        if not m: return None
+        f = self._post({"__EVENTTARGET": m.group(1), "__EVENTARGUMENT": m.group(2)})
+        part = _re_re.split(r"\n\s*Images\s*\n", "".join(f.text), maxsplit=1)
+        labels = [x.strip() for x in (part[1] if len(part) > 1 else "").split("\n") if x.strip() and x.strip() != "View" and "new tab" not in x.lower()]
+        return list(zip(labels[:len(f.views)], f.views))
+
+    def fetch(self, btn):
+        """One document: the View button posts the page, the PDF is then served at Document.aspx."""
+        self._post({btn: "View", "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
+        raw, ctype = self._go("https://www.wvsao.gov/CountyCollections/CTS/Document.aspx")
+        if "pdf" not in ctype: raise ValueError("not a PDF")
+        return raw
+
+
+def sao_read_cert(site, job):
     county, cert, year, wv = job["county"], job["cert"], job.get("year"), job.get("wv_status") or ""
-    docs = _sao_open_images(pg, year, county, cert)
+    docs = site.open_images(year, county, cert)
     if docs is None: return {"county": county, "cert": cert, "status": "none", "error": "no 'View Images' for this certificate"}
     out = {"county": county, "cert": cert, "status": "done", "docs": [d[0] for d in docs], "people": [], "texts": []}
     want_notice = wv in ("DEEDED", "SOLD", "CANCELED")
@@ -5492,7 +5567,9 @@ def sao_read_cert(ctx, pg, job):
         if not kind or (kind != "approval" and not want_notice): continue
         idx = seen.get(L, 0); seen[L] = idx + 1
         try:
-            text = _sao_pdf_text(_sao_fetch(ctx, pg, btn))
+            text = _sao_pdf_text(site.fetch(btn))
+        except SaoBlocked:
+            raise
         except Exception as e:
             out.setdefault("doc_errors", []).append(f"{label}: {str(e)[:80]}"); continue
         out["texts"].append({"label": L, "idx": idx, "text": text[:60000]})
@@ -5524,46 +5601,51 @@ def sao_read_cert(ctx, pg, job):
     return out
 
 
-def sao_loop():
-    """🧾 Reads the State Auditor documents of every sold certificate, one at a time (sao_cert queue)."""
+def sao_loop(n=0):
+    """🧾 Reads the State Auditor documents of every sold certificate (sao_cert queue). SAO_THREADS readers at once
+    (plain HTTP, no browser). If the site pushes back (403 / 429 / 503 / block page) every reader pauses 30 minutes
+    and the pushback is listed in /sao-status - never worked around."""
     import time as _t
-    _t.sleep(90)
-    from playwright.sync_api import sync_playwright
+    _t.sleep(90 + 7 * n)
+    site, done_here = SaoHttp(), 0
     while True:
-        p = browser = None
         try:
-            p, browser = get_playwright_browser()
-            ctx = browser.new_context(user_agent=SAO_UA)
-            pg = ctx.new_page()
-            for _ in range(150):                               # fresh browser every 150 certificates
-                job = _fz_rpc("sao_claim", {})
-                if not job:
-                    SAO["state"] = "idle"; _t.sleep(300); break
-                SAO.update({"state": "working", "current": f"{job['county']} {job['cert']}"})
-                try:
-                    res = sao_read_cert(ctx, pg, job)
-                except Exception as e:
-                    res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": str(e)[:300]}
-                try:
-                    _fz_rpc("sao_save", {"p": res})
-                except Exception as e:
-                    body = ""
-                    try: body = e.read().decode("utf-8", "replace")[:300]
-                    except Exception: pass
-                    print(f"[sao] save refused {job['county']} {job['cert']}: {e} {body}", flush=True)
-                    res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": ("save refused: " + body)[:300]}
-                    try: _fz_rpc("sao_save", {"p": res})
-                    except Exception: pass
-                SAO[res["status"] if res["status"] in ("done", "none", "failed") else "done"] = SAO.get(res["status"], 0) + 1
-                SAO["last"] = f"{job['county']} {job['cert']} {res['status']}"
-                _t.sleep(1.5)                                  # gentle between certificates
+            if _t.time() < SAO.get("pause_until", 0):
+                SAO["state"] = "paused - the site pushed back"; _t.sleep(60); continue
+            if done_here >= 150: site, done_here = SaoHttp(), 0     # a fresh session now and then
+            job = _fz_rpc("sao_claim", {})
+            if not job:
+                SAO["state"] = "idle"; _t.sleep(300); continue
+            SAO["state"] = "working"
+            SAO.setdefault("current", {})[n] = f"{job['county']} {job['cert']}"
+            t0 = _t.time()
+            try:
+                res = sao_read_cert(site, job)
+            except SaoBlocked as e:
+                SAO["pause_until"] = _t.time() + 1800
+                SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']}")
+                print(f"[sao] pushback: {e} - all readers pause 30 min", flush=True)
+                res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site pushed back: {e}"}
+            except Exception as e:
+                res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": str(e)[:300]}
+            try:
+                _fz_rpc("sao_save", {"p": res})
+            except Exception as e:
+                body = ""
+                try: body = e.read().decode("utf-8", "replace")[:300]
+                except Exception: pass
+                print(f"[sao] save refused {job['county']} {job['cert']}: {e} {body}", flush=True)
+                res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": ("save refused: " + body)[:300]}
+                try: _fz_rpc("sao_save", {"p": res})
+                except Exception: pass
+            st = res["status"] if res["status"] in ("done", "none", "failed") else "requeued"
+            SAO[st] = SAO.get(st, 0) + 1
+            SAO["last"] = f"{job['county']} {job['cert']} {res['status']}"
+            SAO.setdefault("secs", []).append(round(_t.time() - t0, 1)); SAO["secs"] = SAO["secs"][-100:]
+            done_here += 1
+            _t.sleep(1.5)                                          # gentle between certificates
         except Exception as e:
             print(f"[sao] {e}", flush=True); _t.sleep(60)
-        finally:
-            try: browser and browser.close()
-            except Exception: pass
-            try: p and p.stop()
-            except Exception: pass
 
 
 def _idx2_run(job, county, last, first, book, page, desc=None):
@@ -5733,5 +5815,6 @@ if __name__ == '__main__':
         for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
             _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
         if os.environ.get("SAO_READER", "1") == "1":
-            _og_threading.Thread(target=sao_loop, daemon=True).start()   # 🧾 State Auditor documents
+            for _s in range(int(os.environ.get("SAO_THREADS", "3"))):   # 🧾 State Auditor documents, 3 readers (plain HTTP)
+                _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
