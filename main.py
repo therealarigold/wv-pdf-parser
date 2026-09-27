@@ -5360,10 +5360,15 @@ def _fz_step_words(name, args, county):
     if name == "old_book_page": return f"📜 Opening the old {str(args.get('book_type') or 'deed book').lower()} {args.get('book')} page {args.get('page')} ({c})…"
     if name == "old_index_book": return f"📒 Looking in the old handwritten index books ({c}){': ' + args.get('book_name').title() if args.get('book_name') else ''}…"
     if name == "search_bank": return f"📚 Checking our own page bank for “{(args or {}).get('query')}”…"
+    if name == "client_summary": return f"📋 Pulling up the client {(args or {}).get('who')}…"
+    if name == "cert_lookup": return f"🔎 Looking up {(args or {}).get('query')} in our records…"
+    if name == "county_index_bank": return f"📚 Checking our county index bank for {(args or {}).get('name')}…"
+    if name == "buyer_spend": return "💵 Looking at the buyers' spending…"
     return "🤔 Working on it…"
 
 
-def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag="", progress=None):
+def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag="", progress=None,
+              model="claude-opus-5", stop_tool=None, tool_fn=None):
     """Claude with our index tools (+ web search). Returns the final text, or the input of final_tool when given."""
     import anthropic
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -5375,7 +5380,7 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
         last_round = step >= max_steps - 2
         if progress and step: progress("🤔 Thinking about what I found…")
         _fz_cache_mark(msgs)
-        kw = dict(model="claude-opus-5", max_tokens=4000, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], messages=msgs,
+        kw = dict(model=model, max_tokens=4000, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], messages=msgs,
                   extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
                   extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
         if last_round and final_tool:
@@ -5400,6 +5405,8 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
         uses = [b for b in blocks if b.get("type") == "tool_use"]
         fin = next((u for u in uses if final_tool and u["name"] == final_tool["name"]), None)
         if fin: return fin.get("input") or {}
+        stop = next((u for u in uses if stop_tool and u["name"] == stop_tool), None)
+        if stop: return {"__stop__": stop.get("input") or {}}
         if not uses:
             if final_tool:                                      # he answered in words: ask for the form
                 msgs.append({"role": "user", "content": f"Now fill in {final_tool['name']}."}); continue
@@ -5408,7 +5415,7 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
         for u in uses:
             if progress: progress(_fz_step_words(u["name"], u.get("input") or {}, sites.home))
             try:
-                out = _fzc_tool(sites, u["name"], u.get("input") or {}, budget)
+                out = (tool_fn or _fzc_tool)(sites, u["name"], u.get("input") or {}, budget)
             except Exception as e:
                 out = f"That did not work: {str(e)[:200]}"
             log(f"[{feature}] {tag} {u['name']} {u.get('input')}")
@@ -5588,6 +5595,107 @@ def fernando_chat_one():
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🤖 GENERAL "ASK FERNANDO" (owners + managers, index.html). Office data only. Cheap model first (our own data); the full
+# model only when he needs a live county search or to read papers - he says so first. Daily money cap (fernando_cap).
+# Role-aware: the tools depend on who asks (owner / manager now; a client version later would get only its own jobs).
+# ─────────────────────────────────────────────────────────────────────────────
+_FZG_MODEL_CHEAP = os.environ.get("FERNANDO_CHEAP_MODEL", "claude-sonnet-5")
+_FZG_SYSTEM = """You are Fernando, the title abstractor and office assistant of a West Virginia tax-lien law office (tax sale
+certificates, title searches for the Notice to Redeem, deeds, surplus recovery). An office member (owner or manager) asks you
+something in plain words. Use the tools to look at the office's own data and answer short, plain and friendly - most important
+thing first, simple "-" bullets if needed, no tables or headings. Say where each fact comes from (job, ticket, State Auditor
+letter, county index bank, page bank). Never invent a number, name, date or book/page. If the data does not say, say so.
+Money: a lien costs the client $500; "owed" = $500 per lien minus what was paid. Dates in MM/DD/YYYY.
+This is office-only information - never suggest sending it to a client unless asked."""
+_FZG_GO_LIVE = {"name": "go_live", "description": "Call this ONLY when the answer needs a LIVE county index search or reading document "
+    "images / old books / the web (our own data is not enough). Say in 'reason' what you will look up. It takes 1-3 minutes and costs more.",
+    "input_schema": {"type": "object", "properties": {"reason": {"type": "string"}, "county": {"type": "string"}}, "required": ["reason"]}}
+_FZG_DATA_TOOLS = [
+    {"name": "client_summary", "description": "Everything about one client: every job (county, cert, round, dates, amounts/payments fields as stored), "
+        "the title-search ticket of each (status, open debts, people to serve, Fernando items still to check), what Fernando found, the State "
+        "Auditor status, and online wins they have NOT asked us about. who = bidder number or part of the client's name.",
+     "input_schema": {"type": "object", "properties": {"who": {"type": "string"}}, "required": ["who"]}},
+    {"name": "cert_lookup", "description": "One certificate (e.g. 2025-C-000060, or just 000060 with county) or an owner name: the State list row, "
+        "our job, the ticket, Fernando's search, the State Auditor letters (sale/bid/surplus, NTR, certified mail), people served, surplus case.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}, "county": {"type": "string"}}, "required": ["query"]}},
+    {"name": "county_index_bank", "description": "Our collected county index rows (every recorded paper's type, date, book/page, parties) for a "
+        "person or company name - instant, no live search.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "county": {"type": "string"}}, "required": ["name"]}},
+]
+_FZG_OWNER_TOOLS = [
+    {"name": "buyer_spend", "description": "Owners only: certificates bought and known prices per buyer per sale year (competitors' budgets).",
+     "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
+]
+
+
+def _fzg_tools(role):
+    """Which data this asker may see (a future client role would get only its own jobs - built then, locked in the database)."""
+    t = list(_FZG_DATA_TOOLS) + [x for x in _FZC_TOOLS if x["name"] == "search_bank"]
+    if role == "owner": t += _FZG_OWNER_TOOLS
+    return t
+
+
+def _fzg_tool_fn(role):
+    def fn(sites, name, args, budget):
+        if name == "client_summary": return _re_json.dumps(_fz_rpc("fz_client", {"p_who": args.get("who") or ""}), ensure_ascii=False)[:60000]
+        if name == "cert_lookup": return _re_json.dumps(_fz_rpc("fz_cert", {"p_query": args.get("query") or "", "p_county": args.get("county") or None}), ensure_ascii=False)[:60000]
+        if name == "county_index_bank": return _re_json.dumps(_fz_rpc("fz_idx_bank", {"p_name": args.get("name") or "", "p_county": args.get("county") or None}), ensure_ascii=False)[:40000]
+        if name == "buyer_spend":
+            if role != "owner": return "Only owners can see buyer spending."
+            return _re_json.dumps(_fz_rpc("fz_buyer_spend", {"p_limit": max(5, min(80, int(args.get("limit") or 40)))}), ensure_ascii=False)[:40000]
+        return _fzc_tool(sites, name, args, budget)
+    return fn
+
+
+def fernando_gchat_one():
+    job = _fz_rpc("fernando_gchat_claim", {})
+    if not job: return False
+    mid = job["id"]
+    _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_general", None, f"gchat {mid}"
+    def progress(t):
+        try: _fz_rpc("fernando_gchat_progress", {"p_id": mid, "p_text": t})
+        except Exception: pass
+    try:
+        if job.get("over_cap"):
+            _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": "Today's Fernando budget is used up - an owner can raise the daily cap, or ask me again tomorrow.", "p_status": "answered"}); return True
+        role = "owner" if job.get("owner") else "manager"
+        msgs = []
+        for h in job.get("history") or []:
+            msgs.append({"role": "user" if h["role"] == "staff" else "assistant", "content": (f"{h.get('author')}: " if h["role"] == "staff" else "") + h["body"]})
+        msgs.append({"role": "user", "content": f"{job.get('author') or 'Office'} ({role}): {job['body']}"})
+        merged = []
+        for m in msgs:
+            if merged and merged[-1]["role"] == m["role"]: merged[-1]["content"] += "\n\n" + m["content"]
+            else: merged.append(m)
+        progress("👀 Looking at our records…")
+        sites = _FzcSites(None)
+        try:
+            out = _fz_agent(_FZG_SYSTEM, merged, _fzg_tools(role) + [_FZG_GO_LIVE], sites, "fernando_general", max_steps=10,
+                            progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=_fzg_tool_fn(role), tag=f"gchat {mid}")
+            if isinstance(out, dict) and "__stop__" in out:
+                why = (out["__stop__"] or {}).get("reason") or "a live county search"
+                county = (out["__stop__"] or {}).get("county")
+                progress(f"🔎 This needs a live look ({why[:120]}) - about 1-3 min…")
+                sites = _FzcSites(_re_re.sub(r"\s*COUNTY\s*$", "", (county or "").upper().strip()) or None)
+                live = [t for t in _FZC_TOOLS if t["name"] != "search_bank"] + [_FZ_WEB_SEARCH]
+                out = _fz_agent(_FZG_SYSTEM + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
+                                merged + [{"role": "assistant", "content": f"(I need a live look: {why})"}, {"role": "user", "content": "Go ahead."}],
+                                _fzg_tools(role) + live, sites, "fernando_general", max_steps=14, progress=progress,
+                                model="claude-opus-5", tool_fn=_fzg_tool_fn(role), tag=f"gchat {mid}")
+        finally:
+            sites.close()
+        text = out if isinstance(out, str) else "Sorry - I lost my train of thought. Please ask again."
+        _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": text[:8000], "p_status": "answered"})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        try: _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": str(e)[:300], "p_status": "failed"})
+        except Exception: pass
+    finally:
+        _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
+    return True
+
+
 def fernando_chat_loop(n=0):
     """💬 A worker only for staff questions (the other workers also take them, between searches)."""
     import time as _t
@@ -5597,6 +5705,11 @@ def fernando_chat_loop(n=0):
             worked = fernando_chat_one()
         except Exception as e:
             print(f"[fernando-chat] {e}", flush=True); worked = False
+        if not worked:
+            try:
+                worked = fernando_gchat_one()
+            except Exception as e:
+                print(f"[fernando-gchat] {e}", flush=True); worked = False
         _t.sleep(2 if worked else 5)
 
 
