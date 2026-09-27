@@ -4247,7 +4247,8 @@ IDX2_SURVEY = {
     "WYOMING": "http://129.71.205.79/",
     "RANDOLPH": "http://129.71.117.90/",           # free IDX (the paid Fidlar service is separate)
     "CALHOUN": "http://129.71.205.140/IDXSearch/",  # found by Ari (not linked from the county site)
-    "RALEIGH": "http://129.71.206.131/",            # needs the office's account (IDX_RALEIGH_USER / _PASS)
+    "RALEIGH": "http://129.71.206.131/",            # needs the office's account (IDX_RALEIGH_USER / _PASS) - probably Raleigh, confirm after login
+    "MERCER": "https://inquiry.mercerclerkwv.com/",  # needs the office's account (IDX_MERCER_USER / _PASS)
     # not the IDX product
     "BERKELEY": "https://search.berkeleydeeds.com/NameSearch.php", "PUTNAM": "https://recordhub.cottsystems.com/PutnamWV",
     "TUCKER": "https://us5.courthousecomputersystems.com/TuckerWV/", "WETZEL": "http://www.wetzelcountywv.us/WEBInquiry/Default.aspx",
