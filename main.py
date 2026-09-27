@@ -4357,6 +4357,25 @@ _IDX2_ASK = {
 }
 
 
+# 💲 AI cost log (owners see it in Reports): every Claude call records its tokens; the database prices them
+# (tables ai_usage / ai_price). The worker thread says which feature + certificate it is working on.
+_AI_CTX = __import__("threading").local()
+
+
+def _ai_log(msg, feature=None):
+    try:
+        u = getattr(msg, "usage", None)
+        if not u: return
+        _fz_rpc("ai_usage_log", {"p_feature": feature or getattr(_AI_CTX, "feature", None) or "other",
+                                 "p_county": getattr(_AI_CTX, "county", None), "p_cert": getattr(_AI_CTX, "cert", None),
+                                 "p_model": getattr(msg, "model", None),
+                                 "p_in": getattr(u, "input_tokens", 0) or 0, "p_out": getattr(u, "output_tokens", 0) or 0,
+                                 "p_cache_read": getattr(u, "cache_read_input_tokens", 0) or 0,
+                                 "p_cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0})
+    except Exception as e:
+        print("[ai-cost] not logged:", str(e)[:200], flush=True)
+
+
 def _idx2_read_doc(kind, images):
     """Read scanned pages with Claude; returns the fields asked for (blank when not on the pages)."""
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -4380,6 +4399,7 @@ def _idx2_read_doc(kind, images):
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
         extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
                     "fallbacks": "default"})
+    _ai_log(msg)
     if getattr(msg, "stop_reason", "") == "refusal":
         return {"error": "declined to read"}
     text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
@@ -4822,6 +4842,7 @@ def fernando_work_one():
     run = _fz_rpc("fernando_claim", {})
     if not run: return False
     county, cert = run["county"], run["cert"]
+    _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_read", county, cert
     FERNANDO.setdefault("working", {})[f"{county} {cert}"] = _re_dt.utcnow().isoformat() + "Z"
     try:
         if county not in IDX2_URLS:
@@ -4842,6 +4863,7 @@ def fernando_work_one():
         except Exception: pass
     finally:
         FERNANDO.get("working", {}).pop(f"{county} {cert}", None); FERNANDO["last"] = f"{county} {cert}"
+        _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
     return True
 
 
@@ -4990,6 +5012,7 @@ def fernando_chat_answer(job, log=print):
                       extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
             if can_search and not last_round: kw["tools"] = _FZC_TOOLS
             msg = client.messages.create(**kw)
+            _ai_log(msg, "fernando_chat")
             if getattr(msg, "stop_reason", "") == "refusal":
                 return "Sorry — I can't help with that one."
             blocks = []
@@ -5020,6 +5043,7 @@ def fernando_chat_one():
     job = _fz_rpc("fernando_chat_claim", {})
     if not job: return False
     tag = f"💬 {job['county']} {job['cert']}"
+    _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_chat", job["county"], job["cert"]
     FERNANDO.setdefault("working", {})[tag] = _re_dt.utcnow().isoformat() + "Z"
     try:
         text = fernando_chat_answer(job, log=lambda m: print(m, flush=True))
