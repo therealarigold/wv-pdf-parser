@@ -5367,6 +5367,8 @@ def _fz_step_words(name, args, county):
     if name == "surplus_estimate": return "💰 Working out the surplus per person…"
     if name == "history": return "🕘 Looking at who changed and opened it…"
     if name == "propose_action": return "✍ Preparing that change for you to confirm…"
+    if name == "find_person": return f"🔎 Looking for {(args or {}).get('name')} everywhere…"
+    if name == "overview": return "📊 Counting it up…"
     return "🤔 Working on it…"
 
 
@@ -5624,6 +5626,12 @@ thing first, simple "-" bullets if needed, no tables or headings. Say where each
 letter, county index bank, page bank). Never invent a number, name, date or book/page. If the data does not say, say so.
 Money: a lien costs the client $500; "owed" = $500 per lien minus what was paid. Dates in MM/DD/YYYY.
 This is office-only information - never suggest sending it to a client unless asked.
+The question may come from speech-to-text: no punctuation, fillers ("uh"), and misheard words ("a store place" = "surplus",
+"Bambi" = "Bambie") - work out what they meant. Use the conversation so far: a name or case already found in this thread
+is the one they mean. A NAME can be a client (bidder), a person on a surplus case (owner / heir), an owner or person on a
+title search, or someone the State served - use find_person, which searches all of them. "Cases", "surplus", "filed to court",
+"hired us" mean surplus cases - use overview for counts and lists. Never answer "I don't have a tool"; if something is truly
+not in the data, say what you can do instead.
 Start with ONE short sentence that answers the question directly (it may be read aloud), then the details. Never show raw
 field names (paid_us, owes_us, liens_found_on_property_still_open...) - say it in words. "Owes us" (our $500 per lien) and
 "liens found on the property" are different things - never mix them.
@@ -5653,6 +5661,15 @@ _FZG_DATA_TOOLS = [
     {"name": "county_index_bank", "description": "Our collected county index rows (every recorded paper's type, date, book/page, parties) for a "
         "person or company name - instant, no live search.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "county": {"type": "string"}}, "required": ["name"]}},
+]
+_FZG_DATA_TOOLS[0:0] = [
+    {"name": "find_person", "description": "Find a NAME anywhere (fuzzy - misheard names are fine): clients (bidders), people on surplus cases "
+        "(owners, heirs), owners and persons on title searches, people the State served. Returns each hit with county/cert and ids.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "overview", "description": "Counts and lists across the office. what = 'surplus' (cases by stage; with stage = one of new, mailed, contacted, "
+        "retained, filed, granted, appealed, received, closed, completed, expired, declined, denied -> the cases in it), 'title' (title searches by "
+        "status; with stage = progress / complete / verified / filed -> the tickets), or 'jobs' (unpaid jobs, what clients owe us, by round).",
+     "input_schema": {"type": "object", "properties": {"what": {"type": "string", "enum": ["surplus", "title", "jobs"]}, "stage": {"type": "string"}}, "required": ["what"]}},
 ]
 _FZG_DATA_TOOLS.append(
     {"name": "surplus_estimate", "description": "What each heir / owner would get from a surplus: gross surplus (approval letter or our surplus "
@@ -5741,6 +5758,10 @@ def _fzg_tool_fn(role, actions=None):
             return _re_json.dumps(_fz_rpc("fz_history", {"p_county": args.get("county") or "", "p_cert": args.get("cert") or ""}), ensure_ascii=False)[:30000]
         if name == "surplus_estimate":
             return _fzg_surplus(args)
+        if name == "find_person":
+            return _re_json.dumps(_fz_rpc("fz_find", {"p_name": args.get("name") or ""}), ensure_ascii=False)[:40000]
+        if name == "overview":
+            return _re_json.dumps(_fz_rpc("fz_overview", {"p_what": args.get("what") or "surplus", "p_stage": args.get("stage") or None}), ensure_ascii=False)[:60000]
         if name == "propose_action":
             return _fzg_propose(args, actions)
         if name == "buyer_spend":
@@ -5913,6 +5934,11 @@ def _fzh_cases():
         {"q": "who owns marshall 2025-C-000012 now", "must": [r"Teater"]},
         {"q": "is the crosscountry loan on marshall 2025-C-000012 still open", "must": [r"Cross ?Country"]},
         {"q": "hey fernando thanks", "max_total_s": 30},
+        {"q": "can you tell me the status for bambi", "must": [r"(Hardy|2023-C-000017)", r"filed"]},
+        {"q": "how many cases have already been filed to the court", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'surplus'}) or {}).get('counts_by_stage') or {}).get('filed', 0)}\b"],
+         "must_not": [r"don.t have a tool"]},
+        {"q": "uh how many a store place cases did we hire", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'surplus'}) or {}).get('counts_by_stage') or {}).get('retained', 0)}\b"]},
+        {"q": "how many title searches are in progress right now", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'title'}) or {}).get('counts_by_status') or {}).get('progress', 0)}\b"]},
     ]
 
 
