@@ -5100,6 +5100,22 @@ def _fzc_tool(sites, name, args, budget):
     return "Unknown tool."
 
 
+def _fz_cache_mark(msgs):
+    """Prompt caching: one marker on the newest block, none on older ones. Each step re-sends the whole conversation;
+    with the marker, everything already sent is read from the cache at a tenth of the price (2026-09-27: heir tracing
+    cost $1.47 a ticket without it)."""
+    for m in msgs:
+        if isinstance(m.get("content"), list):
+            for b in m["content"]:
+                if isinstance(b, dict): b.pop("cache_control", None)
+    last = msgs[-1]
+    if isinstance(last.get("content"), str):
+        last["content"] = [{"type": "text", "text": last["content"]}]
+    for b in reversed(last["content"]):
+        if isinstance(b, dict) and b.get("type") in ("text", "tool_result", "image", "tool_use"):
+            b["cache_control"] = {"type": "ephemeral"}; break
+
+
 def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag=""):
     """Claude with our index tools (+ web search). Returns the final text, or the input of final_tool when given."""
     import anthropic
@@ -5110,7 +5126,8 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
     tools = list(tools) + ([final_tool] if final_tool else [])
     for step in range(max_steps):
         last_round = step >= max_steps - 2
-        kw = dict(model="claude-opus-5", max_tokens=4000, system=system, messages=msgs,
+        _fz_cache_mark(msgs)
+        kw = dict(model="claude-opus-5", max_tokens=4000, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], messages=msgs,
                   extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
                   extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
         if last_round and final_tool:
