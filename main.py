@@ -4551,6 +4551,10 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         other_names = sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))
         out_debts = _idx2_debts(mine)
         estate = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "name": r["name"], "desc": r["desc"]} for r in mine if _ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"]]
+        own_days = [_idx2_day(r["date"]) for r in mine if _idx2_day(r["date"]) and not (_ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"])]
+        cutoff = str(int(min(own_days)[:4]) - 2) if own_days else "1950"
+        old_namesakes = [e for e in estate if _idx2_day(e["date"]) and _idx2_day(e["date"])[:4] < cutoff]
+        estate = [e for e in estate if e not in old_namesakes]
         spouses = [{"spouse": r["other"], "date": r["date"], "desc": r["desc"]} for r in mine if "MARRIAGE" in r["doc"].upper()]
         deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r["other"], "desc": r["desc"]}
                  for r in mine if _idx2_is_deed(r)]
@@ -4624,10 +4628,18 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         bought = max([_idx2_day(r["date"]) for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"] or [""])
         sales = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and _idx2_day(r["date"]) >= bought
                         and len(_idx2_words(r["desc"]) & prop_words) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
+        floor = max(bought, str(_re_dt.utcnow().year - 10) + "0101")   # no purchase in the index: only the last 10 years
+        forced = _re_re.compile(r"TRUSTEE|SHERIFF|TAX|COMMISSIONER|IN LIEU|FORECLOS|AUDITOR|DEPUTY")
+        later = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and _idx2_day(r["date"]) >= floor and r not in sales],
+                       key=lambda r: _idx2_day(r["date"]), reverse=True)
+        if not sales:
+            sales = [r for r in later if forced.search(r["doc"].upper() + " " + (r["desc"] or "").upper())][:1]
+        other_sales = [{"name": r["other"], "date": r["date"], "bookpage": r["bookpage"], "type": r["doc"], "desc": r["desc"]}
+                       for r in later if r not in sales][:8]
         new_owner = None
         if sales:
             s = sales[0]
-            new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"]}
+            new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"], "type": s["doc"]}
             bl, bf = _idx2_name(s["other"])
             if bl:
                 new_owner["debts"] = _idx2_debts(person(bl, bf), since=_idx2_day(s["date"]))
@@ -4636,8 +4648,8 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         for x in out_debts:
             if not x["released"]: read_item("debt", x)
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
-                "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "spouses": spouses,
-                "deeds": deeds, "chain": chain, "sold": new_owner, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
+                "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "estate_skipped_old": old_namesakes[:10], "spouses": spouses,
+                "deeds": deeds, "chain": chain, "sold": new_owner, "other_sales": other_sales, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
         try: browser.close()
