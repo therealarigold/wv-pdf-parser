@@ -5783,8 +5783,7 @@ def fernando_gchat_one():
             msgs.append({"role": "user" if h["role"] == "staff" else "assistant", "content": (f"{h.get('author')}: " if h["role"] == "staff" else "") + h["body"]})
         import datetime as _dtm
         today = (_dtm.datetime.utcnow() - _dtm.timedelta(hours=4)).strftime("%A %m/%d/%Y")    # Eastern time, close enough for a date
-        msgs.append({"role": "user", "content": f"(Today is {today}.)
-{job.get('author') or 'Office'} ({role}): {job['body']}"})
+        msgs.append({"role": "user", "content": f"(Today is {today}.)\n{job.get('author') or 'Office'} ({role}): {job['body']}"})
         merged = []
         for m in msgs:
             if merged and merged[-1]["role"] == m["role"]: merged[-1]["content"] += "\n\n" + m["content"]
