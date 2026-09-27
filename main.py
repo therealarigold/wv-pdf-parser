@@ -4410,6 +4410,34 @@ def _idx2_vault(ctx, base_url, book_name=None, volume=None, page=None):
         ip.close()
 
 
+# ── 📚 The page bank: every county page Fernando reads is kept (idx_page_bank); he looks there before the county ──
+def _bank_get(county, kind, **key):
+    try: return _fz_rpc("idx_bank_get", {"p": dict(key, county=county, kind=kind)})
+    except Exception: return None
+
+
+def _bank_put(county, kind, fields, doc_kind=None, pages=None, text=None, **key):
+    if not fields or (isinstance(fields, dict) and fields.get("error")): return
+    f = dict(fields)
+    names = [str(x) for x in (f.pop("all_names", None) or []) if x]
+    for k in ("grantors", "grantees", "borrowers", "beneficiaries"):
+        names += [str(x) for x in (f.get(k) or []) if x]
+    for k in ("lender_or_creditor", "trustee", "deceased", "executor"):
+        if f.get(k): names.append(str(f[k]))
+    text = text or f.pop("transcription", None)
+    try:
+        _fz_rpc("idx_bank_put", {"p": dict(key, county=county, kind=kind, doc_kind=doc_kind, fields=f, names=sorted(set(names))[:200],
+                                            text=text, pages=pages)})
+    except Exception as e:
+        print(f"[bank] not kept: {str(e)[:120]}", flush=True)
+
+
+def _bank_as_text(b):
+    """A banked page for Fernando to read instead of the images."""
+    return ("FROM OUR PAGE BANK (read " + str(b.get("read_at") or "")[:10] + "): "
+            + _re_json.dumps({k: b.get(k) for k in ("doc_kind", "bookpage", "fields", "names", "text") if b.get(k)}, ensure_ascii=False)[:20000])
+
+
 def _idx2_pages(ctx, base_url, image_id, want=2):
     """First `want` pages of one recorded document, as base64 JPEGs."""
     ip = ctx.new_page()
@@ -4438,6 +4466,8 @@ _IDX2_ASK = {
     "will": ("a recorded will or estate paper", {
         "deceased": "string", "will_date": "string", "executor": "string", "executor_address": "string",
         "beneficiaries": "array", "real_estate_mentioned": "string"}),
+    "page": ("a page from a West Virginia county clerk's recorded books or old handwritten index books", {
+        "doc_type": "string", "transcription": "string", "summary": "string"}),
     "deed": ("a recorded deed", {
         "grantors": "array", "grantees": "array", "grantee_mailing_address": "string", "property_address": "string",
         "legal_description_short": "string", "prior_deed_reference": "string", "consideration": "string", "tax_ids": "array",
@@ -4470,6 +4500,7 @@ def _idx2_read_doc(kind, images):
     if not key:
         return {"error": "ANTHROPIC_API_KEY not set on the server"}
     what, fields = _IDX2_ASK[kind]
+    fields = dict(fields, all_names="array", all_addresses="array")        # for the page bank (Ctrl+F)
     props = {k: ({"type": "array", "items": {"type": "string"}} if t == "array" else {"type": "string"}) for k, t in fields.items()}
     schema = {"type": "object", "properties": props, "required": list(fields), "additionalProperties": False}
     content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in images]
@@ -4477,7 +4508,9 @@ def _idx2_read_doc(kind, images):
         f"These are the first pages of {what} from a West Virginia county clerk's record room (the 'Stolen Copy' "
         "watermark marks an unofficial copy; ignore it). Fill in each field exactly as written on the pages, "
         "including full mailing addresses with ZIP codes. Leave a field empty when it is not on these pages - "
-        "do not guess. prior_deed_reference = the 'being the same property conveyed by ... in Deed Book X page Y' "
+        "do not guess. all_names = every person and company named on the pages; all_addresses = every address on them. "
+        "transcription (page reads only) = the full text of the pages, line by line, handwriting included (write [illegible] "
+        "where you cannot read). prior_deed_reference = the 'being the same property conveyed by ... in Deed Book X page Y' "
         "clause (for a deed of trust: the deed that gave the borrower the property, often in the exhibit), if present. "
         "tax_ids = tax map / parcel numbers as written."})
     import anthropic
@@ -4725,12 +4758,18 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
 
         def read_item(kind, item):
             if item.get("read") is not None: return item["read"]
-            if not read or not item.get("image_id") or reads["n"] >= max_reads: return None
+            if not read or not item.get("image_id"): return None
+            banked = _bank_get(county, "document", image_id=str(item["image_id"]))
+            if banked and banked.get("fields") and banked.get("doc_kind") == kind:
+                item["read"], item["from_bank"] = banked["fields"], True     # read before - no trip, no cost
+                return item["read"]
+            if reads["n"] >= max_reads: return None
             reads["n"] += 1
             try:
                 imgs = _idx2_pages(ctx, url, item["image_id"], 2)
                 item["pages_read"] = len(imgs)
                 item["read"] = _idx2_read_doc(kind, imgs) if imgs else {"error": "no image"}
+                _bank_put(county, "document", item["read"], doc_kind=kind, pages=len(imgs), image_id=str(item["image_id"]), bookpage=item.get("bookpage"))
             except Exception as e:
                 item["read"] = {"error": str(e)[:200]}
             return item["read"]
@@ -4742,16 +4781,21 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 entry = {"date": "", "type": "DEED (older than the computer index)", "bookpage": f"{ref[0]} @ {ref[1]}",
                          "grantor": "", "grantee": "", "desc": said, "found_by": "named in the deed text"}
                 chain.append(entry)
-                if not read or reads["n"] >= max_reads: return
-                try:
-                    imgs = _idx2_book_images(ctx, url, "DEED BOOK", ref[0], ref[1], 3)
-                except Exception as e:
-                    entry["old_book"] = f"image search failed: {str(e)[:80]}"; return
-                if not imgs:
-                    entry["old_book"] = "no scanned page in the county's image search"; return
-                reads["n"] += 1
-                try: rd2 = _idx2_read_doc("deed", imgs)
-                except Exception as e: rd2 = {"error": str(e)[:200]}
+                banked = _bank_get(county, "book", book_type="DEED BOOK", book=ref[0], page=ref[1])
+                if banked and banked.get("fields") and banked.get("doc_kind") == "deed":
+                    rd2, imgs = banked["fields"], [None] * (banked.get("pages") or 1)
+                else:
+                    if not read or reads["n"] >= max_reads: return
+                    try:
+                        imgs = _idx2_book_images(ctx, url, "DEED BOOK", ref[0], ref[1], 3)
+                    except Exception as e:
+                        entry["old_book"] = f"image search failed: {str(e)[:80]}"; return
+                    if not imgs:
+                        entry["old_book"] = "no scanned page in the county's image search"; return
+                    reads["n"] += 1
+                    try: rd2 = _idx2_read_doc("deed", imgs)
+                    except Exception as e: rd2 = {"error": str(e)[:200]}
+                    _bank_put(county, "book", rd2, doc_kind="deed", pages=len(imgs), book_type="DEED BOOK", book=ref[0], page=ref[1])
                 entry.update({"read": rd2, "pages_read": len(imgs), "type": "DEED (old book, read from the scanned page)",
                               "found_by": "old deed book page (read by Fernando)", "date": (rd2 or {}).get("deed_date") or "",
                               "grantor": "; ".join((rd2 or {}).get("grantors") or []), "grantee": "; ".join((rd2 or {}).get("grantees") or [])})
@@ -4812,13 +4856,22 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                             "found": sorted(set(f'{r["doc"]}: {r["name"]}' for r in bp))[:6] or ["nothing at this book/page in the computer index"]}
                 if not bp and read and reads["n"] < max_reads:
                     # older than the computer index: the deed book page itself, read by Fernando
-                    try:
-                        imgs = _idx2_book_images(ctx, url, "DEED BOOK", want_bp[0], want_bp[1], 3)
-                    except Exception:
-                        imgs = []
+                    banked = _bank_get(county, "book", book_type="DEED BOOK", book=want_bp[0], page=want_bp[1])
+                    if banked and banked.get("fields") and banked.get("doc_kind") == "deed":
+                        imgs, rd0b_banked = [None], banked["fields"]
+                    else:
+                        rd0b_banked = None
+                        try:
+                            imgs = _idx2_book_images(ctx, url, "DEED BOOK", want_bp[0], want_bp[1], 3)
+                        except Exception:
+                            imgs = []
                     if imgs:
-                        reads["n"] += 1
-                        rd0b = _idx2_read_doc("deed", imgs)
+                        if rd0b_banked is not None:
+                            rd0b = rd0b_banked
+                        else:
+                            reads["n"] += 1
+                            rd0b = _idx2_read_doc("deed", imgs)
+                            _bank_put(county, "book", rd0b, doc_kind="deed", pages=len(imgs), book_type="DEED BOOK", book=want_bp[0], page=want_bp[1])
                         bp_check["old_book"] = rd0b
                         gs = " ".join((rd0b or {}).get("grantees") or []).upper()
                         if last and last in gs:
@@ -5141,6 +5194,9 @@ _FZC_TOOLS = [
         "and with page to see that page (read the handwriting yourself; the first pages of a volume are usually its own name guide).",
      "input_schema": {"type": "object", "properties": {"book_name": {"type": "string"}, "volume": {"type": "string"}, "page": {"type": "string"},
                       "county": {"type": "string"}}}},
+    {"name": "search_bank", "description": "Ctrl+F in OUR PAGE BANK: every county document and old book page we have ever read (full text, names, "
+        "addresses). Try it first - it is instant and free. query = a name or words (e.g. 'Gladys Brandon' or 'Henretta'); county optional.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}, "county": {"type": "string"}}, "required": ["query"]}},
     {"name": "read_document", "description": "Open the scanned images of the document recorded at a book/page so you can read it yourself "
         "(parties, addresses, amounts, the 'being the same property' clause, release wording). Costly - only when the answer is on the page.",
      "input_schema": {"type": "object", "properties": {"book": {"type": "string"}, "page": {"type": "string"},
@@ -5207,23 +5263,44 @@ class _FzcSites:
         for x in self.open.values(): x.close()
 
 
+def _fzc_transcribe_keep(county, kind, imgs, **key):
+    """Transcribe pages once (kept in the bank) - later questions read our copy instead of the county's."""
+    try:
+        rd = _idx2_read_doc("page", imgs)
+        _bank_put(county, kind, rd, doc_kind="page", pages=len(imgs), **key)
+        return rd
+    except Exception:
+        return None
+
+
 def _fzc_tool(sites, name, args, budget):
+    if name == "search_bank":
+        c = _re_re.sub(r"\s*COUNTY\s*$", "", (args.get("county") or "").upper().strip())
+        rows = _fz_rpc("idx_bank_search", {"p_query": args.get("query") or "", "p_county": c or None, "p_limit": 15}) or []
+        return _re_json.dumps({"found": len(rows), "pages": rows}, ensure_ascii=False) if rows else "Nothing in our page bank for that yet."
     site = sites.get(args.get("county")) if name in ("search_person", "lookup_book_page", "read_document", "old_book_page", "old_index_book") else None
     if name == "old_book_page":
+        bt = (args.get("book_type") or "DEED BOOK").upper()
+        banked = _bank_get(site.county, "book", book_type=bt, book=str(args.get("book")), page=str(args.get("page")))
+        if banked and (banked.get("text") or banked.get("fields")): return _bank_as_text(banked)
         if budget["reads"] >= 8: return "Page reading limit for this question reached (8)."
         site.page()                                                    # signed in (when the county needs it)
-        imgs = _idx2_book_images(site.ctx, site.url, args.get("book_type") or "DEED BOOK", args.get("book"), args.get("page"), max(1, min(4, int(args.get("pages") or 2))))
+        imgs = _idx2_book_images(site.ctx, site.url, bt, args.get("book"), args.get("page"), max(1, min(4, int(args.get("pages") or 2))))
         if not imgs: return f"No scanned page for {args.get('book_type')} {args.get('book')} page {args.get('page')} in this county's image search."
         budget["reads"] += 1
+        _fzc_transcribe_keep(site.county, "book", imgs, book_type=bt, book=str(args.get("book")), page=str(args.get("page")))
         return [{"type": "text", "text": f"{args.get('book_type')} {args.get('book')} page {args.get('page')} - {len(imgs)} page(s):"}] + \
                [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in imgs]
     if name == "old_index_book":
         site.page()
-        if args.get("page") not in (None, ""):
+        if args.get("page") not in (None, "") and args.get("book_name") and args.get("volume"):
+            banked = _bank_get(site.county, "vault", vault_book=args["book_name"], volume=args["volume"], page=str(args["page"]))
+            if banked and banked.get("text"): return _bank_as_text(banked)
             if budget["reads"] >= 8: return "Page reading limit for this question reached (8)."
             budget["reads"] += 1
         got, note = _idx2_vault(site.ctx, site.url, args.get("book_name"), args.get("volume"), args.get("page"))
         if isinstance(got, str):
+            _fzc_transcribe_keep(site.county, "vault", [got], vault_book=args.get("book_name"), volume=args.get("volume"), page=str(args.get("page")))
             return [{"type": "text", "text": note + ":"}, {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": got}}]
         return _re_json.dumps({"note": note, "items": got})
     if name == "search_person":
@@ -5241,13 +5318,16 @@ def _fzc_tool(sites, name, args, budget):
         rows = [r for r in _idx2_search(site.page(), 2, {"txtBook": book, "txtPage": page}, "txtPage") if _idx2_bp(r["bookpage"]) == want]
         if name == "lookup_book_page":
             return _re_json.dumps({"rows": [_fzc_row(r) for r in rows]}) if rows else f"Nothing at book {book} page {page} in the computer index (often older than the index)."
-        if budget["reads"] >= 5: return "Document reading limit for this question reached (5)."
         img = next((r.get("image_id") for r in rows if r.get("image_id")), None)
         if not img: return f"No scanned image for book {book} page {page} in the computer index."
+        banked = _bank_get(site.county, "document", image_id=str(img))
+        if banked and (banked.get("text") or banked.get("fields")): return _bank_as_text(banked)
+        if budget["reads"] >= 5: return "Document reading limit for this question reached (5)."
         budget["reads"] += 1
         n = max(1, min(4, int(args.get("pages") or 2)))
         imgs = _idx2_pages(site.ctx, site.url, img, n)
         if not imgs: return "The image would not open."
+        _fzc_transcribe_keep(site.county, "document", imgs, image_id=str(img), bookpage=f"{want[0]} @ {want[1]}")
         return [{"type": "text", "text": f"Book {book} page {page}: " + "; ".join(f"{r['doc']} {r['date']}" for r in rows[:3]) + f" - {len(imgs)} page(s):"}] + \
                [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in imgs]
     return "Unknown tool."
@@ -5279,6 +5359,7 @@ def _fz_step_words(name, args, county):
     if name == "read_document": return f"📄 Reading the document at book {args.get('book')} page {args.get('page')} ({c})…"
     if name == "old_book_page": return f"📜 Opening the old {str(args.get('book_type') or 'deed book').lower()} {args.get('book')} page {args.get('page')} ({c})…"
     if name == "old_index_book": return f"📒 Looking in the old handwritten index books ({c}){': ' + args.get('book_name').title() if args.get('book_name') else ''}…"
+    if name == "search_bank": return f"📚 Checking our own page bank for “{(args or {}).get('query')}”…"
     return "🤔 Working on it…"
 
 
