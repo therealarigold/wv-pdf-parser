@@ -4887,14 +4887,17 @@ def run_idx2_county_test(counties=None):
 # ═════════════════════════════════════════════════════════════════════════════
 FERNANDO = {"state": "idle", "done": 0, "last": None}
 _FZ_NAME_TAIL = ("JR", "SR", "II", "III", "IV", "DEC", "DECD", "DECEASED", "EST", "ESTATE", "HEIRS", "ETAL", "ET", "AL", "ETUX", "UX", "ETVIR")
-_FZ_COMPANY = _re_re.compile(r"\b(LLC|L L C|INC|CORP|CORPORATION|COMPANY|CO|BANK|TRUST|TRUSTEE|CHURCH|ASSOCIATION|ASSN|PARTNERSHIP|LP|LLP|LTD|PROPERTIES|HOLDINGS|ENTERPRISES|INVESTMENTS|GROUP|FOUNDATION|CITY OF|COUNTY|STATE OF|BOARD)\b")
+_FZ_COMPANY = _re_re.compile(r"\b(LLC|L L C|INC|CORP|CORPORATION|COMPANY|CO|BANK|TRUST|TRUSTEE|CHURCH|ASSOCIATION|ASSN|PARTNERSHIP|LP|LLP|LTD|PROPERTIES|HOLDINGS|ENTERPRISES|INVESTMENTS|GROUP|FOUNDATION|CITY OF|COUNTY|STATE OF|BOARD OF)\b")
 
 
 def fernando_owner_name(owner):
     """'WRIGHT DENNIS L & MELINDA A' -> ('WRIGHT', 'DENNIS', notes). Companies -> (None, None, reason)."""
     o = _re_re.sub(r"\s+", " ", (owner or "").upper()).strip()
     if not o: return None, None, "no owner name"
-    if _FZ_COMPANY.search(o): return None, None, "company owner - company (Firm) search not built yet"
+    # "LICHWA RHONDA L C/O JTK LLC", "BENNON CHRISTOPHER W TR BENNON TRUST": the person comes first - search the person
+    lead = _re_re.split(r"\s+(?:C/O|TR|TRS|TRUSTEE|TRUSTEES)\s+", o)[0]
+    if _FZ_COMPANY.search(lead): return None, None, "company owner - company (Firm) search not built yet"
+    o = lead
     notes = []
     if _re_re.search(r"\bEST\b|\bESTATE\b|\bDEC(D|EASED)?\b|\bHEIRS\b", o): notes.append("owner listed as an estate / deceased")
     first_person = _re_re.split(r"\s*&\s*|\s+AND\s+|\s+ET\s*AL\b|\s+ETAL\b|,", o)[0]
