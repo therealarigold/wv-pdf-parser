@@ -4466,7 +4466,7 @@ def _idx2_same_person(row_name, last, first):
 
 def _idx2_words(s):
     return set(w for w in _re_re.findall(r"[A-Z0-9]+", (s or "").upper().replace("LOTS", "LOT").replace(" LT ", " LOT ").replace("LTS", "LOT"))
-               if len(w) >= 2 and w not in ("DISTRICT", "ADDITIONAL", "AND", "THE", "OF", "PCLS", "PCL", "PARCELS", "PARCEL", "TRCT", "TRACT", "TRACTS", "AC", "LOT"))
+               if len(w) >= 2 and w not in ("DISTRICT", "ADDITIONAL", "AND", "THE", "OF", "PCLS", "PCL", "PARCELS", "PARCEL", "TRCT", "TRACT", "TRACTS", "AC", "LOT", "ADD", "ADDITION", "SUBDIVISION", "SUB"))
 
 
 def _idx2_day(d):
@@ -4481,6 +4481,42 @@ def _idx2_is_deed(r):
 
 _DEBT_RE = _re_re.compile(r"DEED OF TRUST|MORTGAGE|JUDG|LIEN|LIS PENDENS|FINANCING|UCC|ABSTRACT")
 _REL_RE = _re_re.compile(r"RELEASE|SATISFACTION|RECONVEY")
+_DEBT_NOT_RE = _re_re.compile(r"ASSIGN|SUBORDINAT|MODIF|SUBSTITUT|AMEND|CONTINUATION|EXTENSION|AFFIDAVIT|POWER OF ATTORNEY")
+# Ari's rules (2026-09-27): personal debts follow the PERSON (judgments, IRS / state tax liens, child support, bonds);
+# mortgages and property-tied liens (sewer, water, trash, city fees, mechanic's liens...) count only for THIS property.
+_PROP_LIEN_RE = _re_re.compile(r"SEWER|WATER|TRASH|REFUSE|GARBAGE|SANITA|STORM|MUNICIPAL|CITY OF|TOWN OF|VILLAGE OF|\bPSD\b|PUBLIC SERVICE|"
+                               r"MECHANIC|MATERIAL ?M|HOMEOWNER|OWNERS ASS|\bHOA\b|ASSESSMENT|DEMOLI|WEED|NUISANCE|CODE ENF|LIS PENDENS|FIXTURE")
+
+
+def _idx2_debt_kind(x):
+    t = (x.get("type") or "").upper()
+    if "DEED OF TRUST" in t or "MORTGAGE" in t: return "mortgage"
+    if _PROP_LIEN_RE.search(t + " " + (x.get("creditor") or "").upper() + " " + (x.get("desc") or "").upper()): return "property"
+    if "FINANCING" in t or "UCC" in t: return "property"
+    return "personal"
+
+
+def _idx2_relevant(debts, prop_words, owned_from=None, owned_until=None, prior=False):
+    """Split one person's debts into (count, skipped) by Ari's rules. owned_from / owned_until: YYYYMMDD of their purchase / sale."""
+    keep, skip = [], []
+    for x in debts:
+        day, kind = _idx2_day(x.get("date")), _idx2_debt_kind(x)
+        x["kind"] = kind
+        if prior and owned_until and day and day > owned_until:
+            x["why"] = "recorded after they sold"; skip.append(x); continue
+        if kind == "personal":
+            x["why"] = "personal (follows the person)" + (" - recorded before they sold" if prior else ""); keep.append(x); continue
+        if owned_from and day and day < owned_from:
+            x["why"] = "before they owned this property - another property"; skip.append(x); continue
+        dw = _idx2_words(x.get("desc"))
+        hit = len(dw & prop_words)
+        if hit >= 2:
+            x["why"] = "on this property"; keep.append(x)
+        elif len(dw) >= 2 and len(prop_words) >= 2 and not hit:
+            x["why"] = "description is another property"; skip.append(x)
+        else:
+            x["why"], x["check"] = "could be this property or another - check", True; keep.append(x)
+    return keep, skip
 _ESTATE_RE = _re_re.compile(r"WILL|ESTATE|ADMINISTRATION|FIDUCIARY|APPRAISEMENT|SETTLEMENT|HEIRSHIP|DEATH|TRANSFER ON DEATH")
 
 
@@ -4490,6 +4526,7 @@ def _idx2_debts(mine, since=None):
     for r in mine:
         d = r["doc"].upper()
         if _REL_RE.search(d) or d.startswith("REL"): releases.append(r)
+        elif _DEBT_NOT_RE.search(d): continue
         elif _DEBT_RE.search(d) and r["role"] in ("DEBTOR", "GRANTOR", "") and (not since or _idx2_day(r["date"]) >= since): debts.append(r)
     out = []
     for dbt in debts:
@@ -4538,8 +4575,11 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 item["read"] = {"error": str(e)[:200]}
             return item["read"]
 
+        seen_people = {}
         def person(l, f):
-            return [r for r in _idx2_search(pg, 0, {"txtLname": l, "txtFname": f, "txtMname": ""}, "txtFname") if _idx2_same_person(r["name"], l, f)]
+            if (l, f) not in seen_people:
+                seen_people[(l, f)] = [r for r in _idx2_search(pg, 0, {"txtLname": l, "txtFname": f, "txtMname": ""}, "txtFname") if _idx2_same_person(r["name"], l, f)]
+            return seen_people[(l, f)]
 
         rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
         mine = [r for r in rows if _idx2_same_person(r["name"], last, first)]
@@ -4636,20 +4676,43 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             sales = [r for r in later if forced.search(r["doc"].upper() + " " + (r["desc"] or "").upper())][:1]
         other_sales = [{"name": r["other"], "date": r["date"], "bookpage": r["bookpage"], "type": r["doc"], "desc": r["desc"]}
                        for r in later if r not in sales][:8]
+        for c in chain: prop_words |= _idx2_words(c.get("desc")) if c.get("date") else set()
+        # the owner: personal debts any time; mortgages / property liens only on this property, since they bought it
+        own_from = _idx2_day(chain[0]["date"]) if chain and _idx2_same_person(chain[0]["grantee"], last, first) else (bought or None)
+        out_debts, skipped_debts = _idx2_relevant(out_debts, prop_words, owned_from=own_from)
+        # prior owners (up to 3): only what was recorded before they sold
+        prior_owners = []
+        for i, c in enumerate(chain[:3]):
+            if not c.get("date") or not c.get("grantor") or c["grantor"].startswith("("): continue
+            who = c["grantor"].split(";")[0].strip()
+            if _FZ_COMPANY.search(who.upper()): continue
+            pl, pf = _idx2_name(who)
+            if not pl: continue
+            nxt = chain[i + 1] if i + 1 < len(chain) else None
+            frm = _idx2_day(nxt["date"]) if nxt and nxt.get("date") else None
+            try:
+                keep, skip = _idx2_relevant(_idx2_debts(person(pl, pf)), prop_words, owned_from=frm, owned_until=_idx2_day(c["date"]), prior=True)
+            except Exception as e:
+                keep, skip = [], []
+            prior_owners.append({"name": who, "owned_from": nxt["date"] if frm else "", "sold": c["date"], "debts": keep, "skipped": len(skip)})
         new_owner = None
         if sales:
             s = sales[0]
             new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"], "type": s["doc"]}
             bl, bf = _idx2_name(s["other"])
             if bl:
-                new_owner["debts"] = _idx2_debts(person(bl, bf), since=_idx2_day(s["date"]))
+                new_owner["debts"], _ = _idx2_relevant(_idx2_debts(person(bl, bf)), prop_words, owned_from=_idx2_day(s["date"]))
                 for x in new_owner["debts"]:
                     if not x["released"]: read_item("debt", x)
         for x in out_debts:
             if not x["released"]: read_item("debt", x)
+        for po in prior_owners:
+            for x in po["debts"]:
+                if not x["released"]: read_item("debt", x)
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
                 "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "estate_skipped_old": old_namesakes[:10], "spouses": spouses,
-                "deeds": deeds, "chain": chain, "sold": new_owner, "other_sales": other_sales, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
+                "deeds": deeds, "chain": chain, "sold": new_owner, "prior_owners": prior_owners,
+                "skipped_debts": [{"type": x["type"], "date": x["date"], "bookpage": x["bookpage"], "creditor": x["creditor"], "why": x["why"]} for x in skipped_debts][:20], "other_sales": other_sales, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
         try: browser.close()
@@ -4792,6 +4855,12 @@ certificates at the county tax sales and, before the deed, must find and serve w
 interest in the property: the owner(s), heirs of a dead owner, spouses, co-owners, lenders / lienholders with an open deed
 of trust, mortgage, judgment or lien (and their trustees), and anyone the owner sold to. Staff build a "title search"
 ticket for each certificate: the chain of deeds, the debts (open or released), and the people to serve.
+
+Which debts count (the office's rules): the CURRENT owner's personal debts count whenever recorded (judgments, IRS / state
+tax liens, child support, bonds); their mortgages and property-tied liens (sewer, water, trash, city fees, mechanic's liens)
+count only when they are on THIS property - if you cannot tell, list it as "check". A PRIOR owner's debts count only if
+recorded before they sold: personal ones any time before the sale, mortgages / property liens only while they owned this
+property. Assignments, substitutions of trustee and modifications are not debts themselves - they belong to the loan.
 
 A staff member is writing to you about ONE ticket. They write like they talk - short, typos, half sentences. Work out what
 they mean from the ticket; if it is truly unclear, ask them one short question back instead of guessing.
