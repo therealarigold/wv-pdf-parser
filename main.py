@@ -2886,7 +2886,7 @@ class Handler(BaseHTTPRequestHandler):
             county = (g("county") or "MARSHALL").upper()
             last, first = _re_re.sub(r"[^A-Za-z' -]", "", g("last")), _re_re.sub(r"[^A-Za-z' -]", "", g("first"))
             book, pg_ = _re_re.sub(r"\W", "", g("book")), _re_re.sub(r"\W", "", g("page"))
-            if county not in IDX2_URLS and county in IDX2_SURVEY and county not in ("PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"):
+            if county not in IDX2_URLS and county in IDX2_SURVEY and county not in ("PUTNAM", "TUCKER", "WETZEL"):
                 IDX2_URLS[county] = IDX2_SURVEY[county]
             if county not in IDX2_URLS or not last or not first:
                 return self.respond({"error": "county (an IDX county), last and first are required"})
@@ -4231,7 +4231,7 @@ IDX2_SURVEY = {
     "BARBOUR": "http://129.71.117.241/WEBInquiry/Default.aspx", "BOONE": "http://129.71.203.53/", "BROOKE": "http://129.71.117.252/",
     "CABELL": "http://www.recordscabellcountyclerk.org/Default.aspx", "DODDRIDGE": "http://129.71.118.43/", "FAYETTE": "http://129.71.202.7/",
     "GILMER": "http://www.gilmercountywv.gov/idxsearch/", "GRANT": "http://129.71.112.124/", "GREENBRIER": "http://129.71.205.208/",
-    "HAMPSHIRE": "http://129.71.205.207/idxsearch", "HANCOCK": "https://hancockwv.compiled-technologies.com/",
+    "HANCOCK": "https://hancockwv.compiled-technologies.com/",
     "HARRISON": "http://lookup.harrisoncountywv.com/", "JEFFERSON": "http://documents.jeffersoncountywv.org/",
     "LEWIS": "http://inquiry.lewiscountywv.org/", "LINCOLN": "http://129.71.206.62/Default.aspx", "LOGAN": "https://loganwv.compiled-technologies.com/",
     "MCDOWELL": "http://mcdowellcountyclerk.com/", "MARION": "http://129.71.118.22/", "MARSHALL": "http://129.71.117.225/",
@@ -4251,6 +4251,7 @@ IDX2_SURVEY = {
     "MERCER": "https://inquiry.mercerclerkwv.com/",  # needs the office's account (IDX_MERCER_USER / _PASS)
     "KANAWHA": "https://kanawhawv.compiled-technologies.com/",  # needs the office's account (IDX_KANAWHA_USER / _PASS)
     "BERKELEY": "https://records.berkeleywv.org/",   # IDX with the office's account (IDX_BERKELEY_USER / _PASS)
+    "HAMPSHIRE": "http://129.71.118.54/idxsearch/",  # IDX with the office's account (IDX_HAMPSHIRE_USER / _PASS)
     # not the IDX product
     "PUTNAM": "https://recordhub.cottsystems.com/PutnamWV",
     "TUCKER": "https://us5.courthousecomputersystems.com/TuckerWV/", "WETZEL": "http://www.wetzelcountywv.us/WEBInquiry/Default.aspx",
@@ -4671,7 +4672,7 @@ def run_idx2_county_test(counties=None):
     try:
         for county, url in IDX2_SURVEY.items():
             if counties and county not in counties: continue
-            if county in ("PUTNAM", "TUCKER", "WETZEL", "HAMPSHIRE"): continue   # not the IDX product / closed
+            if county in ("PUTNAM", "TUCKER", "WETZEL"): continue   # not the IDX product / closed
             IDX2_COUNTY_TEST["current"] = county
             p, browser = get_playwright_browser()                # a fresh browser per county (the server's one-process browser does not survive reuse)
             try:
