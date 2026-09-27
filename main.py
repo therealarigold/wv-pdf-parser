@@ -5116,7 +5116,18 @@ def _fz_cache_mark(msgs):
             b["cache_control"] = {"type": "ephemeral"}; break
 
 
-def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag=""):
+def _fz_step_words(name, args, county):
+    """What Fernando is doing right now, for the staff member waiting on an answer."""
+    c = ((args or {}).get("county") or county or "").title()
+    if name == "search_person":
+        who = " ".join(x for x in [(args or {}).get("first_name"), (args or {}).get("last_name")] if x)
+        return f"🔎 In the {c} county index, looking up {who.title() or 'a name'}…"
+    if name == "lookup_book_page": return f"📚 In the {c} county index, checking book {args.get('book')} page {args.get('page')}…"
+    if name == "read_document": return f"📄 Reading the document at book {args.get('book')} page {args.get('page')} ({c})…"
+    return "🤔 Working on it…"
+
+
+def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag="", progress=None):
     """Claude with our index tools (+ web search). Returns the final text, or the input of final_tool when given."""
     import anthropic
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -5126,6 +5137,7 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
     tools = list(tools) + ([final_tool] if final_tool else [])
     for step in range(max_steps):
         last_round = step >= max_steps - 2
+        if progress and step: progress("🤔 Thinking about what I found…")
         _fz_cache_mark(msgs)
         kw = dict(model="claude-opus-5", max_tokens=4000, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], messages=msgs,
                   extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
@@ -5146,7 +5158,9 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
         if stop == "refusal": return None if final_tool else "Sorry — I can't help with that one."
         blocks = [b.model_dump(mode="json", exclude_none=True) for b in msg.content]
         msgs.append({"role": "assistant", "content": blocks})
-        if stop == "pause_turn": continue                       # the web search wants to keep going
+        if stop == "pause_turn":                                # the web search wants to keep going
+            if progress: progress("🌐 Searching the web…")
+            continue
         uses = [b for b in blocks if b.get("type") == "tool_use"]
         fin = next((u for u in uses if final_tool and u["name"] == final_tool["name"]), None)
         if fin: return fin.get("input") or {}
@@ -5156,6 +5170,7 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
             return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip() or "Sorry — I lost my train of thought. Please ask again."
         results = []
         for u in uses:
+            if progress: progress(_fz_step_words(u["name"], u.get("input") or {}, sites.home))
             try:
                 out = _fzc_tool(sites, u["name"], u.get("input") or {}, budget)
             except Exception as e:
@@ -5166,7 +5181,7 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
     return None if final_tool else "Sorry — this one took too many steps. Please ask a narrower question."
 
 
-def fernando_chat_answer(job, log=print):
+def fernando_chat_answer(job, log=print, progress=None):
     """Answer one staff message; returns the reply text."""
     county = job["county"]
     can_search = bool(job.get("searchable")) and (county in IDX2_URLS or county in IDX2_SURVEY)
@@ -5193,7 +5208,7 @@ def fernando_chat_answer(job, log=print):
     sites = _FzcSites(county if can_search else None)
     try:
         return _fz_agent(_FZC_SYSTEM, msgs, (_FZC_TOOLS if can_search else []) + [_FZ_WEB_SEARCH], sites, "fernando_chat",
-                         max_steps=12, log=log, tag=f"{county} {job['cert']}")
+                         max_steps=12, log=log, tag=f"{county} {job['cert']}", progress=progress)
     finally:
         sites.close()
 
@@ -5316,12 +5331,16 @@ def fernando_chat_one():
     _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_chat", job["county"], job["cert"]
     FERNANDO.setdefault("working", {})[tag] = _re_dt.utcnow().isoformat() + "Z"
     try:
+        def progress(t):
+            try: _fz_rpc("fernando_chat_progress", {"p_id": job["id"], "p_text": t})
+            except Exception: pass
+        progress("👀 I'm on it - reading the ticket" + (" and the company page" if job.get("kind") == "company" else " and my earlier search") + "…")
         if job.get("kind") == "company":
             _AI_CTX.feature = "fernando_company"
             text, co = fernando_company_read(job)
             _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered", "p_result": {"company": co} if co else None})
         else:
-            text = fernando_chat_answer(job, log=lambda m: print(m, flush=True))
+            text = fernando_chat_answer(job, log=lambda m: print(m, flush=True), progress=progress)
             _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered"})
         FERNANDO["chats"] = FERNANDO.get("chats", 0) + 1
     except Exception as e:
@@ -5331,6 +5350,18 @@ def fernando_chat_one():
     finally:
         FERNANDO.get("working", {}).pop(tag, None)
     return True
+
+
+def fernando_chat_loop():
+    """💬 A worker only for staff questions (the other workers also take them, between searches)."""
+    import time as _t
+    _t.sleep(20)
+    while True:
+        try:
+            worked = fernando_chat_one()
+        except Exception as e:
+            print(f"[fernando-chat] {e}", flush=True); worked = False
+        _t.sleep(2 if worked else 5)
 
 
 def fernando_loop(n=0):
@@ -5847,6 +5878,7 @@ if __name__ == '__main__':
     if os.environ.get("SUPABASE_SECRET_KEY"):
         for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
             _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
+        _og_threading.Thread(target=fernando_chat_loop, daemon=True).start()          # 💬 questions answered at once
         if os.environ.get("SAO_READER", "1") == "1":
             for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP); 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
