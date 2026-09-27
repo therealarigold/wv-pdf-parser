@@ -4515,8 +4515,9 @@ def _idx2_name(s):
     return (n[0], n[1]) if len(n) >= 2 else (None, None)
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=8):
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=8, middle=None):
     last, first = last.upper().strip(), first.upper().strip()
+    mid = (middle or "").upper().strip()[:1]
     url = IDX2_URLS[county]
     p, browser = get_playwright_browser()
     reads = {"n": 0}
@@ -4542,6 +4543,11 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
 
         rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
         mine = [r for r in rows if _idx2_same_person(r["name"], last, first)]
+        if mid:   # WRIGHT HARRY R is not WRIGHT HARRY F (names with no middle are kept)
+            def _mid_ok(name):
+                w = [x for x in _re_re.sub(r"[^A-Z ]", " ", (name or "").upper()).split()[2:] if x not in _FZ_NAME_TAIL]
+                return not w or w[0][0] == mid
+            mine = [r for r in mine if _mid_ok(r["name"])]
         other_names = sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))
         out_debts = _idx2_debts(mine)
         estate = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "name": r["name"], "desc": r["desc"]} for r in mine if _ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"]]
@@ -4555,16 +4561,21 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             buys = [r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"]
             want = _idx2_words(desc or "")
             sim = sorted([r for r in buys if len(_idx2_words(r["desc"]) & want) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
-            pick = sim or sorted(buys, key=lambda r: _idx2_day(r["date"]), reverse=True)
+            mineral = bool(_re_re.search(r"O\s*&\s*G|\bOIL\b|\bGAS\b|\bMIN(ERAL)?S?\b|\bCOAL\b", (desc or "").upper()))
+            # a mineral interest is rarely the owner's latest purchase - only take a deed whose description matches
+            pick = sim or ([] if mineral else sorted(buys, key=lambda r: _idx2_day(r["date"]), reverse=True))
             if pick:
                 book, page = _idx2_bp(pick[0]["bookpage"])
                 found_deed = {"bookpage": pick[0]["bookpage"], "how": "similar description" if sim else "owner's latest purchase (check)"}
         # chain of title back from the deed at book/page
-        chain = []
+        chain, bp_check = [], None
         if book and page:
             want_bp = (str(book).lstrip("0"), str(page).lstrip("0"))
             bp = [r for r in _idx2_search(pg, 2, {"txtBook": str(book), "txtPage": str(page)}, "txtPage") if _idx2_bp(r["bookpage"]) == want_bp]
             cur, how = [r for r in bp if _idx2_is_deed(r) and r["role"] == "GRANTEE"], "book/page given"
+            if not cur and not found_deed:
+                bp_check = {"bookpage": f"{want_bp[0]} @ {want_bp[1]}",
+                            "found": sorted(set(f'{r["doc"]}: {r["name"]}' for r in bp))[:6] or ["nothing at this book/page in the computer index"]}
             seen = set()
             for step in range(6):
                 if not cur: break
@@ -4626,7 +4637,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             if not x["released"]: read_item("debt", x)
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
                 "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "spouses": spouses,
-                "deeds": deeds, "chain": chain, "sold": new_owner, "owner_deed_found": found_deed, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
+                "deeds": deeds, "chain": chain, "sold": new_owner, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
         try: browser.close()
@@ -4701,6 +4712,7 @@ def run_idx2_county_test(counties=None):
 # 🤖 FERNANDO THE TITLE ABSTRACTOR - works the fernando_run queue, one certificate at a time
 # ═════════════════════════════════════════════════════════════════════════════
 FERNANDO = {"state": "idle", "done": 0, "last": None}
+_FZ_NAME_TAIL = ("JR", "SR", "II", "III", "IV", "DEC", "DECD", "DECEASED", "EST", "ESTATE", "HEIRS", "ETAL", "ET", "AL", "ETUX", "UX", "ETVIR")
 _FZ_COMPANY = _re_re.compile(r"\b(LLC|L L C|INC|CORP|CORPORATION|COMPANY|CO|BANK|TRUST|TRUSTEE|CHURCH|ASSOCIATION|ASSN|PARTNERSHIP|LP|LLP|LTD|PROPERTIES|HOLDINGS|ENTERPRISES|INVESTMENTS|GROUP|FOUNDATION|CITY OF|COUNTY|STATE OF|BOARD)\b")
 
 
@@ -4715,6 +4727,13 @@ def fernando_owner_name(owner):
     words = [w for w in _re_re.sub(r"[^A-Z' ]", " ", first_person).split() if w not in ("EST", "ESTATE", "HEIRS", "JR", "SR", "II", "III", "MRS", "MR", "DR")]
     if len(words) < 2: return None, None, "could not read a last and first name"
     return words[0], words[1], "; ".join(notes)
+
+
+def fernando_owner_middle(owner):
+    """'WRIGHT HARRY R JR' -> 'R' (the first person's middle name/initial, if any)."""
+    o = _re_re.split(r"\s*&\s*|\s+AND\s+|\s+ET\s*AL\b|\s+ETAL\b|,", _re_re.sub(r"\s+", " ", (owner or "").upper()).strip())[0]
+    w = [x for x in _re_re.sub(r"[^A-Z ]", " ", o).split() if x not in _FZ_NAME_TAIL + ("MRS", "MR", "DR")]
+    return w[2][:1] if len(w) >= 3 else None
 
 
 def _fz_rpc(name, args):
@@ -4737,7 +4756,7 @@ def fernando_work_one():
         if not last:
             _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "skipped", "p_reason": note})
             return True
-        rep = idx2_owner_report(county, last, first, run.get("book"), run.get("page"), desc=run.get("descr"))
+        rep = idx2_owner_report(county, last, first, run.get("book"), run.get("page"), desc=run.get("descr"), middle=fernando_owner_middle(run.get("owner")))
         rep["owner_note"] = note
         rep["searched_as"] = f"{last} {first}"
         _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "done", "p_report": rep})
