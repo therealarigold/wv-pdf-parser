@@ -5631,7 +5631,8 @@ The question may come from speech-to-text: no punctuation, fillers ("uh"), and m
 is the one they mean. A NAME can be a client (bidder), a person on a surplus case (owner / heir), an owner or person on a
 title search, or someone the State served - use find_person, which searches all of them. "Cases", "surplus", "filed to court",
 "hired us" mean surplus cases - use overview for counts and lists. Never answer "I don't have a tool"; if something is truly
-not in the data, say what you can do instead. Never say you could not find someone unless find_person (or the name search
+not in the data, say what you can do instead. Bidder number 0000 means "number not known yet": the same name under 0000 and
+under a real number is ONE client - add them together and say so, do not ask which one. Never say you could not find someone unless find_person (or the name search
 already done above) actually came back empty - and then say what you searched and offer to try another spelling.
 Start with ONE short sentence that answers the question directly (it may be read aloud), then the details. Never show raw
 field names (paid_us, owes_us, liens_found_on_property_still_open...) - say it in words. "Owes us" (our $500 per lien) and
@@ -5698,9 +5699,8 @@ _FZG_OWNER_TOOLS = [
 
 def _fzg_tools(role):
     """Which data this asker may see (a future client role would get only its own jobs - built then, locked in the database)."""
-    t = list(_FZG_DATA_TOOLS) + [x for x in _FZC_TOOLS if x["name"] == "search_bank"]
-    if role == "owner": t += _FZG_OWNER_TOOLS
-    return t
+    # owner-only tools are offered to everyone and refuse a manager themselves, so he can say "only owners can see that"
+    return list(_FZG_DATA_TOOLS) + [x for x in _FZC_TOOLS if x["name"] == "search_bank"] + _FZG_OWNER_TOOLS
 
 
 _FZG_STAGE_WORDS = {"mailed": "Mailed", "contacted": "Contacted", "retained": "Hired us (retained)", "filed": "Filed in court",
@@ -5755,7 +5755,7 @@ def _fzg_tool_fn(role, actions=None):
         if name == "cert_lookup": return _re_json.dumps(_fz_rpc("fz_cert", {"p_query": args.get("query") or "", "p_county": args.get("county") or None}), ensure_ascii=False)[:60000]
         if name == "county_index_bank": return _re_json.dumps(_fz_rpc("fz_idx_bank", {"p_name": args.get("name") or "", "p_county": args.get("county") or None}), ensure_ascii=False)[:40000]
         if name == "history":
-            if role != "owner": return "Only owners can see the history."
+            if role != "owner": return "Only owners can see who changed or opened a record - tell the manager to ask Ari or Anne."
             return _re_json.dumps(_fz_rpc("fz_history", {"p_county": args.get("county") or "", "p_cert": args.get("cert") or ""}), ensure_ascii=False)[:30000]
         if name == "surplus_estimate":
             return _fzg_surplus(args)
@@ -5766,7 +5766,7 @@ def _fzg_tool_fn(role, actions=None):
         if name == "propose_action":
             return _fzg_propose(args, actions)
         if name == "buyer_spend":
-            if role != "owner": return "Only owners can see buyer spending."
+            if role != "owner": return "Only owners can see buyer spending - tell the manager to ask Ari or Anne."
             return _re_json.dumps(_fz_rpc("fz_buyer_spend", {"p_limit": max(5, min(80, int(args.get("limit") or 40)))}), ensure_ascii=False)[:40000]
         return _fzc_tool(sites, name, args, budget)
     return fn
@@ -5873,7 +5873,7 @@ def fernando_gchat_one():
         progress("👀 Got it - looking at our records…")
         actions = []
         def on_text(t):
-            try: _fz_rpc("fernando_gchat_stream", {"p_id": mid, "p_body": t})
+            try: _fz_rpc("fernando_gchat_stream", {"p_id": mid, "p_body": (t or "").replace("**", "")})
             except Exception: pass
         sites = _FzcSites(None)
         try:
@@ -5893,6 +5893,7 @@ def fernando_gchat_one():
         finally:
             sites.close()
         text = out if isinstance(out, str) else "Sorry - I lost my train of thought. Please ask again."
+        text = text.replace("**", "").replace("__", "")
         _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": text[:8000], "p_status": "answered", "p_actions": actions or None})
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -5931,7 +5932,7 @@ def _fzh_cases():
     gold_prog = ((gold.get("totals") or {}).get("by_ticket_status") or {}).get("progress", 0)
     return [
         {"q": "uh where are we with bidder 5782 what does he owe us", "must": [_fzh_money(owed(julian)), r"Julian"]},
-        {"q": "whats julien kenedy owe us", "must": [_fzh_money(owed(julian))]},
+        {"q": "whats julien kenedy owe us", "must": [_fzh_money(owed(c("Julian Kennedy")))]},
         {"q": "how much does armstong land owe us", "must": [_fzh_money(owed(arm))]},
         {"q": "does client 1948 owe us anything", "must": [r"Maxcell", r"(nothing|\$0\b|no(thing)? (money )?owed|paid( in full| up)?|doesn.t owe|does not owe|owes us nothing)"]},
         {"q": "how many jobs does gold enterprises have", "must": [str((gold.get("totals") or {}).get("jobs"))]},
@@ -5963,7 +5964,7 @@ def _fzh_cases():
         {"q": "how many cases have already been filed to the court", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'surplus'}) or {}).get('counts_by_stage') or {}).get('filed', 0)}\b"],
          "must_not": [r"don.t have a tool"]},
         {"q": "uh how many a store place cases did we hire", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'surplus'}) or {}).get('counts_by_stage') or {}).get('retained', 0)}\b"]},
-        {"q": "how many title searches are in progress right now", "must": [rf"\b{((_fz_rpc('fz_overview', {'p_what': 'title'}) or {}).get('counts_by_status') or {}).get('progress', 0)}\b"]},
+        {"q": "how many title searches are in progress right now", "near": lambda: ((_fz_rpc('fz_overview', {'p_what': 'title'}) or {}).get('counts_by_status') or {}).get('progress', 0)},
     ]
 
 
@@ -5974,6 +5975,10 @@ def _fzh_check(case, ans, times):
         if not _re_re.search(rx, body, _re_re.I): fails.append(f"missing /{rx}/")
     for rx in case.get("must_not", []):
         if _re_re.search(rx, body, _re_re.I): fails.append(f"should not have /{rx}/")
+    if case.get("near"):
+        want = case["near"]()
+        nums = [int(x.replace(",", "")) for x in _re_re.findall(r"\b\d[\d,]*\b", body)]
+        if not any(abs(n - want) <= max(3, want * 0.05) for n in nums): fails.append(f"no number near {want}")
     if _FZH_RAW.search(body): fails.append("shows a raw field name: " + _FZH_RAW.search(body).group(0))
     if "**" in body: fails.append("uses ** bold")
     if case.get("actions"):
