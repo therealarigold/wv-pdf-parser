@@ -4249,6 +4249,7 @@ IDX2_SURVEY = {
     "CALHOUN": "http://129.71.205.140/IDXSearch/",  # found by Ari (not linked from the county site)
     "RALEIGH": "http://129.71.206.131/",            # needs the office's account (IDX_RALEIGH_USER / _PASS) - probably Raleigh, confirm after login
     "MERCER": "https://inquiry.mercerclerkwv.com/",  # needs the office's account (IDX_MERCER_USER / _PASS)
+    "KANAWHA": "https://kanawhawv.compiled-technologies.com/",  # needs the office's account (IDX_KANAWHA_USER / _PASS)
     # not the IDX product
     "BERKELEY": "https://search.berkeleydeeds.com/NameSearch.php", "PUTNAM": "https://recordhub.cottsystems.com/PutnamWV",
     "TUCKER": "https://us5.courthousecomputersystems.com/TuckerWV/", "WETZEL": "http://www.wetzelcountywv.us/WEBInquiry/Default.aspx",
