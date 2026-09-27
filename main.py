@@ -4413,7 +4413,7 @@ def _idx2_read_doc(kind, images):
 
 
 _IDX2_P = "#CallFormPanel_contentSplitter_CallToolPanel_"
-_IDX2_MODES = {0: "Individual", 2: "Book & Page"}
+_IDX2_MODES = {0: "Individual", 1: "Firm", 2: "Book & Page"}
 
 
 def _idx2_open(pg, county, url):
@@ -4479,6 +4479,20 @@ def _idx2_search(pg, mode, fields, enter_in):
 def _idx2_bp(s):
     m = _re_re.match(r"\s*(\w+)\s*@\s*(\w+)", s or "")
     return (m.group(1).lstrip("0"), m.group(2).lstrip("0")) if m else (None, None)
+
+
+_FIRM_TAIL = {"LLC", "L", "C", "INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY", "LTD", "LIMITED", "LP", "LLP", "PLLC", "PC", "THE", "OF"}
+
+
+def _idx2_firm_core(name):
+    w = _re_re.sub(r"[^A-Z0-9& ]", " ", (name or "").upper().replace(".", "")).split()
+    return " ".join(x for x in w if x not in _FIRM_TAIL)
+
+
+def _idx2_same_firm(row_name, core):
+    """Same company: the core words match (the index often cuts long names short)."""
+    r = _idx2_firm_core(row_name)
+    return bool(r and core) and (r == core or (len(r) >= 8 and core.startswith(r)))   # the index cut it short; never a longer, different name
 
 
 def _idx2_same_person(row_name, last, first):
@@ -4602,7 +4616,10 @@ def _idx2_name(s):
     return (n[0], n[1]) if len(n) >= 2 else (None, None)
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=14, middle=None):
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=14, middle=None, firm=None):
+    """firm: a company owner - searched in the index's Firm mode; last/first are ignored."""
+    core = _idx2_firm_core(firm) if firm else ""
+    if firm: last, first = core, ""
     last, first = last.upper().strip(), first.upper().strip()
     mid = (middle or "").upper().strip()[:1]
     url = IDX2_URLS[county]
@@ -4631,8 +4648,12 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 seen_people[(l, f)] = [r for r in _idx2_search(pg, 0, {"txtLname": l, "txtFname": f, "txtMname": ""}, "txtFname") if _idx2_same_person(r["name"], l, f)]
             return seen_people[(l, f)]
 
-        rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
-        mine = [r for r in rows if _idx2_same_person(r["name"], last, first)]
+        if firm:
+            rows = _idx2_search(pg, 1, {"txtFirm": core}, "txtFirm")
+            mine = [r for r in rows if _idx2_same_firm(r["name"], core)]
+        else:
+            rows = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
+            mine = [r for r in rows if _idx2_same_person(r["name"], last, first)]
         if mid:   # WRIGHT HARRY R is not WRIGHT HARRY F (names with no middle are kept)
             def _mid_ok(name):
                 w = [x for x in _re_re.sub(r"[^A-Z ]", " ", (name or "").upper()).split()[2:] if x not in _FZ_NAME_TAIL]
@@ -4749,7 +4770,8 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                     if x in keep: keep.remove(x); skip.append(x)
             return keep, skip
         # the owner: personal debts any time; mortgages / property liens only on this property, since they bought it
-        own_from = _idx2_day(chain[0]["date"]) if chain and _idx2_same_person(chain[0]["grantee"], last, first) else (bought or None)
+        own_ok = chain and (_idx2_same_firm(chain[0]["grantee"], core) if firm else _idx2_same_person(chain[0]["grantee"], last, first))
+        own_from = _idx2_day(chain[0]["date"]) if own_ok else (bought or None)
         out_debts, skipped_debts = settle(*_idx2_relevant(out_debts, prop_words, owned_from=own_from))
         # prior owners (up to 3): only what was recorded before they sold
         prior_owners = []
@@ -4900,13 +4922,20 @@ def fernando_work_one():
             if county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
             else: raise ValueError("no IDX address for " + county)
         last, first, note = fernando_owner_name(run.get("owner"))
-        if not last:
+        firm = None
+        if not last and note.startswith("company owner"):
+            # company owner: the index's Firm search (first line of the owner, without "ET AL" etc.)
+            firm = _re_re.split(r"\s+ET\s*ALS?\b|\n", (run.get("owner") or "").upper())[0].strip()
+            note = "company owner - searched as a company (Firm) in the county index; company records (registered agent, officers) are not searched automatically"
+        if not last and not firm:
             _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "skipped", "p_reason": note})
             return True
-        rep = idx2_owner_report(county, last, first, run.get("book"), run.get("page"), desc=run.get("descr"), middle=fernando_owner_middle(run.get("owner")))
+        rep = idx2_owner_report(county, last or "", first or "", run.get("book"), run.get("page"), desc=run.get("descr"),
+                                middle=None if firm else fernando_owner_middle(run.get("owner")), firm=firm)
         rep["owner_note"] = note
-        rep["searched_as"] = f"{last} {first}"
-        if fernando_needs_heirs(run.get("owner"), rep):
+        rep["searched_as"] = firm or f"{last} {first}"
+        if firm: rep["company"] = {"name": firm, "core": _idx2_firm_core(firm)}
+        if not firm and fernando_needs_heirs(run.get("owner"), rep):
             try:
                 rep["heirs"] = fernando_heirs(county, cert, run.get("owner"), run.get("descr"), rep, log=lambda m: print(m, flush=True))
             except Exception as e:
