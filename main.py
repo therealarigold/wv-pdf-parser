@@ -6032,7 +6032,16 @@ def fz_harness_loop():
     while True:
         try:
             run = _fz_rpc("fz_harness_claim", {})
-            if run: fz_harness_run(run)
+            if run:
+                try:
+                    fz_harness_run(run)
+                except Exception as e:
+                    body = ""
+                    try: body = e.read().decode("utf-8", "replace")[:300]
+                    except Exception: pass
+                    print(f"[harness] run {run.get('id')} failed: {e} {body}", flush=True)
+                    _fz_rpc("fz_harness_save", {"p_id": run["id"], "p": {"passed": 0, "failed": 0, "cost_usd": 0,
+                                                                          "results": [{"error": f"{e} {body}"[:500]}]}})
         except Exception as e:
             print(f"[harness] {e}", flush=True)
         _t.sleep(60)
