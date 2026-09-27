@@ -4347,13 +4347,14 @@ def _idx2_pages(ctx, base_url, image_id, want=2):
 _IDX2_ASK = {
     "debt": ("a recorded deed of trust, mortgage, lien or judgment", {
         "lender_or_creditor": "string", "lender_address": "string", "trustee": "string", "trustee_address": "string",
-        "borrowers": "array", "amount": "string", "loan_number": "string", "property_address": "string", "tax_ids": "array"}),
+        "borrowers": "array", "amount": "string", "loan_number": "string", "property_address": "string", "tax_ids": "array",
+        "legal_description_short": "string", "prior_deed_reference": "string"}),
     "will": ("a recorded will or estate paper", {
         "deceased": "string", "will_date": "string", "executor": "string", "executor_address": "string",
         "beneficiaries": "array", "real_estate_mentioned": "string"}),
     "deed": ("a recorded deed", {
         "grantors": "array", "grantees": "array", "grantee_mailing_address": "string", "property_address": "string",
-        "legal_description_short": "string", "prior_deed_reference": "string", "consideration": "string"}),
+        "legal_description_short": "string", "prior_deed_reference": "string", "consideration": "string", "tax_ids": "array"}),
 }
 
 
@@ -4390,7 +4391,8 @@ def _idx2_read_doc(kind, images):
         "watermark marks an unofficial copy; ignore it). Fill in each field exactly as written on the pages, "
         "including full mailing addresses with ZIP codes. Leave a field empty when it is not on these pages - "
         "do not guess. prior_deed_reference = the 'being the same property conveyed by ... in Deed Book X page Y' "
-        "clause, if present."})
+        "clause (for a deed of trust: the deed that gave the borrower the property, often in the exhibit), if present. "
+        "tax_ids = tax map / parcel numbers as written."})
     import anthropic
     client = anthropic.Anthropic(api_key=key)
     msg = client.messages.create(
@@ -4516,6 +4518,34 @@ def _idx2_debt_kind(x):
     return "personal"
 
 
+def _idx2_addr(a):
+    """'1508 Seventh Street, Moundsville' -> ('1508', 'SEVENTH') - house number + first street word."""
+    m = _re_re.search(r"\b(\d{1,6})\s+([A-Z][A-Z0-9']*)", (a or "").upper())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _idx2_nums(ids):
+    return set(_re_re.sub(r"[^0-9A-Z]", "", str(x).upper()) for x in (ids or []) if str(x).strip())
+
+
+def _idx2_match_read(rd, prof):
+    """Is the document read from the images about the property in the profile? 'yes' / 'no' / None (can't tell) + why."""
+    if not rd or rd.get("error"): return None, ""
+    ref = _re_re.search(r"Book\s+(?:No\.?\s*)?(\d+)\s*,?\s*(?:at\s+)?Page\s+(?:No\.?\s*)?(\d+)", rd.get("prior_deed_reference") or "", _re_re.I)
+    if ref and (ref.group(1).lstrip("0"), ref.group(2).lstrip("0")) in prof.get("deeds", set()):
+        return "yes", f"it names the deed {ref.group(1)}/{ref.group(2)}"
+    a, b = _idx2_addr(rd.get("property_address")), prof.get("addr")
+    if a and b:
+        if a == b: return "yes", f"same address {rd.get('property_address')}"
+        if a[0] != b[0]: return "no", f"address {rd.get('property_address')}"     # same number, street spelled differently: keep looking
+    t = _idx2_nums(rd.get("tax_ids")) & prof.get("tax", set())
+    if t: return "yes", "same tax map / parcel " + ", ".join(sorted(t))
+    lw = _idx2_words(rd.get("legal_description_short"))
+    if len(lw & prof.get("legal", set())) >= 3: return "yes", "legal description matches"
+    if ref and prof.get("deeds"): return "no", f"it names another deed ({ref.group(1)}/{ref.group(2)})"
+    return None, ""
+
+
 def _idx2_relevant(debts, prop_words, owned_from=None, owned_until=None, prior=False):
     """Split one person's debts into (count, skipped) by Ari's rules. owned_from / owned_until: YYYYMMDD of their purchase / sale."""
     keep, skip = [], []
@@ -4572,7 +4602,7 @@ def _idx2_name(s):
     return (n[0], n[1]) if len(n) >= 2 else (None, None)
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=8, middle=None):
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=14, middle=None):
     last, first = last.upper().strip(), first.upper().strip()
     mid = (middle or "").upper().strip()[:1]
     url = IDX2_URLS[county]
@@ -4697,9 +4727,30 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         other_sales = [{"name": r["other"], "date": r["date"], "bookpage": r["bookpage"], "type": r["doc"], "desc": r["desc"]}
                        for r in later if r not in sales][:8]
         for c in chain: prop_words |= _idx2_words(c.get("desc")) if c.get("date") else set()
+        # 🏠 the property's profile, read from the owner's deed - every mortgage / lien is compared with it
+        rd0 = (chain[0].get("read") or {}) if chain else {}
+        profile = {"from_deed": chain[0]["bookpage"] if chain else "", "address": rd0.get("property_address") or "",
+                   "legal": rd0.get("legal_description_short") or "", "tax_ids": rd0.get("tax_ids") or [], "description": desc or ""}
+        prof = {"deeds": set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")), "addr": _idx2_addr(profile["address"]),
+                "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words}
+
+        def settle(keep, skip):
+            """Read the open mortgages / property liens the index could not place, and decide by what they say."""
+            for x in list(keep) + list(skip):
+                if x.get("kind") not in ("mortgage", "property") or x.get("released"): continue
+                unsure = x.get("check") or (x in skip and x.get("why") == "description is another property")
+                if not unsure: continue
+                verdict, why = _idx2_match_read(read_item("debt", x) or {}, prof)
+                if verdict == "yes":
+                    x["why"], x["check"] = "on this property - " + why, False
+                    if x in skip: skip.remove(x); keep.append(x)
+                elif verdict == "no":
+                    x["why"] = "another property - " + why; x.pop("check", None)
+                    if x in keep: keep.remove(x); skip.append(x)
+            return keep, skip
         # the owner: personal debts any time; mortgages / property liens only on this property, since they bought it
         own_from = _idx2_day(chain[0]["date"]) if chain and _idx2_same_person(chain[0]["grantee"], last, first) else (bought or None)
-        out_debts, skipped_debts = _idx2_relevant(out_debts, prop_words, owned_from=own_from)
+        out_debts, skipped_debts = settle(*_idx2_relevant(out_debts, prop_words, owned_from=own_from))
         # prior owners (up to 3): only what was recorded before they sold
         prior_owners = []
         for i, c in enumerate(chain[:3]):
@@ -4711,7 +4762,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             nxt = chain[i + 1] if i + 1 < len(chain) else None
             frm = _idx2_day(nxt["date"]) if nxt and nxt.get("date") else None
             try:
-                keep, skip = _idx2_relevant(_idx2_debts(person(pl, pf)), prop_words, owned_from=frm, owned_until=_idx2_day(c["date"]), prior=True)
+                keep, skip = settle(*_idx2_relevant(_idx2_debts(person(pl, pf)), prop_words, owned_from=frm, owned_until=_idx2_day(c["date"]), prior=True))
             except Exception as e:
                 keep, skip = [], []
             prior_owners.append({"name": who, "owned_from": nxt["date"] if frm else "", "sold": c["date"], "debts": keep, "skipped": len(skip)})
@@ -4721,7 +4772,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"], "type": s["doc"]}
             bl, bf = _idx2_name(s["other"])
             if bl:
-                new_owner["debts"], _ = _idx2_relevant(_idx2_debts(person(bl, bf)), prop_words, owned_from=_idx2_day(s["date"]))
+                new_owner["debts"], _ = settle(*_idx2_relevant(_idx2_debts(person(bl, bf)), prop_words, owned_from=_idx2_day(s["date"])))
                 for x in new_owner["debts"]:
                     if not x["released"]: read_item("debt", x)
         for x in out_debts:
@@ -4731,7 +4782,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 if not x["released"]: read_item("debt", x)
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
                 "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "estate_skipped_old": old_namesakes[:10], "spouses": spouses,
-                "deeds": deeds, "chain": chain, "sold": new_owner, "prior_owners": prior_owners,
+                "deeds": deeds, "chain": chain, "sold": new_owner, "prior_owners": prior_owners, "property": profile,
                 "skipped_debts": [{"type": x["type"], "date": x["date"], "bookpage": x["bookpage"], "creditor": x["creditor"], "why": x["why"]} for x in skipped_debts][:20], "other_sales": other_sales, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
