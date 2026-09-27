@@ -2856,6 +2856,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/og-status":
             return self.respond({"status": OG_STATUS})
 
+        if path == "/idx-ping":
+            # Can this server reach a county IDX at all? (Marshall by default) - loads the home page only.
+            import time as _t
+            url = "http://129.71.117.225/"
+            t0 = _t.time()
+            try:
+                req = _re_ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with _re_ur.urlopen(req, timeout=25) as r:
+                    html = r.read(200000).decode("utf-8", "replace")
+                    m = _re_re.search(r"<title[^>]*>(.*?)</title>", html, _re_re.I | _re_re.S)
+                    return self.respond({"reachable": True, "status": r.status, "bytes": len(html),
+                                         "title": (m.group(1).strip() if m else None),
+                                         "has_search_page": "cboKey" in html or "grd" in html,
+                                         "seconds": round(_t.time() - t0, 2)})
+            except Exception as e:
+                return self.respond({"reachable": False, "error": str(e), "seconds": round(_t.time() - t0, 2)})
+
         if path == "/refresh-status":
             # Returns the most recent refresh log entry from Supabase.
             import urllib.request as _ur
