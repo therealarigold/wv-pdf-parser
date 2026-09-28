@@ -5417,6 +5417,20 @@ def _mem_used():
 _FZ_MEM_MAX = int(float(os.environ.get("FERNANDO_MEM_MAX_GB", "1.3")) * 1024 ** 3)
 
 
+_FZ_INFLIGHT = {"msgs": set(), "gmsgs": set(), "runs": {}}
+
+
+def fernando_handback_all(why="restart"):
+    """Render is about to stop this server: give every question / search in progress back to the queue right away."""
+    try:
+        _fz_rpc("fernando_handback", {"p_msg_ids": sorted(_FZ_INFLIGHT["msgs"]), "p_gmsg_ids": sorted(_FZ_INFLIGHT["gmsgs"]),
+                                      "p_runs": [{"county": c, "cert": k} for c, k in _FZ_INFLIGHT["runs"].values()]})
+        print(f"[fernando] {why}: handed back {len(_FZ_INFLIGHT['msgs'])} questions, {len(_FZ_INFLIGHT['gmsgs'])} office questions, "
+              f"{len(_FZ_INFLIGHT['runs'])} searches", flush=True)
+    except Exception as e:
+        print(f"[fernando] hand-back failed: {e}", flush=True)
+
+
 def fernando_work_one():
     if _ai_paused(): return False
     if _mem_used() > _FZ_MEM_MAX:            # each search opens its own browser - wait until memory frees up (no crash)
@@ -5425,6 +5439,7 @@ def fernando_work_one():
     run = _fz_rpc("fernando_claim", {})
     if not run: return False
     county, cert = run["county"], run["cert"]
+    _tid = __import__("threading").get_ident(); _FZ_INFLIGHT["runs"][_tid] = (county, cert)
     _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_read", county, cert
     FERNANDO.setdefault("working", {})[f"{county} {cert}"] = _re_dt.utcnow().isoformat() + "Z"
     try:
@@ -5469,6 +5484,7 @@ def fernando_work_one():
         try: _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "failed", "p_reason": str(e)[:300]})
         except Exception: pass
     finally:
+        _FZ_INFLIGHT["runs"].pop(_tid, None)
         FERNANDO.get("working", {}).pop(f"{county} {cert}", None); FERNANDO["last"] = f"{county} {cert}"
         _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
     return True
@@ -5955,7 +5971,9 @@ def fernando_chat_one():
     job = _fz_rpc("fernando_chat_claim", {})
     if not job: return False
     tag = f"💬 {job['county']} {job['cert']}"
+    _FZ_INFLIGHT["msgs"].add(job["id"])
     if _ai_paused():
+        _FZ_INFLIGHT["msgs"].discard(job["id"])
         _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": FZ_PAUSE_MSG, "p_status": "answered"}); return True
     _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_chat", job["county"], job["cert"]
     FERNANDO.setdefault("working", {})[tag] = _re_dt.utcnow().isoformat() + "Z"
@@ -5980,6 +5998,7 @@ def fernando_chat_one():
         try: _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": str(e)[:300], "p_status": "failed"})
         except Exception: pass
     finally:
+        _FZ_INFLIGHT["msgs"].discard(job["id"])
         FERNANDO.get("working", {}).pop(tag, None)
     return True
 
@@ -6220,6 +6239,7 @@ def fernando_gchat_one():
     job = _fz_rpc("fernando_gchat_claim", {})
     if not job: return False
     mid = job["id"]
+    _FZ_INFLIGHT["gmsgs"].add(mid)
     _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_general", None, f"gchat {mid}"
     def progress(t):
         try: _fz_rpc("fernando_gchat_progress", {"p_id": mid, "p_text": t})
@@ -6276,6 +6296,7 @@ def fernando_gchat_one():
         try: _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": str(e)[:300], "p_status": "failed"})
         except Exception: pass
     finally:
+        _FZ_INFLIGHT["gmsgs"].discard(mid)
         _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
     return True
 
@@ -6992,4 +7013,10 @@ if __name__ == '__main__':
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
         except Exception as _me:
             print(f"[mailer] not started: {_me}", flush=True)
+    import signal as _signal
+    def _on_term(signum, frame):
+        fernando_handback_all("server stopping (SIGTERM)")
+        os._exit(0)
+    try: _signal.signal(_signal.SIGTERM, _on_term)
+    except Exception as _se: print(f"[fernando] no SIGTERM hand-back: {_se}", flush=True)
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
