@@ -4631,6 +4631,76 @@ def _idx2_words(s):
                if len(w) >= 2 and w not in ("DISTRICT", "ADDITIONAL", "AND", "THE", "OF", "PCLS", "PCL", "PARCELS", "PARCEL", "TRCT", "TRACT", "TRACTS", "AC", "LOT", "ADD", "ADDITION", "SUBDIVISION", "SUB"))
 
 
+# Ari 2026-09-28 (Marshall 2025-C-000262): a mineral owner often holds several interests - "1/2 OF 3/10 INT 40A MFRS LEASE 2189
+# WELL 1836" is NOT "1/2 OF 1/5 INT 47A MFRS LEASE2275 WELL 2472" even though they share INT / MFRS / WELL.
+# Lease, well and NRA numbers (and the fraction + acres) identify the interest.
+_MIN_GENERIC = {"INT", "INTEREST", "MFRS", "LEASE", "LSE", "WELL", "WELLS", "OG", "OIL", "GAS", "MIN", "MINERAL", "MINERALS", "ROYALTY",
+                "ROY", "NRA", "LSED", "LEASED", "UNDIVIDED", "UND", "TAX", "DEED", "ACRES", "ACRE"}
+
+
+def _idx2_min_ids(desc):
+    d = (desc or "").upper()
+    ids = {"lease": set(_re_re.findall(r"(?:LEASE|LSE)\s*#?\s*(\d{2,7})\b", d)),
+           "well": set(_re_re.findall(r"WELL\s*#?\s*(\d{2,7})\b", d)),
+           "nra": set(_re_re.findall(r"NRA\s*#?\s*(\d{6,})", d)),
+           "acres": set(x.rstrip("0").rstrip(".") for x in _re_re.findall(r"(?<![\d/])(\d+(?:\.\d+)?)\s*A(?:C|CRES?|\b)", d)),
+           "frac": set(_re_re.sub(r"\s+", " ", x).strip() for x in _re_re.findall(r"((?:\d+/\d+\s*(?:OF\s*)?)+)\s*INT", d))}
+    return ids
+
+
+_LOT_RE = _re_re.compile(r"\b(?:LOTS?|LTS?)\s*(?:NO\.?\s*|#\s*)?((?:\d+[A-Z]?\s*(?:,|&|AND|-|THRU)?\s*)+)")
+_DESC_COMMON = _MIN_GENERIC | {"ST", "STREET", "AVE", "AVENUE", "RD", "ROAD", "DR", "DRIVE", "FT", "SQ", "SQUARE", "BLK", "BL", "BLOCK", "ADN", "CITY",
+    "TOWN", "NO", "PT", "PART", "ALL", "SUR", "SURF", "SURFACE", "FEE", "AS", "ACS", "NEAR", "OR", "IN", "ON", "TO", "AT", "NORTH", "SOUTH",
+    "EAST", "WEST", "CONSIDERATION", "DESCRIPTION", "DESC1", "DESC2", "DESC3", "MAP", "SIDE", "WITH", "FORMERLY", "CERT", "PLAT", "VARIOUS",
+    "CERTAIN", "DEL", "DEED", "TAX", "HOME", "LTS", "LT", "DIST", "CORP", "MUN", "00"}
+
+
+def _idx2_lots(desc):
+    out = set()
+    for m in _LOT_RE.findall((desc or "").upper()):
+        nums = _re_re.findall(r"\d+[A-Z]?", m)
+        if "THRU" in m or ("-" in m and len(nums) == 2 and all(n.isdigit() for n in nums) and int(nums[1]) - int(nums[0]) < 50):
+            a, b = int(_re_re.sub(r"\D", "", nums[0])), int(_re_re.sub(r"\D", "", nums[-1]))
+            out |= set(str(i) for i in range(a, b + 1)) if 0 <= b - a < 50 else set(nums)
+        else:
+            out |= set(nums)
+    return out
+
+
+def _idx2_same_mineral(a, b):
+    """'yes' / 'no' / None: do two descriptions name the same mineral interest / lot?"""
+    x, y = _idx2_min_ids(a), _idx2_min_ids(b)
+    x["lot"], y["lot"] = _idx2_lots(a), _idx2_lots(b)
+    sq = lambda t: set(_re_re.findall(r"\bSQ(?:UARE)?\.?\s*(?:NO\.?\s*)?(\d+)", (t or "").upper()))
+    x["sq"], y["sq"] = sq(a), sq(b)
+    verdict = None
+    if x["sq"] and y["sq"]:
+        if not (x["sq"] & y["sq"]): return "no"
+        if x["lot"] & y["lot"] or not (x["lot"] and y["lot"]): return "yes"
+    for k in ("lease", "well", "nra", "lot"):
+        if x[k] and y[k]:
+            if x[k] & y[k]: return "yes"
+            verdict = "no"
+    if verdict: return verdict
+    if x["acres"] and y["acres"] and x["frac"] and y["frac"]:
+        if x["acres"] & y["acres"] and x["frac"] & y["frac"]: return "yes"
+        if not (x["acres"] & y["acres"]) and not (x["frac"] & y["frac"]): return "no"
+    return None
+
+
+def _idx2_desc_match(a, b, need=2):
+    """Same property by description: mineral numbers decide when both have them; else >= `need` shared non-generic words."""
+    m = _idx2_same_mineral(a, b)
+    if m: return m == "yes"
+    return len((_idx2_words(a) - _DESC_COMMON) & (_idx2_words(b) - _DESC_COMMON)) >= need
+
+
+def _idx2_says_little(desc):
+    """An index description that names no property at all ('Consideration 2,716.38 Additional...', 'District LIBERTY')."""
+    w = [x for x in _idx2_words(_re_re.sub(r"DISTRICT\s+\S+(\s+(DISTRICT|DIST|CORP|MUN))?", " ", (desc or "").upper())) - _DESC_COMMON if not _re_re.fullmatch(r"[\d,.]+", x)]
+    return len(w) < 2
+
+
 def _idx2_day(d):
     m = _re_re.match(r"(\d\d)/(\d\d)/(\d{4})", d or "")
     return m.group(3) + m.group(1) + m.group(2) if m else ""
@@ -4686,7 +4756,7 @@ def _idx2_match_read(rd, prof):
     return None, ""
 
 
-def _idx2_relevant(debts, prop_words, owned_from=None, owned_until=None, prior=False):
+def _idx2_relevant(debts, prop_words, owned_from=None, owned_until=None, prior=False, prop_desc=None):
     """Split one person's debts into (count, skipped) by Ari's rules. owned_from / owned_until: YYYYMMDD of their purchase / sale."""
     keep, skip = [], []
     for x in debts:
@@ -4698,8 +4768,10 @@ def _idx2_relevant(debts, prop_words, owned_from=None, owned_until=None, prior=F
             x["why"] = "personal (follows the person)" + (" - recorded before they sold" if prior else ""); keep.append(x); continue
         if owned_from and day and day < owned_from:
             x["why"] = "before they owned this property - another property"; skip.append(x); continue
-        dw = _idx2_words(x.get("desc"))
-        hit = len(dw & prop_words)
+        if prop_desc and _idx2_same_mineral(x.get("desc"), prop_desc) == "no":
+            x["why"] = "another mineral interest (lease / well differs)"; skip.append(x); continue
+        dw = _idx2_words(x.get("desc")) - _MIN_GENERIC
+        hit = len(dw & (prop_words - _MIN_GENERIC))
         if hit >= 2:
             x["why"] = "on this property"; keep.append(x)
         elif len(dw) >= 2 and len(prop_words) >= 2 and not hit:
@@ -4838,7 +4910,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         if not (book and page):
             buys = [r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"]
             want = _idx2_words(desc or "")
-            sim = sorted([r for r in buys if len(_idx2_words(r["desc"]) & want) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
+            sim = sorted([r for r in buys if _idx2_desc_match(r["desc"], desc or "")], key=lambda r: _idx2_day(r["date"]), reverse=True)
             mineral = bool(_re_re.search(r"O\s*&\s*G|\bOIL\b|\bGAS\b|\bMIN(ERAL)?S?\b|\bCOAL\b", (desc or "").upper()))
             # a mineral interest is rarely the owner's latest purchase - only take a deed whose description matches
             pick = sim or ([] if mineral else sorted(buys, key=lambda r: _idx2_day(r["date"]), reverse=True))
@@ -4907,7 +4979,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 srows = person(sl, sf)
                 want, sold_day = _idx2_words(d["desc"]), _idx2_day(d["date"])
                 buys = [r for r in srows if _idx2_is_deed(r) and r["role"] == "GRANTEE" and _idx2_day(r["date"]) <= sold_day]
-                similar = sorted([r for r in buys if len(_idx2_words(r["desc"]) & want) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
+                similar = sorted([r for r in buys if _idx2_desc_match(r["desc"], d["desc"])], key=lambda r: _idx2_day(r["date"]), reverse=True)
                 if similar:
                     cur, how = similar, "seller's purchase, similar description"; continue
                 # 3. inherited
@@ -4927,16 +4999,21 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         # did the owner already sell it? (a later deed where the owner is the grantor, for this property)
         prop_words = _idx2_words(desc or "") | (_idx2_words(chain[0]["desc"]) if chain else set())
         bought = max([_idx2_day(r["date"]) for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"] or [""])
-        sales = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and _idx2_day(r["date"]) >= bought
-                        and len(_idx2_words(r["desc"]) & prop_words) >= 2], key=lambda r: _idx2_day(r["date"]), reverse=True)
+        other_interest = lambda r: _idx2_same_mineral(r["desc"], desc or "") == "no" or bool(chain and _idx2_same_mineral(r["desc"], chain[0]["desc"]) == "no")
+        sales = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and _idx2_day(r["date"]) >= bought and not other_interest(r)
+                        and (_idx2_same_mineral(r["desc"], desc or "") == "yes" or len((_idx2_words(r["desc"]) - _DESC_COMMON) & (prop_words - _DESC_COMMON)) >= 2)],
+                       key=lambda r: _idx2_day(r["date"]), reverse=True)
         floor = max(bought, str(_re_dt.utcnow().year - 10) + "0101")   # no purchase in the index: only the last 10 years
         forced = _re_re.compile(r"TRUSTEE|SHERIFF|TAX|COMMISSIONER|IN LIEU|FORECLOS|AUDITOR|DEPUTY")
         later = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and _idx2_day(r["date"]) >= floor and r not in sales],
                        key=lambda r: _idx2_day(r["date"]), reverse=True)
         if not sales:
-            sales = [r for r in later if forced.search(r["doc"].upper() + " " + (r["desc"] or "").upper())][:1]
+            # a tax / trustee / sheriff deed counts only when its index description names no property at all - and it is marked "check"
+            sales = [dict(r, _check=True) for r in later if forced.search(r["doc"].upper() + " " + (r["desc"] or "").upper())
+                     and not other_interest(r) and _idx2_says_little(r["desc"])][:1]
+        sold_ids = set(r["bookpage"] for r in sales)
         other_sales = [{"name": r["other"], "date": r["date"], "bookpage": r["bookpage"], "type": r["doc"], "desc": r["desc"]}
-                       for r in later if r not in sales][:8]
+                       for r in later if r["bookpage"] not in sold_ids][:8]
         for c in chain: prop_words |= _idx2_words(c.get("desc")) if c.get("date") else set()
         # 🏠 the property's profile, read from the owner's deed - every mortgage / lien is compared with it
         rd0 = (chain[0].get("read") or {}) if chain else {}
@@ -4962,7 +5039,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         # the owner: personal debts any time; mortgages / property liens only on this property, since they bought it
         own_ok = chain and (_idx2_same_firm(chain[0]["grantee"], core) if firm else _idx2_same_person(chain[0]["grantee"], last, first))
         own_from = _idx2_day(chain[0]["date"]) if own_ok else (bought or None)
-        out_debts, skipped_debts = settle(*_idx2_relevant(out_debts, prop_words, owned_from=own_from))
+        out_debts, skipped_debts = settle(*_idx2_relevant(out_debts, prop_words, owned_from=own_from, prop_desc=desc))
         # prior owners (up to 3): only what was recorded before they sold
         prior_owners = []
         for i, c in enumerate(chain[:3]):
@@ -4974,7 +5051,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             nxt = chain[i + 1] if i + 1 < len(chain) else None
             frm = _idx2_day(nxt["date"]) if nxt and nxt.get("date") else None
             try:
-                keep, skip = settle(*_idx2_relevant(_idx2_debts(person(pl, pf)), prop_words, owned_from=frm, owned_until=_idx2_day(c["date"]), prior=True))
+                keep, skip = settle(*_idx2_relevant(_idx2_debts(person(pl, pf)), prop_words, owned_from=frm, owned_until=_idx2_day(c["date"]), prior=True, prop_desc=desc))
             except Exception as e:
                 keep, skip = [], []
             prior_owners.append({"name": who, "owned_from": nxt["date"] if frm else "", "sold": c["date"], "debts": keep, "skipped": len(skip)})
@@ -4982,9 +5059,11 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         if sales:
             s = sales[0]
             new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"], "type": s["doc"]}
+            if s.get("_check"):
+                new_owner["check"] = "the index description does not say which property - open the deed to confirm it is this one"
             bl, bf = _idx2_name(s["other"])
             if bl:
-                new_owner["debts"], _ = settle(*_idx2_relevant(_idx2_debts(person(bl, bf)), prop_words, owned_from=_idx2_day(s["date"])))
+                new_owner["debts"], _ = settle(*_idx2_relevant(_idx2_debts(person(bl, bf)), prop_words, owned_from=_idx2_day(s["date"]), prop_desc=desc))
                 for x in new_owner["debts"]:
                     if not x["released"]: read_item("debt", x)
         for x in out_debts:
