@@ -4500,6 +4500,49 @@ def _ai_log(msg, feature=None):
         print("[ai-cost] not logged:", str(e)[:200], flush=True)
 
 
+# ⏸ When Anthropic refuses for money (credits used up / monthly spending limit), Fernando PAUSES: searches stay queued (never
+# saved as done without reading), questions get a plain "paused" answer, and every 30 min one tiny test call checks whether
+# the limit was raised - then he goes on by himself.
+class FzPaused(Exception):
+    pass
+
+
+FZ_PAUSE_MSG = ("Fernando is paused (monthly spending limit reached) - an owner can raise the limit in the Anthropic Console "
+                "(Settings > Limits / Billing). He picks up again by himself within 30 minutes; please ask again then.")
+_AI_PAUSE = {"on": False, "until": 0.0, "why": ""}
+_AI_PAUSE_RE = _re_re.compile(r"credit balance is too low|usage limits?|spend(ing)? limit|purchase credits", _re_re.I)
+
+
+def _ai_pause_check(e):
+    """Raise FzPaused when the error is Anthropic refusing for money; otherwise do nothing (caller re-raises)."""
+    if isinstance(e, FzPaused): raise e
+    if _AI_PAUSE_RE.search(str(e)):
+        import time as _t
+        _AI_PAUSE.update(on=True, until=_t.time() + 1800, why=str(e)[:300])
+        print(f"[fernando] ⏸ paused - Anthropic: {str(e)[:200]}", flush=True)
+        raise FzPaused(FZ_PAUSE_MSG) from e
+
+
+def _ai_paused():
+    """True while paused. After 30 min one tiny test call decides (a refused call costs nothing)."""
+    if not _AI_PAUSE["on"]: return False
+    import time as _t
+    if _t.time() < _AI_PAUSE["until"]: return True
+    try:
+        import anthropic
+        anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip()).messages.create(
+            model="claude-haiku-4-5", max_tokens=1, messages=[{"role": "user", "content": "ok"}])
+        _AI_PAUSE.update(on=False, until=0.0, why="")
+        print("[fernando] ▶ Anthropic works again - resuming", flush=True)
+        return False
+    except Exception as e:
+        if _AI_PAUSE_RE.search(str(e)):
+            _AI_PAUSE["until"] = _t.time() + 1800
+            return True
+        _AI_PAUSE.update(on=False, until=0.0)
+        return False
+
+
 def _idx2_read_doc(kind, images):
     """Read scanned pages with Claude; returns the fields asked for (blank when not on the pages)."""
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -4521,12 +4564,11 @@ def _idx2_read_doc(kind, images):
         "tax_ids = tax map / parcel numbers as written."})
     import anthropic
     client = anthropic.Anthropic(api_key=key)
-    msg = client.messages.create(
-        model="claude-opus-5", max_tokens=4000,
-        messages=[{"role": "user", "content": content}],
-        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
-        extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
-                    "fallbacks": "default"})
+    if _ai_paused(): raise FzPaused(FZ_PAUSE_MSG)
+    try:
+        msg = _idx2_read_call(client, content, schema)
+    except Exception as e:
+        _ai_pause_check(e); raise
     _ai_log(msg)
     if getattr(msg, "stop_reason", "") == "refusal":
         return {"error": "declined to read"}
@@ -4536,6 +4578,15 @@ def _idx2_read_doc(kind, images):
     except Exception:
         m = _re_re.search(r"\{.*\}", text, _re_re.S)
         return json.loads(m.group(0)) if m else {"error": "unreadable answer"}
+
+
+def _idx2_read_call(client, content, schema):
+    return client.messages.create(
+        model="claude-opus-5", max_tokens=4000,
+        messages=[{"role": "user", "content": content}],
+        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+        extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+                    "fallbacks": "default"})
 
 
 _IDX2_P = "#CallFormPanel_contentSplitter_CallToolPanel_"
@@ -4907,6 +4958,8 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 item["pages_read"] = len(imgs)
                 item["read"] = _idx2_read_doc(kind, imgs) if imgs else {"error": "no image"}
                 _bank_put(county, "document", item["read"], doc_kind=kind, pages=len(imgs), image_id=str(item["image_id"]), bookpage=item.get("bookpage"))
+            except FzPaused:
+                raise
             except Exception as e:
                 item["read"] = {"error": str(e)[:200]}
             return item["read"]
@@ -4936,6 +4989,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                         entry["old_book"] = "no scanned page in the county's image search"; return
                     reads["n"] += 1
                     try: rd2 = _idx2_read_doc("deed", imgs)
+                    except FzPaused: raise
                     except Exception as e: rd2 = {"error": str(e)[:200]}
                     _bank_put(county, "book", rd2, doc_kind="deed", pages=len(imgs), book_type="DEED BOOK", book=ref[0], page=ref[1])
                 entry.update({"read": rd2, "pages_read": len(imgs), "type": "DEED (old book, read from the scanned page)",
@@ -5319,6 +5373,7 @@ def _fz_rpc(name, args):
 
 
 def fernando_work_one():
+    if _ai_paused(): return False
     run = _fz_rpc("fernando_claim", {})
     if not run: return False
     county, cert = run["county"], run["cert"]
@@ -5348,10 +5403,16 @@ def fernando_work_one():
         elif not firm and fernando_needs_heirs(run.get("owner"), rep):
             try:
                 rep["heirs"] = fernando_heirs(county, cert, run.get("owner"), run.get("descr"), rep, log=lambda m: print(m, flush=True))
+            except FzPaused:
+                raise
             except Exception as e:
                 rep["heirs_error"] = str(e)[:300]
         _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "done", "p_report": rep})
         FERNANDO["done"] += 1
+    except FzPaused:
+        # back in line exactly as it was (never saved as done / failed without reading)
+        try: _fz_rpc("fernando_requeue", {"p_county": county, "p_cert": cert, "p_reason": "waiting: Fernando paused (Anthropic spending limit)"})
+        except Exception: pass
     except Exception as e:
         import traceback; traceback.print_exc()
         try: _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "failed", "p_reason": str(e)[:300]})
@@ -5624,13 +5685,16 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
             if any(getattr(b, "type", "") == "tool_use" for b in m_.content): on_text("")      # it was only a lead-in to a look-up
             elif got: on_text(got)
             return m_
+        if _ai_paused(): raise FzPaused(FZ_PAUSE_MSG)
         try:
             msg = _call(kw)
         except anthropic.BadRequestError as e:
-            if "web_search_20260209" not in str(e): raise
+            if "web_search_20260209" not in str(e): _ai_pause_check(e); raise
             kw["tools"] = [dict(t, type="web_search_20250305") if t.get("name") == "web_search" else t for t in kw.get("tools", [])]
             tools = [dict(t, type="web_search_20250305") if t.get("name") == "web_search" else t for t in tools]
             msg = _call(kw)
+        except Exception as e:
+            _ai_pause_check(e); raise
         _ai_log(msg, feature)
         budget["searches"] = budget.get("searches", 0) + _ai_searches(msg)
         stop = getattr(msg, "stop_reason", "")
@@ -5654,6 +5718,8 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
             if progress: progress(_fz_step_words(u["name"], u.get("input") or {}, sites.home))
             try:
                 out = (tool_fn or _fzc_tool)(sites, u["name"], u.get("input") or {}, budget)
+            except FzPaused:
+                raise
             except Exception as e:
                 out = f"That did not work: {str(e)[:200]}"
             log(f"[{feature}] {tag} {u['name']} {u.get('input')}")
@@ -5810,6 +5876,8 @@ def fernando_chat_one():
     job = _fz_rpc("fernando_chat_claim", {})
     if not job: return False
     tag = f"💬 {job['county']} {job['cert']}"
+    if _ai_paused():
+        _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": FZ_PAUSE_MSG, "p_status": "answered"}); return True
     _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_chat", job["county"], job["cert"]
     FERNANDO.setdefault("working", {})[tag] = _re_dt.utcnow().isoformat() + "Z"
     try:
@@ -5825,6 +5893,9 @@ def fernando_chat_one():
             text = fernando_chat_answer(job, log=lambda m: print(m, flush=True), progress=progress)
             _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered"})
         FERNANDO["chats"] = FERNANDO.get("chats", 0) + 1
+    except FzPaused:
+        try: _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": FZ_PAUSE_MSG, "p_status": "answered"})
+        except Exception: pass
     except Exception as e:
         import traceback; traceback.print_exc()
         try: _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": str(e)[:300], "p_status": "failed"})
@@ -6075,6 +6146,8 @@ def fernando_gchat_one():
         try: _fz_rpc("fernando_gchat_progress", {"p_id": mid, "p_text": t})
         except Exception: pass
     try:
+        if _ai_paused():
+            _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": FZ_PAUSE_MSG, "p_status": "answered"}); return True
         if job.get("over_cap"):
             _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": "Today's Fernando budget is used up - an owner can raise the daily cap, or ask me again tomorrow.", "p_status": "answered"}); return True
         role = "owner" if job.get("owner") else "manager"
@@ -6116,6 +6189,9 @@ def fernando_gchat_one():
         text = out if isinstance(out, str) else "Sorry - I lost my train of thought. Please ask again."
         text = text.replace("**", "").replace("__", "")
         _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": text[:8000], "p_status": "answered", "p_actions": actions or None})
+    except FzPaused:
+        try: _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": FZ_PAUSE_MSG, "p_status": "answered"})
+        except Exception: pass
     except Exception as e:
         import traceback; traceback.print_exc()
         try: _fz_rpc("fernando_gchat_answer", {"p_id": mid, "p_body": str(e)[:300], "p_status": "failed"})
