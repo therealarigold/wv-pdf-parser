@@ -4812,6 +4812,8 @@ def _idx2_match_read(rd, prof):
         m = _idx2_same_mineral(legal, ours) if ours and legal else None
         if m == "yes": return "yes", f"same interest / lot numbers ({legal[:90]})"
         if m == "no": return "no", f"it describes another interest / lot ({legal[:90]})"
+    if _idx2_other_district(legal, prof.get("district")):
+        return "no", f"another district - ours is {prof.get('district')} ({legal[:90]})"
     lw = _idx2_words(legal) - _DESC_COMMON
     if len(lw & (prof.get("legal", set()) - _DESC_COMMON)) >= 3: return "yes", "legal description matches"
     if ref and prof.get("deeds"): return "no", f"it names another deed ({ref.group(1)}/{ref.group(2)})"
@@ -4834,6 +4836,28 @@ _IDX2_BOOK_PREFIX = {"": ["DEED BOOK"], "D": ["DEED BOOK"], "DB": ["DEED BOOK"],
                      "A": ["APPRAISEMENT BOOK"], "AB": ["APPRAISEMENT BOOK"], "S": ["SETTLEMENT BOOK"], "SB": ["SETTLEMENT BOOK"],
                      "O": ["ORDER BOOK"], "OB": ["ORDER BOOK"], "M": ["MISC BOOK"], "MB": ["MISC BOOK"],
                      "F": ["FIDUCIARY BOND", "WILL BOOK"], "FB": ["FIDUCIARY BOND"]}
+
+
+_DIST_SKIP = {"DIST", "DISTRICT", "CORP", "CORPORATION", "CITY", "OF", "TOWN", "MUN", "MUNICIPAL", "INSIDE", "OUTSIDE", "IN", "OUT", "THE",
+              "DESCRIPTION", "CONSIDERATION", "ADDITIONAL", "MAP", "PARCEL", "SUB", "DIVISION", "AND", "LOT", "LOTS", "TAX", "DEED"}
+
+
+def _idx2_districts(text):
+    """District words a paper names: 'District FRANKLIN', 'WALTON DISTRICT', 'MEADE DIST' -> {'FRANKLIN'} ..."""
+    t = (text or "").upper()
+    out = set()
+    for m in _re_re.findall(r"\bDISTRICT\s*:?\s+([A-Z][A-Z .'-]{2,40}?)(?=\s*(?:/|\||ADDITIONAL|MAP|PARCEL|SUB ?DIVISION|CONSIDERATION|DESC|$|\d))", t):
+        out |= set(w for w in _re_re.findall(r"[A-Z]{3,}", m) if w not in _DIST_SKIP)
+    for m in _re_re.findall(r"\b([A-Z]{3,})(?:\s+[A-Z]{3,})?\s+DIST(?:RICT)?\b", t):
+        if m not in _DIST_SKIP: out.add(m)
+    return out
+
+
+def _idx2_other_district(text, district):
+    """True when the paper names a district and none of its words is the certificate's district."""
+    ours = set(w for w in _re_re.findall(r"[A-Z]{3,}", (district or "").upper()) if w not in _DIST_SKIP)
+    theirs = _idx2_districts(text)
+    return bool(ours and theirs and not (ours & theirs))
 
 
 def _idx2_detail(pg, bookpage, doc=None):
@@ -4867,6 +4891,8 @@ def _idx2_match_detail(det, prof):
         m = _idx2_same_mineral(text, ours) if ours and text.strip() else None
         if m == "yes": return "yes", f"index description names the same interest / lot ({text[:120]})"
         if m == "no": return "no", f"index description names another interest / lot ({text[:120]})"
+    if _idx2_other_district(text, prof.get("district")):
+        return "no", f"another district - ours is {prof.get('district')} ({text[:120]})"
     lw = _idx2_words(text) - _DESC_COMMON
     if len(lw & (prof.get("legal", set()) - _DESC_COMMON)) >= 3: return "yes", f"index description matches ({text[:120]})"
     return None, ""
@@ -4930,7 +4956,7 @@ def _idx2_name(s):
     return (n[0], n[1]) if len(n) >= 2 else (None, None)
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=24, middle=None, firm=None):
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=24, middle=None, firm=None, district=None):
     """firm: a company owner - searched in the index's Firm mode; last/first are ignored."""
     core = _idx2_firm_core(firm) if firm else ""
     if firm: last, first = core, ""
@@ -5160,7 +5186,8 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         # did the owner already sell it? (a later deed where the owner is the grantor, for this property)
         prop_words = _idx2_words(desc or "") | (_idx2_words(chain[0]["desc"]) if chain else set())
         bought = max([_idx2_day(r["date"]) for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"] or [""])
-        other_interest = lambda r: _idx2_same_mineral(r["desc"], desc or "") == "no" or bool(chain and _idx2_same_mineral(r["desc"], chain[0]["desc"]) == "no")
+        other_interest = lambda r: (_idx2_same_mineral(r["desc"], desc or "") == "no" or bool(chain and _idx2_same_mineral(r["desc"], chain[0]["desc"]) == "no")
+                                    or (_idx2_same_mineral(r["desc"], desc or "") != "yes" and _idx2_other_district(r["desc"], district)))
         sales = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and _idx2_day(r["date"]) >= bought and not other_interest(r)
                         and (_idx2_same_mineral(r["desc"], desc or "") == "yes" or len((_idx2_words(r["desc"]) - _DESC_COMMON) & (prop_words - _DESC_COMMON)) >= 2)],
                        key=lambda r: _idx2_day(r["date"]), reverse=True)
@@ -5182,7 +5209,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                    "legal": rd0.get("legal_description_short") or "", "tax_ids": rd0.get("tax_ids") or [], "description": desc or ""}
         prof = {"deeds": set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")), "addr": _idx2_addr(profile["address"]),
                 "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words,
-                "desc": desc or "", "legal_text": profile["legal"]}
+                "desc": desc or "", "legal_text": profile["legal"], "district": district or ""}
         prof_ref[0] = prof
 
         def settle(keep, skip):
@@ -5393,7 +5420,8 @@ def fernando_work_one():
             _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "skipped", "p_reason": note})
             return True
         rep = idx2_owner_report(county, last or "", first or "", run.get("book"), run.get("page"), desc=run.get("descr"),
-                                middle=None if firm else fernando_owner_middle(run.get("owner")), firm=firm)
+                                middle=None if firm else fernando_owner_middle(run.get("owner")), firm=firm, district=run.get("district"))
+        if run.get("district"): rep["district"] = run["district"]
         rep["owner_note"] = note
         rep["searched_as"] = firm or f"{last} {first}"
         if firm: rep["company"] = {"name": firm, "core": _idx2_firm_core(firm)}
@@ -5402,7 +5430,8 @@ def fernando_work_one():
             rep["heirs"] = dict(old_heirs, reused_from=str(run.get("finished_at") or "")[:10] or "an earlier search")
         elif not firm and fernando_needs_heirs(run.get("owner"), rep):
             try:
-                rep["heirs"] = fernando_heirs(county, cert, run.get("owner"), run.get("descr"), rep, log=lambda m: print(m, flush=True))
+                rep["heirs"] = fernando_heirs(county, cert, run.get("owner"), run.get("descr"), rep, log=lambda m: print(m, flush=True),
+                                              staff_notes=run.get("staff_notes"))
             except FzPaused:
                 raise
             except Exception as e:
@@ -5445,8 +5474,21 @@ they mean from the ticket; if it is truly unclear, ask them one short question b
 
 You can use tools to check the county's computer index and read recorded documents (scanned images). Check before you
 answer when a tool can settle it; say what you checked (document type, book/page, date) so staff can find it. The
-computer index usually starts in the 1970s-1990s; anything older is only in the paper books - say "check the books"
-instead of guessing. You cannot call anyone or see paper books. Never invent a book/page, name, date or amount.
+computer index usually starts in the 1970s-1990s; older papers are in the paper books - open them with old_book_page /
+old_index_book when you can, otherwise say "check the books". You cannot call anyone. Never invent a book/page, name, date or amount.
+
+Lessons from our staff (keep them):
+- The SAME PROPERTY means the same district, acreage / fraction, and lease / well / lot numbers. A deed or tax deed in another
+  district (e.g. Franklin when ours is Meade) or for another acreage (40 A vs 47 A) is NOT ours, even with the owner's name on it.
+  Descriptions can drift a little over the years - then read the paper and compare before deciding.
+- One person can appear under several names: Linda Kay Phillips = Linda K. Phillips = Linda Cox Phillips (a middle name can be
+  a maiden name). When one paper lists the names together, or the address / spouse matches, treat them as the same person.
+- The owner on the TAX TICKET is who we serve first. "SMITH JOHN HEIRS" means trace John Smith's heirs - even if the index
+  shows someone else holding part of it now (then serve both).
+- Mineral interests usually came down through families: follow the wills and APPRAISEMENTS up the line (an appraisement
+  lists the interests, e.g. "1/5 interest in lease 2275"), and say when the true share is smaller than the ticket shows.
+- The old paper books (deed, will, appraisement, settlement, order, misc books) can be opened in the county's Image
+  Search (old_book_page) - W = will book, A = appraisement, S = settlement, O = order, M = misc.
 You can also search the web (obituaries, a company's current address). Give the link for anything you found on the web,
 and say whether it matches our papers (date, town, family names) or is only "possible, not confirmed".
 
@@ -5776,6 +5818,19 @@ Rules (from the office owner):
 6. For every person, record where they live (lives_in: city, state) - obituaries say "Karen Warsinsky of Georgia",
    "Harriet Prager of McMechen" - so staff can find their address. A full street address only when a paper gives one.
 
+Lessons from our staff (keep them):
+- The SAME PROPERTY means the same district, acreage / fraction, and lease / well / lot numbers. A deed or tax deed in another
+  district (e.g. Franklin when ours is Meade) or for another acreage (40 A vs 47 A) is NOT ours, even with the owner's name on it.
+  Descriptions can drift a little over the years - then read the paper and compare before deciding.
+- One person can appear under several names: Linda Kay Phillips = Linda K. Phillips = Linda Cox Phillips (a middle name can be
+  a maiden name). When one paper lists the names together, or the address / spouse matches, treat them as the same person.
+- The owner on the TAX TICKET is who we serve first. "SMITH JOHN HEIRS" means trace John Smith's heirs - even if the index
+  shows someone else holding part of it now (then serve both).
+- Mineral interests usually came down through families: follow the wills and APPRAISEMENTS up the line (an appraisement
+  lists the interests, e.g. "1/5 interest in lease 2275"), and say when the true share is smaller than the ticket shows.
+- The old paper books (deed, will, appraisement, settlement, order, misc books) can be opened in the county's Image
+  Search (old_book_page) - W = will book, A = appraisement, S = settlement, O = order, M = misc.
+
 Use the tools, then call report_heirs once. The summary is for office ladies, plain English, like:
 "Gladys died 8/9/2012 (obituary). Daughters: Harriet Prager (died 2016, will 107/592 - serve her executrix + heirs), Rosetta
 Amsbaugh (on the lease), Karen Warsinsky of Georgia (not on the lease; may be an heir). Check the deed that created Gladys's life estate." """
@@ -5806,11 +5861,13 @@ def fernando_needs_heirs(owner, rep):
     return bool(_FZH_TRIGGER.search((owner or "").upper()) or (rep or {}).get("estate"))
 
 
-def fernando_heirs(county, cert, owner, descr, rep, log=print):
-    small = {k: rep.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "bookpage_check", "sold", "property", "owner_note")}
+def fernando_heirs(county, cert, owner, descr, rep, log=print, staff_notes=None):
+    small = {k: rep.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "bookpage_check", "sold", "property", "owner_note", "district")}
+    told = ("\n\nWHAT OUR STAFF TOLD YOU ON THIS TICKET (they checked the paper books - trust it over your own guesses, "
+            "follow the book/pages they give):\n" + "\n".join(f"- {n.get('by')} ({n.get('on')}): {n.get('said')}" for n in staff_notes)) if staff_notes else ""
     msgs = [{"role": "user", "content":
         f"Certificate {cert}, {county} County, WV. Owner on the tax ticket: {owner}\nProperty on the certificate: {descr or '(no description)'}\n\n"
-        f"Your county-index search of the owner so far:\n{_re_json.dumps(small, ensure_ascii=False)[:30000]}\n\n"
+        f"Your county-index search of the owner so far:\n{_re_json.dumps(small, ensure_ascii=False)[:30000]}{told}\n\n"
         "Trace the heirs and who must be served, then call report_heirs."}]
     sites = _FzcSites(county)
     try:
