@@ -4640,9 +4640,9 @@ _MIN_GENERIC = {"INT", "INTEREST", "MFRS", "LEASE", "LSE", "WELL", "WELLS", "OG"
 
 def _idx2_min_ids(desc):
     d = (desc or "").upper()
-    ids = {"lease": set(_re_re.findall(r"(?:LEASE|LSE)\s*#?\s*(\d{2,7})\b", d)),
-           "well": set(_re_re.findall(r"WELL\s*#?\s*(\d{2,7})\b", d)),
-           "nra": set(_re_re.findall(r"NRA\s*#?\s*(\d{6,})", d)),
+    ids = {"lease": set(_re_re.findall(r"(?:LEASE|LSE)\.?\s*(?:NO\.?|NUMBER|#)?\s*(\d{2,7})\b", d)),
+           "well": set(_re_re.findall(r"WELL\s*(?:NO\.?|NUMBER|#)?\s*(\d{2,7})\b", d)),
+           "nra": set(_re_re.findall(r"NRA\s*(?:NO\.?|NUMBER|#)?\s*(\d{6,})", d)),
            "acres": set(x.rstrip("0").rstrip(".") for x in _re_re.findall(r"(?<![\d/])(\d+(?:\.\d+)?)\s*A(?:C|CRES?|\b)", d)),
            "frac": set(_re_re.sub(r"\s+", " ", x).strip() for x in _re_re.findall(r"((?:\d+/\d+\s*(?:OF\s*)?)+)\s*INT", d))}
     return ids
@@ -4750,8 +4750,13 @@ def _idx2_match_read(rd, prof):
         if a[0] != b[0]: return "no", f"address {rd.get('property_address')}"     # same number, street spelled differently: keep looking
     t = _idx2_nums(rd.get("tax_ids")) & prof.get("tax", set())
     if t: return "yes", "same tax map / parcel " + ", ".join(sorted(t))
-    lw = _idx2_words(rd.get("legal_description_short"))
-    if len(lw & prof.get("legal", set())) >= 3: return "yes", "legal description matches"
+    legal = rd.get("legal_description_short") or ""
+    for ours in (prof.get("desc"), prof.get("legal_text")):
+        m = _idx2_same_mineral(legal, ours) if ours and legal else None
+        if m == "yes": return "yes", f"same interest / lot numbers ({legal[:90]})"
+        if m == "no": return "no", f"it describes another interest / lot ({legal[:90]})"
+    lw = _idx2_words(legal) - _DESC_COMMON
+    if len(lw & (prof.get("legal", set()) - _DESC_COMMON)) >= 3: return "yes", "legal description matches"
     if ref and prof.get("deeds"): return "no", f"it names another deed ({ref.group(1)}/{ref.group(2)})"
     return None, ""
 
@@ -4814,7 +4819,7 @@ def _idx2_name(s):
     return (n[0], n[1]) if len(n) >= 2 else (None, None)
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=14, middle=None, firm=None):
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=20, middle=None, firm=None):
     """firm: a company owner - searched in the index's Firm mode; last/first are ignored."""
     core = _idx2_firm_core(firm) if firm else ""
     if firm: last, first = core, ""
@@ -5020,14 +5025,15 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         profile = {"from_deed": chain[0]["bookpage"] if chain else "", "address": rd0.get("property_address") or "",
                    "legal": rd0.get("legal_description_short") or "", "tax_ids": rd0.get("tax_ids") or [], "description": desc or ""}
         prof = {"deeds": set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")), "addr": _idx2_addr(profile["address"]),
-                "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words}
+                "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words,
+                "desc": desc or "", "legal_text": profile["legal"]}
 
         def settle(keep, skip):
-            """Read the open mortgages / property liens the index could not place, and decide by what they say."""
+            """Ari: read every open mortgage / property lien and decide by what the document itself says (the index line is not enough).
+            Only the ones skipped by DATE (before they owned it / after they sold) are not read."""
             for x in list(keep) + list(skip):
                 if x.get("kind") not in ("mortgage", "property") or x.get("released"): continue
-                unsure = x.get("check") or (x in skip and x.get("why") == "description is another property")
-                if not unsure: continue
+                if (x.get("why") or "").startswith(("before they owned", "recorded after")): continue
                 verdict, why = _idx2_match_read(read_item("debt", x) or {}, prof)
                 if verdict == "yes":
                     x["why"], x["check"] = "on this property - " + why, False
@@ -5036,6 +5042,28 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                     x["why"] = "another property - " + why; x.pop("check", None)
                     if x in keep: keep.remove(x); skip.append(x)
             return keep, skip
+        # 🔎 Ari (2026-09-28): never say "sold" from the index line - open each candidate deed and check it is about THIS property
+        # (the Robertson / Armstrong tax deed was another interest: 3/10 of 40 A, lease 2189 - not 1/5 of 47 A, lease 2275)
+        seen_bp, cands = set(), []
+        for r in list(sales) + [x for x in later if not other_interest(x)] + [x for x in later if other_interest(x)]:
+            if r["bookpage"] in seen_bp: continue
+            seen_bp.add(r["bookpage"]); cands.append(r)
+        chosen, sale_checks = None, []
+        for r in cands[:4]:
+            item = {"image_id": r.get("image_id"), "bookpage": r["bookpage"]}
+            verdict, why = _idx2_match_read(read_item("deed", item) or {}, prof)
+            sale_checks.append({"bookpage": r["bookpage"], "name": r["other"], "date": r["date"], "verdict": verdict or "could not tell",
+                                "why": why or ("no image to read" if not r.get("image_id") else "the deed does not say enough"),
+                                "index_matched": r in sales})
+            if verdict == "yes":
+                chosen = dict(r, _how="read the deed: " + why); break
+        if not chosen:
+            unsure = [r for r, c in zip(cands, sale_checks) if c["verdict"] == "could not tell" and c["index_matched"]]
+            if unsure: chosen = dict(unsure[0], _check=True)
+        sales = [chosen] if chosen else []
+        other_sales = [dict(o, checked=next((c for c in sale_checks if c["bookpage"] == o["bookpage"]), None))
+                       for o in ([{"name": r["other"], "date": r["date"], "bookpage": r["bookpage"], "type": r["doc"], "desc": r["desc"]}
+                                  for r in cands if not chosen or r["bookpage"] != chosen["bookpage"]])][:8]
         # the owner: personal debts any time; mortgages / property liens only on this property, since they bought it
         own_ok = chain and (_idx2_same_firm(chain[0]["grantee"], core) if firm else _idx2_same_person(chain[0]["grantee"], last, first))
         own_from = _idx2_day(chain[0]["date"]) if own_ok else (bought or None)
@@ -5059,8 +5087,9 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         if sales:
             s = sales[0]
             new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"], "type": s["doc"]}
+            if s.get("_how"): new_owner["confirmed"] = s["_how"]
             if s.get("_check"):
-                new_owner["check"] = "the index description does not say which property - open the deed to confirm it is this one"
+                new_owner["check"] = "could not confirm from the deed itself that it is this property - open the deed and compare"
             bl, bf = _idx2_name(s["other"])
             if bl:
                 new_owner["debts"], _ = settle(*_idx2_relevant(_idx2_debts(person(bl, bf)), prop_words, owned_from=_idx2_day(s["date"]), prop_desc=desc))
@@ -5074,7 +5103,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         return {"county": county, "owner": f"{last} {first}", "found": len(mine), "debts": out_debts,
                 "open_debts": [x for x in out_debts if not x["released"]], "estate": estate, "estate_skipped_old": old_namesakes[:10], "spouses": spouses,
                 "deeds": deeds, "chain": chain, "sold": new_owner, "prior_owners": prior_owners, "property": profile,
-                "skipped_debts": [{"type": x["type"], "date": x["date"], "bookpage": x["bookpage"], "creditor": x["creditor"], "why": x["why"]} for x in skipped_debts][:20], "other_sales": other_sales, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
+                "skipped_debts": [{"type": x["type"], "date": x["date"], "bookpage": x["bookpage"], "creditor": x["creditor"], "why": x["why"]} for x in skipped_debts][:20], "other_sales": other_sales, "sale_checks": sale_checks, "owner_deed_found": found_deed, "bookpage_check": bp_check, "other_names_skipped": other_names[:30], "documents_read": reads["n"],
                 "reading": "on" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else "no ANTHROPIC_API_KEY on the server"}
     finally:
         try: browser.close()
