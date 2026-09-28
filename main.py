@@ -5530,6 +5530,9 @@ Lessons from our staff (keep them):
 You can also search the web (obituaries, a company's current address). Give the link for anything you found on the web,
 and say whether it matches our papers (date, town, family names) or is only "possible, not confirmed".
 
+When a staff member TEACHES you something that should hold on other tickets too (a correction of how you work, a rule of
+thumb, how the county's books are organized), call save_lesson with the rule in plain words, and say "Got it - I'll remember
+that." Facts about this one ticket don't need it - the ticket chat already remembers those.
 You only advise: you cannot change the ticket, and you must not say you did. Tell them what to add, fix or remove and why.
 Answer in plain, friendly English, short (a few sentences or a short list), most important thing first. No markdown
 headings or tables; plain text with simple "-" bullets if needed. Sign nothing."""
@@ -5725,6 +5728,9 @@ def _fz_step_words(name, args, county):
     if name == "surplus_estimate": return "💰 Working out the surplus per person…"
     if name == "history": return "🕘 Looking at who changed and opened it…"
     if name == "propose_action": return "✍ Preparing that change for you to confirm…"
+    if name == "save_lesson": return "🎓 Writing that down so I remember it…"
+    if name == "lessons_to_approve": return "🎓 Looking at what staff taught me…"
+    if name == "decide_lesson": return "🎓 Preparing your decision to confirm…"
     if name == "find_person": return f"🔎 Looking for {(args or {}).get('name')} everywhere…"
     if name == "overview": return "📊 Counting it up…"
     return "🤔 Working on it…"
@@ -5808,6 +5814,28 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
     return None if final_tool else "Sorry — this one took too many steps. Please ask a narrower question."
 
 
+# 🎓 Lessons staff teach Fernando (fernando_lesson): owners' apply at once, other staff's after an owner approves.
+_FZ_LESSONS = {"at": 0.0, "text": ""}
+_FZ_SAVE_LESSON = {"name": "save_lesson", "description": "Write down a GENERAL rule a staff member just taught you, so you follow it on every "
+    "ticket from now on (e.g. 'a deed in another district is not our property'). One or two plain sentences, in your own words. "
+    "Not for facts about this one ticket.",
+    "input_schema": {"type": "object", "properties": {"lesson": {"type": "string"}}, "required": ["lesson"]}}
+
+
+def _fz_lessons_text():
+    """The approved lessons, for every prompt (refreshed every 5 minutes)."""
+    import time as _t
+    if _t.time() - _FZ_LESSONS["at"] > 300:
+        try:
+            ls = _fz_rpc("fernando_lessons_active", {}) or []
+            _FZ_LESSONS["text"] = ("\n\nLESSONS OUR OFFICE TAUGHT YOU (always follow them):\n" +
+                                   "\n".join(f"- {x['lesson']} ({x.get('by')}, {x.get('on')})" for x in ls)) if ls else ""
+            _FZ_LESSONS["at"] = _t.time()
+        except Exception:
+            pass
+    return _FZ_LESSONS["text"]
+
+
 def fernando_chat_answer(job, log=print, progress=None):
     """Answer one staff message; returns the reply text."""
     county = job["county"]
@@ -5834,8 +5862,12 @@ def fernando_chat_answer(job, log=print, progress=None):
     msgs = merged
     sites = _FzcSites(county if can_search else None)
     try:
-        return _fz_agent(_FZC_SYSTEM, msgs, (_FZC_TOOLS if can_search else []) + [_FZ_WEB_SEARCH], sites, "fernando_chat",
-                         max_steps=12, log=log, tag=f"{county} {job['cert']}", progress=progress)
+        def tool_fn(sites_, name, args, budget):
+            if name == "save_lesson":
+                return _fz_rpc("fernando_lesson_add", {"p_msg_id": job["id"], "p_lesson": (args or {}).get("lesson") or ""}) or "saved"
+            return _fzc_tool(sites_, name, args, budget)
+        return _fz_agent(_FZC_SYSTEM + _fz_lessons_text(), msgs, (_FZC_TOOLS if can_search else []) + [_FZ_WEB_SEARCH, _FZ_SAVE_LESSON], sites,
+                         "fernando_chat", max_steps=12, log=log, tag=f"{county} {job['cert']}", progress=progress, tool_fn=tool_fn)
     finally:
         sites.close()
 
@@ -5909,7 +5941,7 @@ def fernando_heirs(county, cert, owner, descr, rep, log=print, staff_notes=None)
         "Trace the heirs and who must be served, then call report_heirs."}]
     sites = _FzcSites(county)
     try:
-        return _fz_agent(_FZH_SYSTEM, msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_heirs", final_tool=_FZH_REPORT,
+        return _fz_agent(_FZH_SYSTEM + _fz_lessons_text(), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_heirs", final_tool=_FZH_REPORT,
                          max_steps=16, log=log, tag=f"{county} {cert}", model=_FZH_MODEL, max_searches=8)
     finally:
         sites.close()
@@ -6084,6 +6116,12 @@ _FZG_OWNER_TOOLS = [
      "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "cert": {"type": "string"}}, "required": ["county", "cert"]}},
     {"name": "buyer_spend", "description": "Owners only: certificates bought and known prices per buyer per sale year (competitors' budgets).",
      "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
+    {"name": "lessons_to_approve", "description": "Owners only: what staff tried to teach Fernando that waits for an owner's OK (id, lesson, who, ticket).",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "decide_lesson", "description": "Owners only: prepare the owner's decision on one staff lesson (approve = Fernando follows it from now on, "
+        "reject = he ignores it). The owner confirms with the ✓ button. Use after lessons_to_approve.",
+     "input_schema": {"type": "object", "properties": {"lesson_id": {"type": "integer"}, "decision": {"type": "string", "enum": ["approve", "reject"]},
+                                                       "note": {"type": "string"}}, "required": ["lesson_id", "decision"]}},
 ]
 
 
@@ -6155,6 +6193,19 @@ def _fzg_tool_fn(role, actions=None):
             return _re_json.dumps(_fz_rpc("fz_overview", {"p_what": args.get("what") or "surplus", "p_stage": args.get("stage") or None}), ensure_ascii=False)[:60000]
         if name == "propose_action":
             return _fzg_propose(args, actions)
+        if name == "lessons_to_approve":
+            if role != "owner": return "Only owners (Ari, Anne) decide what Fernando learns."
+            return _re_json.dumps(_fz_rpc("fernando_lessons_pending", {}), ensure_ascii=False)[:20000]
+        if name == "decide_lesson":
+            if role != "owner": return "Only owners (Ari, Anne) decide what Fernando learns."
+            pend = {int(x["id"]): x for x in (_fz_rpc("fernando_lessons_pending", {}) or [])}
+            ls = pend.get(int(args.get("lesson_id") or 0))
+            if not ls: return "That lesson is not waiting any more (already decided?) - call lessons_to_approve again."
+            ok = args.get("decision") == "approve"
+            label = ("Teach Fernando" if ok else "Do NOT teach Fernando") + f" ({ls['by']}'s lesson): \"{ls['lesson'][:200]}\""
+            actions.append({"id": f"a{len(actions) + 1}", "label": label, "kind": "lesson", "target": {"lesson_id": ls["id"]},
+                            "change": {"decision": "approve" if ok else "reject", "note": (args.get("note") or "")[:500], "lesson": ls["lesson"][:300]}})
+            return f"Proposed (the owner will see a ✓ Confirm button): {label}"
         if name == "buyer_spend":
             if role != "owner": return "Only owners can see buyer spending - tell the manager to ask Ari or Anne."
             return _re_json.dumps(_fz_rpc("fz_buyer_spend", {"p_limit": max(5, min(80, int(args.get("limit") or 40)))}), ensure_ascii=False)[:40000]
@@ -6270,7 +6321,7 @@ def fernando_gchat_one():
             except Exception: pass
         sites = _FzcSites(None)
         try:
-            out = _fz_agent(_FZG_SYSTEM, merged, _fzg_tools(role) + [_FZG_GO_LIVE], sites, "fernando_general", max_steps=10,
+            out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text(), merged, _fzg_tools(role) + [_FZG_GO_LIVE], sites, "fernando_general", max_steps=10,
                             progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}",
                             on_text=on_text)
             if isinstance(out, dict) and "__stop__" in out:
@@ -6279,7 +6330,7 @@ def fernando_gchat_one():
                 progress(f"🔎 This needs a live look ({why[:120]}) - about 1-3 min…")
                 sites = _FzcSites(_re_re.sub(r"\s*COUNTY\s*$", "", (county or "").upper().strip()) or None)
                 live = [t for t in _FZC_TOOLS if t["name"] != "search_bank"] + [_FZ_WEB_SEARCH]
-                out = _fz_agent(_FZG_SYSTEM + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
+                out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text() + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
                                 merged + [{"role": "assistant", "content": f"(I need a live look: {why})"}, {"role": "user", "content": "Go ahead."}],
                                 _fzg_tools(role) + live, sites, "fernando_general", max_steps=14, progress=progress,
                                 model="claude-opus-5", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}", on_text=on_text)
