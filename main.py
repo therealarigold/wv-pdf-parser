@@ -5077,6 +5077,10 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                     if prow:
                         cur, how = prow, "named in the deed text"; continue
                     if len(chain) < 6 or not far_enough(d["date"]): old_chain(ref, rd.get("prior_deed_reference"))
+                    else:   # 30+ years reached: still write down the older deed it names, for staff (not opened)
+                        chain.append({"date": "", "type": "older deed named in the deed text (not opened - 30+ years reached)",
+                                      "bookpage": f"{ref[0]} @ {ref[1]}", "grantor": "", "grantee": "", "desc": rd.get("prior_deed_reference") or "",
+                                      "found_by": "named in the deed text"})
                     break
                 # 2. the seller's own purchase with a similar description
                 srows = person(sl, sf)
