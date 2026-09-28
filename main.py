@@ -6059,6 +6059,9 @@ already done above) actually came back empty - and then say what you searched an
 Start with ONE short sentence that answers the question directly (it may be read aloud), then the details. Never show raw
 field names (paid_us, owes_us, liens_found_on_property_still_open...) - say it in words. "Owes us" (our $500 per lien) and
 "liens found on the property" are different things - never mix them.
+When someone TEACHES you something that should hold from now on (how to read a deed, a legal rule, how the office works),
+call save_lesson with the rule in plain words, then say "Got it - I'll remember that." NEVER say you will remember or apply
+something "going forward" unless save_lesson said it was saved - without it you forget when the conversation ends.
 Plain text only: no ** bold, no tables. When staff ask to OPEN something, give the full link on its own line:
   title search: https://portal.annelabes.com/attorney.html#ts=<ticket_id>
   surplus case: https://portal.annelabes.com/surplus.html#case=<surplus id>
@@ -6320,9 +6323,16 @@ def fernando_gchat_one():
             try: _fz_rpc("fernando_gchat_stream", {"p_id": mid, "p_body": (t or "").replace("**", "")})
             except Exception: pass
         sites = _FzcSites(None)
+        _tf = _fzg_tool_fn(role, actions)
+        def tool_fn(sites_, name, args, budget):
+            if name == "save_lesson":
+                return _fz_rpc("fernando_lesson_add_g", {"p_gmsg_id": mid, "p_lesson": (args or {}).get("lesson") or ""}) or "saved"
+            return _tf(sites_, name, args, budget)
         try:
-            out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text(), merged, _fzg_tools(role) + [_FZG_GO_LIVE], sites, "fernando_general", max_steps=10,
-                            progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}",
+            # a COPY of the conversation: when he stops for a live look, his unanswered go_live call must not stay in it
+            # (that broke Anne's "yep go ahead" 9/28: "tool_use ids were found without tool_result")
+            out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text(), list(merged), _fzg_tools(role) + [_FZG_GO_LIVE, _FZ_SAVE_LESSON], sites, "fernando_general", max_steps=10,
+                            progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=tool_fn, tag=f"gchat {mid}",
                             on_text=on_text)
             if isinstance(out, dict) and "__stop__" in out:
                 why = (out["__stop__"] or {}).get("reason") or "a live county search"
@@ -6332,8 +6342,8 @@ def fernando_gchat_one():
                 live = [t for t in _FZC_TOOLS if t["name"] != "search_bank"] + [_FZ_WEB_SEARCH]
                 out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text() + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
                                 merged + [{"role": "assistant", "content": f"(I need a live look: {why})"}, {"role": "user", "content": "Go ahead."}],
-                                _fzg_tools(role) + live, sites, "fernando_general", max_steps=14, progress=progress,
-                                model="claude-opus-5", tool_fn=_fzg_tool_fn(role, actions), tag=f"gchat {mid}", on_text=on_text)
+                                _fzg_tools(role) + live + [_FZ_SAVE_LESSON], sites, "fernando_general", max_steps=14, progress=progress,
+                                model="claude-opus-5", tool_fn=tool_fn, tag=f"gchat {mid}", on_text=on_text)
         finally:
             sites.close()
         text = out if isinstance(out, str) else "Sorry - I lost my train of thought. Please ask again."
