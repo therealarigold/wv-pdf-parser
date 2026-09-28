@@ -4919,7 +4919,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         def old_chain(ref, said, steps=8):
             """Older than the computer index: open the deed book page itself (Image Search), read it, and follow its own
             'being the same property ... Book X Page Y' back, up to `steps` deeds."""
-            for _ in range(steps):
+            for n_old in range(steps):
                 entry = {"date": "", "type": "DEED (older than the computer index)", "bookpage": f"{ref[0]} @ {ref[1]}",
                          "grantor": "", "grantee": "", "desc": said, "found_by": "named in the deed text"}
                 chain.append(entry)
@@ -4945,7 +4945,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 if not m2: return
                 nref = (m2.group(1).lstrip("0"), m2.group(2).lstrip("0"))
                 if nref == ref: return
-                if far_enough(entry.get("date")): return          # 30 years back - enough
+                if n_old >= 3 and far_enough(entry.get("date")): return    # at least 4 old deeds (as before), and until 30 years
                 ref, said = nref, rd2.get("prior_deed_reference")
 
         details = {}
@@ -5059,7 +5059,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             seen = set()
             for step in range(12):                                # until 30 years back (12 deeds at most)
                 if not cur: break
-                if chain and far_enough(chain[-1].get("date")): break
+                if len(chain) >= 6 and far_enough(chain[-1].get("date")): break   # at least 6 deeds back (as before), and until 30 years
                 d = cur[0]
                 entry = {"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d["other"], "grantee": d["name"],
                          "desc": d["desc"], "image_id": d.get("image_id") or None, "found_by": how}
@@ -5076,7 +5076,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                             if _idx2_bp(r["bookpage"]) == ref and _idx2_is_deed(r) and r["role"] == "GRANTEE"]
                     if prow:
                         cur, how = prow, "named in the deed text"; continue
-                    if not far_enough(d["date"]): old_chain(ref, rd.get("prior_deed_reference"))
+                    if len(chain) < 6 or not far_enough(d["date"]): old_chain(ref, rd.get("prior_deed_reference"))
                     break
                 # 2. the seller's own purchase with a similar description
                 srows = person(sl, sf)
