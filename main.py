@@ -5727,7 +5727,7 @@ _FZH_REPORT = {"name": "report_heirs", "description": "Your finished heir tracin
         "check": {"type": "array", "items": {"type": "string"}, "description": "things staff should still look up"}},
         "required": ["summary", "people"]}}
 
-_FZH_MODEL = os.environ.get("FERNANDO_HEIRS_MODEL", "claude-sonnet-5")
+_FZH_MODEL = os.environ.get("FERNANDO_HEIRS_MODEL", "claude-opus-5-5")
 _FZH_TRIGGER = _re_re.compile(r"\bET\s*ALS?\b|\bETALS?\b|\bHEIRS?\b|\bEST(ATE)?\b|\bDEC(D|EASED)?\b|\bLIFE\b|\bL/E\b|\bTENANT\b")
 
 
