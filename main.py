@@ -6568,8 +6568,10 @@ deeds back), debts (open mortgages / liens / judgments that must be served), peo
 right = matches, partly = some, wrong = missed or wrong, n/a = nothing to compare.
 missed = what staff had that Fernando lacked (short, with book/page). extra = what Fernando had that staff did not keep
 (and whether staff may have missed it). why = one or two plain sentences on the main reason for the differences.
-lessons = 0-2 GENERAL rules a junior should learn from this (only if clearly supported; not about this one ticket).
-county_notes = 0-2 habits of THIS county's records you can see (where papers are filed, how books are named, index quirks).
+lessons = AT MOST 1 general rule a junior should learn from this - only when he made a real mistake that would repeat on
+other tickets, and only if it is not already in the LESSONS HE ALREADY HAS below. Usually none.
+county_notes = AT MOST 1 habit of THIS county's records (where papers are filed, how books are named, index quirks) - only if
+new and useful, not already in his lessons. Usually none.
 cases = exactly 1 short case for his memory: kind (mineral / surface / company / estate / ...), situation (what the
 ticket looked like: property, owner status, what made it hard), lesson (what the finished ticket shows, what to do next
 time). Plain English, no names of staff."""
@@ -6599,7 +6601,10 @@ def fernando_grade_one():
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
-        body = (f"Certificate {cert}, {county} County. Tax-ticket owner: {job.get('owner')}. Property: {job.get('descr')}\n\n"
+        known = _fz_lessons_text() or "\n\n(no lessons yet)"
+        pend = "; ".join(x.get("lesson", "")[:160] for x in (_fz_rpc("fernando_lessons_pending", {}) or [])[:60])
+        body = (f"LESSONS HE ALREADY HAS:{known}\nALREADY SUGGESTED (do not repeat): {pend}\n\n"
+                f"Certificate {cert}, {county} County. Tax-ticket owner: {job.get('owner')}. Property: {job.get('descr')}\n\n"
                 f"(A) STAFF'S FINISHED TICKET:\n{_re_json.dumps(_fz_trim_ticket(t), ensure_ascii=False)[:40000]}\n\n"
                 f"(B) FERNANDO'S SEARCH:\n{_re_json.dumps(_fz_trim_report(job.get('report') or {}), ensure_ascii=False)[:40000]}")
         try:
