@@ -21,7 +21,7 @@ Render environment:
   ENG_FROM         — default "Marci at Anne Labes, Esq. <marci@annelabes.com>"
   ENG_REPLY_TO     — default marci@annelabes.com
 """
-import base64, hashlib, hmac, html, json, os, time, urllib.request, urllib.error
+import base64, hashlib, hmac, html, json, os, re, time, urllib.request, urllib.error
 from datetime import datetime, timezone, timedelta
 
 SB_URL = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
@@ -200,8 +200,9 @@ def make_paylink(job_id, e):
                                       "base_price_money": {"amount": cents, "currency": "USD"}}]},
             "checkout_options": {"redirect_url": e["link"], "ask_for_shipping_address": False},
             "payment_note": f"Anne Labes agreement {e['id']} · bidder {f.get('bidder', '')}"[:500]}
-    if e.get("email"):
-        body["pre_populated_data"] = {"buyer_email": e["email"]}
+    em = (e.get("email") or "").strip().lower()
+    if live and re.match(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$", em):   # Square rejects anything it doesn't like; test mode leaves it out
+        body["pre_populated_data"] = {"buyer_email": em}
     try:
         pl = _square("POST", "/v2/online-checkout/payment-links", body)["payment_link"]
     except urllib.error.HTTPError as ex:
