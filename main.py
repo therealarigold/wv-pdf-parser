@@ -4861,6 +4861,9 @@ def _idx2_districts(text):
 
 def _idx2_other_district(text, district):
     """True when the paper names a district and none of its words is the certificate's district."""
+    # a town's tax district ("HARRISVILLE CORP", "WHEELING CITY") sits inside a magisterial district the deeds name instead
+    # ("Town of Harrisville, Union District") - the report card caught it (Ritchie 145): don't compare those
+    if _re_re.search(r"(CORP|CORPORATION|CITY|TOWN|MUN|MUNICIPAL|VILLAGE)", (district or "").upper()): return False
     ours = set(w for w in _re_re.findall(r"[A-Z]{3,}", (district or "").upper()) if w not in _DIST_SKIP)
     theirs = _idx2_districts(text)
     return bool(ours and theirs and not (ours & theirs))
