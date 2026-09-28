@@ -6839,6 +6839,70 @@ def _fz_cases_text(county, text, n=4):
             "\n".join(f"- [{c.get('county')} {c.get('cert') or ''}, {c.get('kind') or ''}] {c.get('situation')} -> {c.get('lesson')}" for c in cs))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔑 CLIENT PORTAL LOGIN EMAILS (Ari 2026-09-28): welcome after the agreement is paid, "forgot password", and staff invites.
+# The client gets a private one-time link to set-password.html and chooses their own password (stored scrambled).
+# Same Resend account and TEST MODE rule as the agreement emails: until ENG_LIVE=1 every email goes only to ENG_TEST_TO.
+# ─────────────────────────────────────────────────────────────────────────────
+def _client_mail_body(job):
+    import html as _h
+    link = f"https://portal.annelabes.com/set-password.html?t={job['token']}"
+    name = (job.get("name") or "").strip()
+    hi = f"Hello {_h.escape(name)}," if name else "Hello,"
+    if job["kind"] == "welcome":
+        subj = "Your client portal account - Anne Labes, Esq."
+        lead = ("Thank you - your payment was received and our title work has started. You also have a client portal account "
+                "where you can follow your certificates and title searches.")
+        valid = "The link works once and is good for 7 days."
+    else:
+        subj = "Set a new password - Anne Labes, Esq. client portal"
+        lead = "We received a request to set a new password for your client portal account."
+        valid = "The link works once and is good for 2 hours. If you did not ask for this, you can ignore this email."
+    bid = _h.escape(job["bidder"])
+    body = (f"<div style='font-family:Georgia,serif;font-size:15px;color:#1f2937;max-width:560px'>"
+            f"<p>{hi}</p><p>{lead}</p>"
+            f"<p><b>Your username:</b> your bidder number, <b>{bid}</b></p>"
+            f"<p><a href='{link}' style='display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;"
+            f"text-decoration:none;font-weight:bold'>Choose your password</a></p>"
+            f"<p style='font-size:13px;color:#6b7280'>{valid}<br>Then sign in at <a href='https://portal.annelabes.com'>portal.annelabes.com</a>.</p>"
+            f"<p>Thank you,<br>Marci<br>Anne Labes, Esq.</p></div>")
+    return subj, body
+
+
+def client_mail_one():
+    job = _fz_rpc("client_login_next", {})
+    if not job: return False
+    key = os.environ.get("RESEND_API_KEY", "").strip()
+    live = os.environ.get("ENG_LIVE", "").strip() == "1"
+    to = job["email"] if live else (os.environ.get("ENG_TEST_TO", "").strip() or "ari@eqoppa.com")
+    try:
+        if not key: raise RuntimeError("RESEND_API_KEY not set")
+        subj, body = _client_mail_body(job)
+        if not live: subj = f"[TEST for {job['email']}] " + subj
+        req = _re_ur.Request("https://api.resend.com/emails", method="POST",
+                             data=_re_json.dumps({"from": os.environ.get("ENG_FROM", "Marci at Anne Labes, Esq. <marci@annelabes.com>"),
+                                                  "reply_to": os.environ.get("ENG_REPLY_TO", "marci@annelabes.com"),
+                                                  "to": [to], "subject": subj, "html": body}).encode(),
+                             headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                                      "User-Agent": "annelabes-portal/1.0"})
+        with _re_ur.urlopen(req, timeout=30) as r: r.read()
+        _fz_rpc("client_login_done", {"p_id": job["id"], "p_status": "sent"})
+        print(f"[client-mail] {job['kind']} #{job['id']} for bidder {job['bidder']}: sent{'' if live else ' (TEST to ' + to + ')'}", flush=True)
+    except Exception as e:
+        _fz_rpc("client_login_done", {"p_id": job["id"], "p_status": "failed", "p_error": str(e)[:300]})
+        print(f"[client-mail] #{job['id']} failed: {str(e)[:200]}", flush=True)
+    return True
+
+
+def client_mail_loop():
+    import time as _t
+    _t.sleep(60)
+    while True:
+        try: worked = client_mail_one()
+        except Exception as e: print(f"[client-mail] {e}", flush=True); worked = False
+        _t.sleep(5 if worked else 30)
+
+
 def fernando_loop(n=0):
     import time as _t
     _t.sleep(30 + 20 * n)                              # let the server start first; workers start a little apart
@@ -7383,6 +7447,7 @@ if __name__ == '__main__':
         if os.environ.get("SAO_READER", "1") == "1":
             for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP): 1 by day, 2 at night; 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
+        _og_threading.Thread(target=client_mail_loop, daemon=True).start()        # 🔑 client portal login emails
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
