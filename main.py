@@ -6552,6 +6552,10 @@ class SaoHttp:
         except urllib.error.HTTPError as e:
             if e.code in (403, 429, 503): raise SaoBlocked(f"HTTP {e.code}")
             raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if "timed out" in str(e).lower() or isinstance(e, TimeoutError):
+                raise SaoBlocked(f"site not answering (timed out)")
+            raise
         took = round(__import__("time").time() - t0, 2)
         SAO.setdefault("resp", []).append(took); SAO["resp"] = SAO["resp"][-200:]
         # the site slowing right down is pushback too: 3 answers in a row slower than 25 s -> everyone pauses
@@ -6663,6 +6667,7 @@ def sao_loop(n=0):
     and the pushback is listed in /sao-status - never worked around."""
     import time as _t
     _t.sleep(90 + 7 * n)
+    SAO.setdefault("careful", 20)                          # after a restart: start slow; the first sign of pushback pauses
     site, done_here = SaoHttp(), 0
     while True:
         try:
@@ -6685,22 +6690,31 @@ def sao_loop(n=0):
             try:
                 res = sao_read_cert(site, job)
             except SaoBlocked as e:
-                slow = "slow" in str(e)
-                if slow and not SAO.get("slow_last_cert"):
+                slow = "slow" in str(e) or "timed out" in str(e)
+                if slow and not SAO.get("slow_last_cert") and not SAO.get("careful"):
                     # some certificates make the site hang (~50 s answers) while others answer in 1 s: skip this one
                     # (it is tried again later); only a second slow certificate in a row counts as the site pushing back
                     SAO["slow_last_cert"] = True
                     SAO.setdefault("slow_certs", []).append(f"{job['county']} {job['cert']}")
                     res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": "the site hangs on this certificate - tried again later"}
                 else:
-                    SAO["pause_until"] = _t.time() + 1800
+                    SAO["pause_n"] = SAO.get("pause_n", 0) + 1
+                    mins = min(30 * 2 ** (SAO["pause_n"] - 1), 480)
+                    SAO["pause_until"] = _t.time() + mins * 60
+                    SAO["careful"] = 20                                     # then 20 certificates at a slow pace
                     SAO["extra_off_until"] = _t.time() + 12 * 3600          # back to one reader until the next night
-                    SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']}")
-                    print(f"[sao] pushback: {e} - all readers pause 30 min", flush=True)
+                    SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']} - pause {mins} min")
+                    SAO["pushback"] = SAO["pushback"][-30:]
+                    print(f"[sao] pushback: {e} - all readers pause {mins} min", flush=True)
                     res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site pushed back: {e}"}
                     SAO["slow_last_cert"] = False
             except Exception as e:
                 res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": str(e)[:300]}
+            if res.get("status") in ("done", "none"):
+                SAO["slow_last_cert"] = False
+                if SAO.get("careful"):
+                    SAO["careful"] -= 1
+                    if SAO["careful"] <= 0: SAO["pause_n"] = 0              # 20 good ones after a pause: back to normal
             try:
                 _fz_rpc("sao_save", {"p": res})
             except Exception as e:
@@ -6717,7 +6731,7 @@ def sao_loop(n=0):
             SAO["last"] = f"{job['county']} {job['cert']} {res['status']}"
             SAO.setdefault("secs", []).append(round(_t.time() - t0, 1)); SAO["secs"] = SAO["secs"][-100:]
             done_here += 1
-            _t.sleep(1.5)                                          # gentle between certificates
+            _t.sleep(30 if SAO.get("careful") else 1.5)            # gentle between certificates; slow for a while after a pause
         except Exception as e:
             print(f"[sao] {e}", flush=True); _t.sleep(60)
 
