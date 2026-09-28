@@ -4558,10 +4558,11 @@ def _idx2_read_doc(kind, images):
     fields = dict(fields, all_names="array", all_addresses="array")        # for the page bank (Ctrl+F)
     props = {k: ({"type": "array", "items": {"type": "string"}} if t == "array" else {"type": "string"}) for k, t in fields.items()}
     schema = {"type": "object", "properties": props, "required": list(fields), "additionalProperties": False}
-    content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}} for b in images]
+    content = [{"type": "image", "source": {"type": "base64", "media_type": b[0] if isinstance(b, tuple) else "image/jpeg",
+                                            "data": b[1] if isinstance(b, tuple) else b}} for b in images]
     content.append({"type": "text", "text":
-        f"These are the first pages of {what} from a West Virginia county clerk's record room (the 'Stolen Copy' "
-        "watermark marks an unofficial copy; ignore it). Fill in each field exactly as written on the pages, "
+        f"These are the first pages of {what} from a West Virginia county clerk's record room (a 'Stolen Copy' or "
+        "'UNOFFICIAL' watermark marks an unofficial copy; ignore it). Fill in each field exactly as written on the pages, "
         "including full mailing addresses with ZIP codes. Leave a field empty when it is not on these pages - "
         "do not guess. all_names = every person and company named on the pages; all_addresses = every address on them. "
         "transcription (page reads only) = the full text of the pages, line by line, handwriting included (write [illegible] "
@@ -5618,8 +5619,8 @@ _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses
 # ─────────────────────────────────────────────────────────────────────────────
 # 🗂 BANK-ONLY COUNTIES (Putnam 2026-09-28): the county's index (Cott RECORDhub) needs a captcha sign-in, so the server never
 # opens it. The office computer's signed-in Putnam tab collects owners into our bank (idx_doc / idx_party) and answers
-# live requests (idx_live_ask -> idx_live_status). County's written OK: title work only, a normal user's pace, images are
-# PAID - never requested. Fernando: bank first, a live request only for a name the bank lacks (a few per ticket).
+# live requests (idx_live_ask -> idx_live_status). County's written OK: title work only, a normal user's pace. Pictures: viewing
+# is included in the subscription (Ari 2026-09-28) - the window fetches the viewer's pages (kind 'image'); copies are never bought. Fernando: bank first, a live request only for a name the bank lacks (a few per ticket).
 # ─────────────────────────────────────────────────────────────────────────────
 BANK_COUNTIES = {"PUTNAM"}
 _BANK_LIVE_WAIT = 180
@@ -5647,6 +5648,60 @@ def bank_owner_rows(county, last, first="", live=True, note=None):
         note.append(f"{county.title()} search for {term} is queued - the office computer's {county.title()} session may be signed out "
                     f"(the search runs when someone signs in there).")
     return rows
+
+
+_BANK_IMAGE_WAIT = 600
+_BANK_MAX_READS = 8
+
+
+def bank_image(county, bookpage, note=None):
+    """The viewer's page images of one paper (book/page), fetched by the office computer's signed-in window (Ari 2026-09-28:
+    viewing is included in the monthly fee; copies are never bought). -> [(mime, base64)], first 3 pages."""
+    import time as _t
+    b, pg = _idx2_bp(bookpage)
+    if not (b and pg): return []
+    term = f"{b}/{pg}"
+    def got():
+        rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
+        return [(r.get("mime") or "image/jpeg", r["b64"]) for r in rows if r.get("b64") and (r.get("mime") or "").lower() in ("image/jpeg", "image/png", "")][:3]
+    have = got()
+    if have: return have
+    try:
+        rid = _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando", "p_kind": "image"})
+    except Exception as e:
+        if note is not None: note.append(f"{county.title()} picture {term} could not be asked for: {str(e)[:80]}")
+        return []
+    t0 = _t.time()
+    while _t.time() - t0 < _BANK_IMAGE_WAIT:
+        _t.sleep(15)
+        st = _fz_rpc("idx_live_status", {"p_id": rid}) or {}
+        if st.get("status") == "done": return got()
+        if st.get("status") == "failed":
+            if note is not None: note.append(f"{county.title()} picture {term}: {st.get('error') or 'not found'}")
+            return []
+    if note is not None: note.append(f"{county.title()} picture {term} did not come in time - the office computer's {county.title()} window may be busy or signed out")
+    return []
+
+
+def bank_read(county, kind, bookpage, reads, note=None):
+    """Read one Putnam paper (deed / deed of trust / lien) from its picture; read once, kept in the page bank."""
+    b, pg = _idx2_bp(bookpage)
+    if not (b and pg): return None
+    key = f"{county}:BP{b}/{pg}"
+    banked = _bank_get(county, "document", image_id=key)
+    if banked and banked.get("fields") and banked.get("doc_kind") == kind: return banked["fields"]
+    if reads["n"] >= _BANK_MAX_READS: return None
+    imgs = bank_image(county, bookpage, note)
+    if not imgs: return None
+    reads["n"] += 1
+    try:
+        rd = _idx2_read_doc(kind, imgs)
+    except FzPaused:
+        raise
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    _bank_put(county, "document", rd, doc_kind=kind, pages=len(imgs), image_id=key, bookpage=bookpage)
+    return rd
 
 
 def bank_owner_report(county, last, first, book=None, page=None, desc=None, district=None, middle=None, firm=None):
@@ -5694,9 +5749,27 @@ def bank_owner_report(county, last, first, book=None, page=None, desc=None, dist
     bought = max([_idx2_day(r["date"]) for r in buys] or [""])
     own_from = _idx2_day(chain[0]["date"]) if chain else (bought or None)
     keep, skipped = _idx2_relevant(out_debts, prop_words, owned_from=own_from, prop_desc=desc)
-    for x in keep:
-        if x.get("kind") in ("mortgage", "property") and not x.get("released"):
-            x.setdefault("check", True); x["why"] = (x.get("why") or "") + " - Putnam: from the index line only, the paper was not read"
+    # 🔎 Ari's rule: READ the papers. The owner's deed gives the property's profile; every open mortgage / property lien and
+    # every possible sale is compared with it (pictures fetched by the office window, one at a time, at the county's pace)
+    reads = {"n": 0}
+    rd0 = (bank_read(county, "deed", chain[0]["bookpage"], reads, notes) or {}) if chain else {}
+    if rd0.get("error"): rd0 = {}
+    if chain and rd0: chain[0]["read"] = rd0
+    profile = {"from_deed": chain[0]["bookpage"] if chain and rd0 else "", "address": rd0.get("property_address") or "",
+               "legal": rd0.get("legal_description_short") or "", "tax_ids": rd0.get("tax_ids") or [], "description": desc or ""}
+    prof = {"deeds": set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")), "addr": _idx2_addr(profile["address"]),
+            "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words,
+            "desc": desc or "", "legal_text": profile["legal"], "district": district or ""}
+    for x in list(keep):
+        if x.get("kind") not in ("mortgage", "property") or x.get("released"): continue
+        v, why = _idx2_match_read(bank_read(county, "debt", x.get("bookpage"), reads, notes) or {}, prof)
+        if v == "yes":
+            x["why"], x["check"] = "on this property - read the paper: " + why, False
+        elif v == "no":
+            x["why"] = "another property - read the paper: " + why; x.pop("check", None)
+            keep.remove(x); skipped.append(x)
+        else:
+            x.setdefault("check", True); x["why"] = (x.get("why") or "") + " - Putnam: the paper could not tell / was not read"
     # did the owner sell it? (index lines only - always 'check')
     # not a sale: a mobile / manufactured home title cancelled to join the land (Putnam 2025-C-000588), corrections, affidavits
     not_sale = lambda r: bool(_re_re.search(r"CANCELL?ATION OF TITLE|MOBILE|MANUFACTURED HOME|CORRECTI|AFFIDAVIT", (r["doc"] + " " + r["desc"]).upper()))
@@ -5706,14 +5779,23 @@ def bank_owner_report(county, last, first, book=None, page=None, desc=None, dist
     other_interest = lambda r: _idx2_same_mineral(r["desc"], desc or "") == "no" or _idx2_other_district(r["desc"], district)
     sold_rows = [r for r in sells if not other_interest(r) and (_idx2_same_mineral(r["desc"], desc or "") == "yes"
                                                                   or len((_idx2_words(r["desc"]) - _DESC_COMMON) & (prop_words - _DESC_COMMON)) >= 2)]
-    new_owner = None
-    if sold_rows:
+    new_owner, sale_checks, verdicts = None, [], {}
+    for r in (sold_rows + [x for x in sells if x not in sold_rows and not other_interest(x)])[:3]:
+        rd = bank_read(county, "deed", r["bookpage"], reads, notes) or {}
+        v, why = _idx2_match_read(rd, prof)
+        verdicts[r["bookpage"]] = {"verdict": v or "could not tell", "why": why}
+        sale_checks.append({"bookpage": r["bookpage"], "date": r["date"], "to": r.get("other") or "", "verdict": v or "could not tell",
+                            "why": why or ("the paper was not read" if not rd or rd.get("error") else "the paper does not say enough")})
+        if v == "yes" and not new_owner:
+            new_owner = {"name": r.get("other") or "", "date": r["date"], "bookpage": r["bookpage"], "desc": r["desc"], "type": r["doc"],
+                         "confirmed": "read the deed: " + why}
+    if not new_owner and sold_rows and verdicts.get(sold_rows[0]["bookpage"], {}).get("verdict") != "no":
         s0 = sold_rows[0]
         new_owner = {"name": s0.get("other") or "", "date": s0["date"], "bookpage": s0["bookpage"], "desc": s0["desc"], "type": s0["doc"],
-                     "check": "from the index line only (Putnam papers are paid) - compare the description before relying on it"}
+                     "check": "the deed could not tell (or was not read) - compare the description before relying on it"}
     other_sales = [{"name": r.get("other") or "", "date": r["date"], "bookpage": r["bookpage"], "type": r["doc"], "desc": r["desc"],
-                    "checked": {"verdict": "no" if other_interest(r) else "could not tell"}}
-                   for r in sells if not sold_rows or r is not sold_rows[0]][:8]
+                    "checked": verdicts.get(r["bookpage"]) or {"verdict": "no" if other_interest(r) else "could not tell"}}
+                   for r in sells if not new_owner or r["bookpage"] != new_owner["bookpage"]][:8]
     state = [{"date": r["date"], "bookpage": r["bookpage"], "desc": r["desc"]} for r in mine if state_cert(r)][:10]
     if state: notes.append("State Auditor papers on the index (sale approval / redemption letters, not sales): " +
                            "; ".join(f"{x['bookpage'].replace(' @ ', '/')} {x['date']} {x['desc'][:80]}" for x in state))
@@ -5724,11 +5806,11 @@ def bank_owner_report(county, last, first, book=None, page=None, desc=None, dist
                     or ["not in our Putnam bank yet"]}
     return {"county": county, "owner": f"{last} {first}".strip(), "found": len(mine), "debts": keep,
             "open_debts": [x for x in keep if not x["released"]], "estate": estate, "estate_skipped_old": [], "spouses": spouses,
-            "deeds": deeds, "chain": chain, "sold": new_owner, "prior_owners": [], "property": {"description": desc or "", "address": "", "legal": "", "tax_ids": []},
+            "deeds": deeds, "chain": chain, "sold": new_owner, "prior_owners": [], "property": profile,
             "skipped_debts": [{"type": x["type"], "date": x["date"], "bookpage": x["bookpage"], "creditor": x["creditor"], "why": x["why"]} for x in skipped][:20],
-            "other_sales": other_sales, "sale_checks": [], "owner_deed_found": None, "bookpage_check": bp_check,
-            "other_names_skipped": sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))[:30], "documents_read": 0,
-            "reading": "index lines only - this county's document images are paid, never opened",
+            "other_sales": other_sales, "sale_checks": sale_checks, "owner_deed_found": bool(rd0), "bookpage_check": bp_check,
+            "other_names_skipped": sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))[:30], "documents_read": reads["n"],
+            "reading": "pictures fetched by the office computer's signed-in Putnam window (viewing is included in the subscription)",
             "source": "our bank of the county index (office computer's signed-in session)", "bank_notes": notes}
 
 
