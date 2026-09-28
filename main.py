@@ -5732,6 +5732,7 @@ def _fz_step_words(name, args, county):
     if name == "history": return "🕘 Looking at who changed and opened it…"
     if name == "propose_action": return "✍ Preparing that change for you to confirm…"
     if name == "save_lesson": return "🎓 Writing that down so I remember it…"
+    if name == "county_playbook": return f"📒 Opening the {(args or {}).get('county') or ''} playbook…"
     if name == "report_card": return "📋 Pulling up my report card…"
     if name == "lessons_to_approve": return "🎓 Looking at what staff taught me…"
     if name == "decide_lesson": return "🎓 Preparing your decision to confirm…"
@@ -5820,14 +5821,40 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
 
 # 🎓 Lessons staff teach Fernando (fernando_lesson): owners' apply at once, other staff's after an owner approves.
 _FZ_LESSONS = {"at": 0.0, "text": ""}
+_FZ_PLAYBOOKS = {}   # county -> (fetched at, text)
 _FZ_SAVE_LESSON = {"name": "save_lesson", "description": "Write down a GENERAL rule a staff member just taught you, so you follow it on every "
     "ticket from now on (e.g. 'a deed in another district is not our property'). One or two plain sentences, in your own words. "
-    "Not for facts about this one ticket.",
-    "input_schema": {"type": "object", "properties": {"lesson": {"type": "string"}}, "required": ["lesson"]}}
+    "Not for facts about this one ticket. county_only = true when it is about THIS county's records only (where the clerk files "
+    "things, how its books are named, its index quirks) - it goes into this county's playbook.",
+    "input_schema": {"type": "object", "properties": {"lesson": {"type": "string"}, "county_only": {"type": "boolean"}}, "required": ["lesson"]}}
+_FZ_SAVE_LESSON_G = {"name": "save_lesson", "description": "Write down a GENERAL rule someone just taught you, so you follow it from now on. One or "
+    "two plain sentences, in your own words. county = the WV county when it is about that county's records only (it goes into "
+    "that county's playbook); leave empty for a rule for every county.",
+    "input_schema": {"type": "object", "properties": {"lesson": {"type": "string"}, "county": {"type": "string"}}, "required": ["lesson"]}}
 
 
-def _fz_lessons_text():
-    """The approved lessons, for every prompt (refreshed every 5 minutes)."""
+def _fz_lessons_text(county=None):
+    """The approved lessons (every county) + this county's playbook, for his prompt (refreshed every 5 minutes)."""
+    import time as _t
+    return _fz_general_lessons() + (_fz_playbook_text(county) if county else "")
+
+
+def _fz_playbook_text(county):
+    import time as _t
+    c = _re_re.sub(r"\s*COUNTY\s*$", "", (county or "").upper().strip())
+    got = _FZ_PLAYBOOKS.get(c)
+    if not got or _t.time() - got[0] > 300:
+        try:
+            ls = _fz_rpc("fz_playbook", {"p_county": c}) or []
+            txt = (f"\n\n{c} COUNTY PLAYBOOK (how this county keeps its records - use it to know where to look):\n" +
+                   "\n".join(f"- {x['lesson']}" for x in ls)) if ls else ""
+            _FZ_PLAYBOOKS[c] = got = (_t.time(), txt)
+        except Exception:
+            return got[1] if got else ""
+    return got[1]
+
+
+def _fz_general_lessons():
     import time as _t
     if _t.time() - _FZ_LESSONS["at"] > 300:
         try:
@@ -5869,9 +5896,10 @@ def fernando_chat_answer(job, log=print, progress=None):
     try:
         def tool_fn(sites_, name, args, budget):
             if name == "save_lesson":
-                return _fz_rpc("fernando_lesson_add", {"p_msg_id": job["id"], "p_lesson": (args or {}).get("lesson") or ""}) or "saved"
+                return _fz_rpc("fernando_lesson_add", {"p_msg_id": job["id"], "p_lesson": (args or {}).get("lesson") or "",
+                                                       "p_county_only": bool((args or {}).get("county_only"))}) or "saved"
             return _fzc_tool(sites_, name, args, budget)
-        return _fz_agent(_FZC_SYSTEM + _fz_lessons_text(), msgs, (_FZC_TOOLS if can_search else []) + [_FZ_WEB_SEARCH, _FZ_SAVE_LESSON], sites,
+        return _fz_agent(_FZC_SYSTEM + _fz_lessons_text(county), msgs, (_FZC_TOOLS if can_search else []) + [_FZ_WEB_SEARCH, _FZ_SAVE_LESSON], sites,
                          "fernando_chat", max_steps=12, log=log, tag=f"{county} {job['cert']}", progress=progress, tool_fn=tool_fn)
     finally:
         sites.close()
@@ -5947,7 +5975,7 @@ def fernando_heirs(county, cert, owner, descr, rep, log=print, staff_notes=None)
         "Trace the heirs and who must be served, then call report_heirs."}]
     sites = _FzcSites(county)
     try:
-        return _fz_agent(_FZH_SYSTEM + _fz_lessons_text(), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_heirs", final_tool=_FZH_REPORT,
+        return _fz_agent(_FZH_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_heirs", final_tool=_FZH_REPORT,
                          max_steps=16, log=log, tag=f"{county} {cert}", model=_FZH_MODEL, max_searches=8)
     finally:
         sites.close()
@@ -6125,6 +6153,9 @@ _FZG_OWNER_TOOLS = [
      "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "cert": {"type": "string"}}, "required": ["county", "cert"]}},
     {"name": "buyer_spend", "description": "Owners only: certificates bought and known prices per buyer per sale year (competitors' budgets).",
      "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
+    {"name": "county_playbook", "description": "A county's playbook: what Fernando knows about how that county keeps its records "
+        "(approved), plus entries still waiting for Ari / Anne.",
+     "input_schema": {"type": "object", "properties": {"county": {"type": "string"}}, "required": ["county"]}},
     {"name": "report_card", "description": "Owners only: how Fernando's own searches compare with the tickets staff finished - right / partly / wrong "
         "per part (owner, sale, chain, debts, people), per county, and his recent misses with the reason. county optional.",
      "input_schema": {"type": "object", "properties": {"county": {"type": "string"}}}},
@@ -6205,6 +6236,11 @@ def _fzg_tool_fn(role, actions=None):
             return _re_json.dumps(_fz_rpc("fz_overview", {"p_what": args.get("what") or "surplus", "p_stage": args.get("stage") or None}), ensure_ascii=False)[:60000]
         if name == "propose_action":
             return _fzg_propose(args, actions)
+        if name == "county_playbook":
+            c = _re_re.sub(r"\s*COUNTY\s*$", "", (args.get("county") or "").upper().strip())
+            pend = [x for x in (_fz_rpc("fernando_lessons_pending", {}) or []) if (x.get("for") or "").startswith(c + " ")]
+            return _re_json.dumps({"county": c, "approved": _fz_rpc("fz_playbook", {"p_county": c}) or [],
+                                   "waiting_for_ari_or_anne": pend}, ensure_ascii=False)[:20000]
         if name == "report_card":
             if role != "owner": return "Only owners can see Fernando's report card - tell the manager to ask Ari or Anne."
             return _re_json.dumps(_fz_rpc("fz_report_card", {"p_county": (args.get("county") or None)}), ensure_ascii=False)[:20000]
@@ -6338,12 +6374,13 @@ def fernando_gchat_one():
         _tf = _fzg_tool_fn(role, actions)
         def tool_fn(sites_, name, args, budget):
             if name == "save_lesson":
-                return _fz_rpc("fernando_lesson_add_g", {"p_gmsg_id": mid, "p_lesson": (args or {}).get("lesson") or ""}) or "saved"
+                return _fz_rpc("fernando_lesson_add_g", {"p_gmsg_id": mid, "p_lesson": (args or {}).get("lesson") or "",
+                                                         "p_county": (args or {}).get("county") or None}) or "saved"
             return _tf(sites_, name, args, budget)
         try:
             # a COPY of the conversation: when he stops for a live look, his unanswered go_live call must not stay in it
             # (that broke Anne's "yep go ahead" 9/28: "tool_use ids were found without tool_result")
-            out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text(), list(merged), _fzg_tools(role) + [_FZG_GO_LIVE, _FZ_SAVE_LESSON], sites, "fernando_general", max_steps=10,
+            out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text(), list(merged), _fzg_tools(role) + [_FZG_GO_LIVE, _FZ_SAVE_LESSON_G], sites, "fernando_general", max_steps=10,
                             progress=progress, model=_FZG_MODEL_CHEAP, stop_tool="go_live", tool_fn=tool_fn, tag=f"gchat {mid}",
                             on_text=on_text)
             if isinstance(out, dict) and "__stop__" in out:
@@ -6352,9 +6389,9 @@ def fernando_gchat_one():
                 progress(f"🔎 This needs a live look ({why[:120]}) - about 1-3 min…")
                 sites = _FzcSites(_re_re.sub(r"\s*COUNTY\s*$", "", (county or "").upper().strip()) or None)
                 live = [t for t in _FZC_TOOLS if t["name"] != "search_bank"] + [_FZ_WEB_SEARCH]
-                out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text() + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
+                out = _fz_agent(_FZG_SYSTEM + _fz_lessons_text(county) + "\nYou may now search the county index live and read documents and old books (pass county on each tool).",
                                 merged + [{"role": "assistant", "content": f"(I need a live look: {why})"}, {"role": "user", "content": "Go ahead."}],
-                                _fzg_tools(role) + live + [_FZ_SAVE_LESSON], sites, "fernando_general", max_steps=14, progress=progress,
+                                _fzg_tools(role) + live + [_FZ_SAVE_LESSON_G], sites, "fernando_general", max_steps=14, progress=progress,
                                 model="claude-opus-5", tool_fn=tool_fn, tag=f"gchat {mid}", on_text=on_text)
         finally:
             sites.close()
@@ -6601,7 +6638,7 @@ def fernando_grade_one():
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
-        known = _fz_lessons_text() or "\n\n(no lessons yet)"
+        known = _fz_lessons_text(county) or "\n\n(no lessons yet)"
         pend = "; ".join(x.get("lesson", "")[:160] for x in (_fz_rpc("fernando_lessons_pending", {}) or [])[:60])
         body = (f"LESSONS HE ALREADY HAS:{known}\nALREADY SUGGESTED (do not repeat): {pend}\n\n"
                 f"Certificate {cert}, {county} County. Tax-ticket owner: {job.get('owner')}. Property: {job.get('descr')}\n\n"
