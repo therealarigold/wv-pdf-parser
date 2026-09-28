@@ -6814,4 +6814,9 @@ if __name__ == '__main__':
         if os.environ.get("SAO_READER", "1") == "1":
             for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP): 1 by day, 2 at night; 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
+        try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
+            from engagement_mailer import mailer_loop
+            _og_threading.Thread(target=mailer_loop, daemon=True).start()
+        except Exception as _me:
+            print(f"[mailer] not started: {_me}", flush=True)
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
