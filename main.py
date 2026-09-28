@@ -6884,6 +6884,19 @@ def _client_mail_body(job):
     return subj, body
 
 
+def _mail_plain_text(html):
+    """Plain-text copy of an HTML email (spam filters trust mail that has both). Links are kept as 'words (url)'."""
+    import html as _h, re as _r
+    t = _r.sub(r"<a [^>]*href='([^']*)'[^>]*>(.*?)</a>", lambda m: m.group(2) if m.group(1) in m.group(2) else f"{m.group(2)} ({m.group(1)})", html, flags=_r.S)
+    t = _r.sub(r"<br\s*/?>", "\n", t)
+    t = _r.sub(r"<li>", "- ", t)
+    t = _r.sub(r"</li>", "\n", t)
+    t = _r.sub(r"</(p|ul|div)>", "\n\n", t)
+    t = _h.unescape(_r.sub(r"<[^>]+>", "", t))
+    t = "\n".join(line.strip() for line in t.split("\n"))
+    return _r.sub(r"\n{3,}", "\n\n", t).strip() + "\n"
+
+
 def client_mail_one():
     job = _fz_rpc("client_login_next", {})
     if not job: return False
@@ -6897,7 +6910,7 @@ def client_mail_one():
         req = _re_ur.Request("https://api.resend.com/emails", method="POST",
                              data=_re_json.dumps({"from": os.environ.get("ENG_FROM", "Marci at Anne Labes, Esq. <marci@annelabes.com>"),
                                                   "reply_to": os.environ.get("ENG_REPLY_TO", "marci@annelabes.com"),
-                                                  "to": [to], "subject": subj, "html": body}).encode(),
+                                                  "to": [to], "subject": subj, "html": body, "text": _mail_plain_text(body)}).encode(),
                              headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
                                       "User-Agent": "annelabes-portal/1.0"})
         with _re_ur.urlopen(req, timeout=30) as r: r.read()
