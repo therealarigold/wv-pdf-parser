@@ -5426,7 +5426,8 @@ def fernando_work_one():
         rep["searched_as"] = firm or f"{last} {first}"
         if firm: rep["company"] = {"name": firm, "core": _idx2_firm_core(firm)}
         old_heirs = ((run.get("report") or {}).get("heirs") or {}) if isinstance(run.get("report"), dict) else {}
-        if not firm and fernando_needs_heirs(run.get("owner"), rep) and old_heirs.get("people"):
+        told_since = any((n.get("on") or "") >= str(run.get("finished_at") or "")[:10] for n in (run.get("staff_notes") or []))
+        if not firm and fernando_needs_heirs(run.get("owner"), rep) and old_heirs.get("people") and not told_since:   # staff told him something new -> trace again
             rep["heirs"] = dict(old_heirs, reused_from=str(run.get("finished_at") or "")[:10] or "an earlier search")
         elif not firm and fernando_needs_heirs(run.get("owner"), rep):
             try:
