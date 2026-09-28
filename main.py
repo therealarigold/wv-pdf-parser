@@ -4480,6 +4480,11 @@ _IDX2_ASK = {
 _AI_CTX = __import__("threading").local()
 
 
+def _ai_searches(msg):
+    st = getattr(getattr(msg, "usage", None), "server_tool_use", None)
+    return int(getattr(st, "web_search_requests", 0) or 0) if st else 0
+
+
 def _ai_log(msg, feature=None):
     try:
         u = getattr(msg, "usage", None)
@@ -4489,7 +4494,8 @@ def _ai_log(msg, feature=None):
                                  "p_model": getattr(msg, "model", None),
                                  "p_in": getattr(u, "input_tokens", 0) or 0, "p_out": getattr(u, "output_tokens", 0) or 0,
                                  "p_cache_read": getattr(u, "cache_read_input_tokens", 0) or 0,
-                                 "p_cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0})
+                                 "p_cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0,
+                                 "p_searches": _ai_searches(msg)})
     except Exception as e:
         print("[ai-cost] not logged:", str(e)[:200], flush=True)
 
@@ -5332,7 +5338,10 @@ def fernando_work_one():
         rep["owner_note"] = note
         rep["searched_as"] = firm or f"{last} {first}"
         if firm: rep["company"] = {"name": firm, "core": _idx2_firm_core(firm)}
-        if not firm and fernando_needs_heirs(run.get("owner"), rep):
+        old_heirs = ((run.get("report") or {}).get("heirs") or {}) if isinstance(run.get("report"), dict) else {}
+        if not firm and fernando_needs_heirs(run.get("owner"), rep) and old_heirs.get("people"):
+            rep["heirs"] = dict(old_heirs, reused_from=str(run.get("finished_at") or "")[:10] or "an earlier search")
+        elif not firm and fernando_needs_heirs(run.get("owner"), rep):
             try:
                 rep["heirs"] = fernando_heirs(county, cert, run.get("owner"), run.get("descr"), rep, log=lambda m: print(m, flush=True))
             except Exception as e:
@@ -5577,7 +5586,7 @@ def _fz_step_words(name, args, county):
 
 
 def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14, log=print, tag="", progress=None,
-              model="claude-opus-5", stop_tool=None, tool_fn=None, on_text=None):
+              model="claude-opus-5", stop_tool=None, tool_fn=None, on_text=None, max_searches=None):
     """Claude with our index tools (+ web search). Returns the final text, or the input of final_tool when given."""
     import anthropic
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -5596,6 +5605,8 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
             kw["tools"], kw["tool_choice"] = [final_tool], {"type": "tool", "name": final_tool["name"]}
         elif not last_round and tools:
             kw["tools"] = tools
+            if max_searches and budget.get("searches", 0) >= max_searches:
+                kw["tools"] = [t for t in tools if t.get("name") != "web_search"]
         def _call(kw):
             if not on_text: return client.messages.create(**kw)
             import time as _tm
@@ -5617,6 +5628,7 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
             tools = [dict(t, type="web_search_20250305") if t.get("name") == "web_search" else t for t in tools]
             msg = _call(kw)
         _ai_log(msg, feature)
+        budget["searches"] = budget.get("searches", 0) + _ai_searches(msg)
         stop = getattr(msg, "stop_reason", "")
         if stop == "refusal": return None if final_tool else "Sorry — I can't help with that one."
         blocks = [b.model_dump(mode="json", exclude_none=True) for b in msg.content]
@@ -5715,6 +5727,7 @@ _FZH_REPORT = {"name": "report_heirs", "description": "Your finished heir tracin
         "check": {"type": "array", "items": {"type": "string"}, "description": "things staff should still look up"}},
         "required": ["summary", "people"]}}
 
+_FZH_MODEL = os.environ.get("FERNANDO_HEIRS_MODEL", "claude-sonnet-5")
 _FZH_TRIGGER = _re_re.compile(r"\bET\s*ALS?\b|\bETALS?\b|\bHEIRS?\b|\bEST(ATE)?\b|\bDEC(D|EASED)?\b|\bLIFE\b|\bL/E\b|\bTENANT\b")
 
 
@@ -5732,7 +5745,7 @@ def fernando_heirs(county, cert, owner, descr, rep, log=print):
     sites = _FzcSites(county)
     try:
         return _fz_agent(_FZH_SYSTEM, msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_heirs", final_tool=_FZH_REPORT,
-                         max_steps=16, log=log, tag=f"{county} {cert}")
+                         max_steps=16, log=log, tag=f"{county} {cert}", model=_FZH_MODEL, max_searches=8)
     finally:
         sites.close()
 
