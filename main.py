@@ -5446,7 +5446,7 @@ def fernando_work_one():
     _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_read", county, cert
     FERNANDO.setdefault("working", {})[f"{county} {cert}"] = _re_dt.utcnow().isoformat() + "Z"
     try:
-        if county not in IDX2_URLS:
+        if county not in IDX2_URLS and county not in BANK_COUNTIES:
             if county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
             else: raise ValueError("no IDX address for " + county)
         last, first, note = fernando_owner_name(run.get("owner"))
@@ -5458,8 +5458,12 @@ def fernando_work_one():
         if not last and not firm:
             _fz_rpc("fernando_finish", {"p_county": county, "p_cert": cert, "p_status": "skipped", "p_reason": note})
             return True
-        rep = idx2_owner_report(county, last or "", first or "", run.get("book"), run.get("page"), desc=run.get("descr"),
-                                middle=None if firm else fernando_owner_middle(run.get("owner")), firm=firm, district=run.get("district"))
+        if county in BANK_COUNTIES:
+            rep = bank_owner_report(county, last or "", first or "", run.get("book"), run.get("page"), desc=run.get("descr"), district=run.get("district"),
+                                    middle=None if firm else fernando_owner_middle(run.get("owner")), firm=firm)
+        else:
+            rep = idx2_owner_report(county, last or "", first or "", run.get("book"), run.get("page"), desc=run.get("descr"),
+                                    middle=None if firm else fernando_owner_middle(run.get("owner")), firm=firm, district=run.get("district"))
         if run.get("district"): rep["district"] = run["district"]
         rep["owner_note"] = note
         rep["searched_as"] = firm or f"{last} {first}"
@@ -5611,6 +5615,126 @@ _FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "WETZEL", "MERCER"}
 _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🗂 BANK-ONLY COUNTIES (Putnam 2026-09-28): the county's index (Cott RECORDhub) needs a captcha sign-in, so the server never
+# opens it. The office computer's signed-in Putnam tab collects owners into our bank (idx_doc / idx_party) and answers
+# live requests (idx_live_ask -> idx_live_status). County's written OK: title work only, a normal user's pace, images are
+# PAID - never requested. Fernando: bank first, a live request only for a name the bank lacks (a few per ticket).
+# ─────────────────────────────────────────────────────────────────────────────
+BANK_COUNTIES = {"PUTNAM"}
+_BANK_LIVE_WAIT = 180
+
+
+def bank_owner_rows(county, last, first="", live=True, note=None):
+    """The owner's papers from our bank; when there are none, ask the office computer's county tab and wait (<= 3 min)."""
+    import time as _t
+    rows = _fz_rpc("fz_bank_owner", {"p_county": county, "p_last": last, "p_first": first or None}) or []
+    if rows or not live: return rows
+    term = f"{last} {first}".strip()
+    try:
+        rid = _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando"})
+    except Exception as e:
+        if note is not None: note.append(f"{county} live search could not be asked: {str(e)[:80]}")
+        return rows
+    t0 = _t.time()
+    while _t.time() - t0 < _BANK_LIVE_WAIT:
+        _t.sleep(10)
+        st = _fz_rpc("idx_live_status", {"p_id": rid}) or {}
+        if st.get("status") in ("done", "failed"):
+            if st.get("status") == "failed" and note is not None: note.append(f"{county} live search for {term} failed: {st.get('error') or ''}")
+            return _fz_rpc("fz_bank_owner", {"p_county": county, "p_last": last, "p_first": first or None}) or []
+    if note is not None:
+        note.append(f"{county.title()} search for {term} is queued - the office computer's {county.title()} session may be signed out "
+                    f"(the search runs when someone signs in there).")
+    return rows
+
+
+def bank_owner_report(county, last, first, book=None, page=None, desc=None, district=None, middle=None, firm=None):
+    """Fernando's owner report for a bank-only county: same shape as idx2_owner_report, from the index lines only
+    (no scanned pages - paid there). Unsure items stay 'check'."""
+    notes = []
+    core = _idx2_firm_core(firm) if firm else ""
+    if firm: last, first = core, ""
+    last, first = (last or "").upper().strip(), (first or "").upper().strip()
+    rows = bank_owner_rows(county, last, first, live=True, note=notes)
+    mine = [r for r in rows if (_idx2_same_firm(r["name"], core) if firm else _idx2_same_person(r["name"], last, first))]
+    mid = (middle or "").upper().strip()[:1]
+    if mid and not firm:
+        def _mid_ok(name):
+            w = [x for x in _re_re.sub(r"[^A-Z ]", " ", (name or "").upper()).split()[2:] if x not in _FZ_NAME_TAIL]
+            return not w or w[0][0] == mid
+        mine = [r for r in mine if _mid_ok(r["name"])]
+    state_cert = lambda r: "DELINQUENT LAND" in r["doc"].upper() or "AUDITOR" in (r.get("other") or "").upper()
+    estate = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "name": r["name"], "desc": r["desc"]}
+              for r in mine if _ESTATE_RE.search(r["doc"].upper()) or "DECEASED" in r["name"] or " DEC" in r["name"]]
+    spouses = [{"spouse": r.get("other"), "date": r["date"], "desc": r["desc"]} for r in mine if "MARRIAGE" in r["doc"].upper()]
+    deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r.get("other") or "", "desc": r["desc"]}
+             for r in mine if _idx2_is_deed(r) and not state_cert(r)]
+    out_debts = _idx2_debts([r for r in mine if not state_cert(r)])
+    # the owner's own purchase of this property: similar description, else the latest (not for a mineral interest)
+    buys = [r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE" and not state_cert(r)]
+    sim = sorted([r for r in buys if _idx2_desc_match(r["desc"], desc or "")], key=lambda r: _idx2_day(r["date"]), reverse=True)
+    mineral = bool(_re_re.search(r"O\s*&\s*G|\bOIL\b|\bGAS\b|\bMIN(ERAL)?S?\b|\bCOAL\b", (desc or "").upper()))
+    pick = sim or ([] if mineral else sorted(buys, key=lambda r: _idx2_day(r["date"]), reverse=True))
+    chain, seen = [], set()
+    cur, how = pick[:1], ("similar description" if sim else "owner's latest purchase (check)")
+    for _ in range(6):                                # back through the sellers' own purchases, bank only (no live requests)
+        if not cur: break
+        d = cur[0]
+        chain.append({"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d.get("other") or "", "grantee": d["name"],
+                      "desc": d["desc"], "found_by": how + " (index line, Putnam images not opened)"})
+        sl, sf = _idx2_name((d.get("other") or "").split(";")[0])
+        if not sl or (sl, sf) in seen: break
+        seen.add((sl, sf))
+        srows = [r for r in bank_owner_rows(county, sl, sf, live=False) if _idx2_same_person(r["name"], sl, sf)]
+        sb = [r for r in srows if _idx2_is_deed(r) and r["role"] == "GRANTEE" and _idx2_day(r["date"]) <= _idx2_day(d["date"])]
+        simb = sorted([r for r in sb if _idx2_desc_match(r["desc"], d["desc"])], key=lambda r: _idx2_day(r["date"]), reverse=True)
+        cur, how = simb[:1], "seller's purchase, similar description"
+    prop_words = _idx2_words(desc or "") | (_idx2_words(chain[0]["desc"]) if chain else set())
+    bought = max([_idx2_day(r["date"]) for r in buys] or [""])
+    own_from = _idx2_day(chain[0]["date"]) if chain else (bought or None)
+    keep, skipped = _idx2_relevant(out_debts, prop_words, owned_from=own_from, prop_desc=desc)
+    for x in keep:
+        if x.get("kind") in ("mortgage", "property") and not x.get("released"):
+            x.setdefault("check", True); x["why"] = (x.get("why") or "") + " - Putnam: from the index line only, the paper was not read"
+    # did the owner sell it? (index lines only - always 'check')
+    sells = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and not state_cert(r) and _idx2_day(r["date"]) >= (bought or "0")],
+                   key=lambda r: _idx2_day(r["date"]), reverse=True)
+    other_interest = lambda r: _idx2_same_mineral(r["desc"], desc or "") == "no" or _idx2_other_district(r["desc"], district)
+    sold_rows = [r for r in sells if not other_interest(r) and (_idx2_same_mineral(r["desc"], desc or "") == "yes"
+                                                                  or len((_idx2_words(r["desc"]) - _DESC_COMMON) & (prop_words - _DESC_COMMON)) >= 2)]
+    new_owner = None
+    if sold_rows:
+        s0 = sold_rows[0]
+        new_owner = {"name": s0.get("other") or "", "date": s0["date"], "bookpage": s0["bookpage"], "desc": s0["desc"], "type": s0["doc"],
+                     "check": "from the index line only (Putnam papers are paid) - compare the description before relying on it"}
+    other_sales = [{"name": r.get("other") or "", "date": r["date"], "bookpage": r["bookpage"], "type": r["doc"], "desc": r["desc"],
+                    "checked": {"verdict": "no" if other_interest(r) else "could not tell"}}
+                   for r in sells if not sold_rows or r is not sold_rows[0]][:8]
+    state = [{"date": r["date"], "bookpage": r["bookpage"], "desc": r["desc"]} for r in mine if state_cert(r)][:10]
+    if state: notes.append("State Auditor papers on the index (sale approval / redemption letters, not sales): " +
+                           "; ".join(f"{x['bookpage'].replace(' @ ', '/')} {x['date']} {x['desc'][:80]}" for x in state))
+    bp_check = None
+    if book and page:
+        got = _fz_rpc("fz_bank_bookpage", {"p_county": county, "p_book": str(book), "p_page": str(page)}) or []
+        bp_check = {"bookpage": f"{book} @ {page}", "found": [f"{g.get('doc')}: {'; '.join(g.get('parties') or [])}" for g in got][:6]
+                    or ["not in our Putnam bank yet"]}
+    return {"county": county, "owner": f"{last} {first}".strip(), "found": len(mine), "debts": keep,
+            "open_debts": [x for x in keep if not x["released"]], "estate": estate, "estate_skipped_old": [], "spouses": spouses,
+            "deeds": deeds, "chain": chain, "sold": new_owner, "prior_owners": [], "property": {"description": desc or "", "address": "", "legal": "", "tax_ids": []},
+            "skipped_debts": [{"type": x["type"], "date": x["date"], "bookpage": x["bookpage"], "creditor": x["creditor"], "why": x["why"]} for x in skipped][:20],
+            "other_sales": other_sales, "sale_checks": [], "owner_deed_found": None, "bookpage_check": bp_check,
+            "other_names_skipped": sorted(set(r["name"] for r in rows) - set(r["name"] for r in mine))[:30], "documents_read": 0,
+            "reading": "index lines only - this county's document images are paid, never opened",
+            "source": "our bank of the county index (office computer's signed-in session)", "bank_notes": notes}
+
+
+class _FzcBankCounty:
+    """A bank-only county for the chat tools: bank + live requests, never the site itself."""
+    def __init__(self, county): self.county = county
+    def close(self): pass
+
+
 class _FzcSites:
     """The county index sites one conversation may use, opened on first use; closed together."""
     def __init__(self, home):
@@ -5618,6 +5742,9 @@ class _FzcSites:
 
     def get(self, county=None):
         c = _re_re.sub(r"\s*COUNTY\s*$", "", (county or self.home or "").upper().strip()) or self.home
+        if c in BANK_COUNTIES:
+            if c not in self.open: self.open[c] = _FzcBankCounty(c)
+            return self.open[c]
         if c in _FZ_NO_AUTO or not (c in IDX2_URLS or c in IDX2_SURVEY):
             raise ValueError(f"{c} County's index can't be searched automatically")
         if c not in self.open: self.open[c] = _FzcCounty(c)
@@ -5643,6 +5770,23 @@ def _fzc_tool(sites, name, args, budget):
         rows = _fz_rpc("idx_bank_search", {"p_query": args.get("query") or "", "p_county": c or None, "p_limit": 15}) or []
         return _re_json.dumps({"found": len(rows), "pages": rows}, ensure_ascii=False) if rows else "Nothing in our page bank for that yet."
     site = sites.get(args.get("county")) if name in ("search_person", "lookup_book_page", "read_document", "old_book_page", "old_index_book") else None
+    if isinstance(site, _FzcBankCounty):
+        if name == "search_person":
+            last, first = (args.get("last_name") or "").upper().strip(), (args.get("first_name") or "").upper().strip()
+            if not last: return "Give a last name."
+            if budget.get("live", 0) >= 4:
+                rows = bank_owner_rows(site.county, last, first, live=False)
+                return _re_json.dumps({"found": len(rows), "rows": rows[:150], "note": "bank only (live-search limit of 4 per question reached)"})
+            budget["live"] = budget.get("live", 0) + 1
+            notes = []
+            rows = bank_owner_rows(site.county, last, first, live=True, note=notes)
+            return _re_json.dumps({"found": len(rows), "rows": rows[:150], "source": f"our {site.county.title()} bank (+ a live search on the office computer when needed)",
+                                   "notes": notes}, ensure_ascii=False)
+        if name in ("lookup_book_page", "read_document"):
+            got = _fz_rpc("fz_bank_bookpage", {"p_county": site.county, "p_book": str(args.get("book") or ""), "p_page": str(args.get("page") or "")}) or []
+            return _re_json.dumps({"found": got, "note": f"{site.county.title()}'s document images are paid - the paper itself is not opened; "
+                                   "this is the index entry. Staff can open it in their RECORDhub account if needed."}, ensure_ascii=False)
+        return f"{site.county.title()}'s old books and images are not available to me (paid / sign-in only) - staff can check them in RECORDhub."
     if name == "old_book_page":
         bt = (args.get("book_type") or "DEED BOOK").upper()
         banked = _bank_get(site.county, "book", book_type=bt, book=str(args.get("book")), page=str(args.get("page")))
@@ -5870,7 +6014,7 @@ def _fz_general_lessons():
 def fernando_chat_answer(job, log=print, progress=None):
     """Answer one staff message; returns the reply text."""
     county = job["county"]
-    can_search = bool(job.get("searchable")) and (county in IDX2_URLS or county in IDX2_SURVEY)
+    can_search = bool(job.get("searchable")) and (county in IDX2_URLS or county in IDX2_SURVEY or county in BANK_COUNTIES)
     run = job.get("run") or {}
     ctx_text = (f"Certificate {job['cert']}, {county} County, WV.\n"
                 f"THE TICKET (as {job.get('author') or 'the staff member'} sees it now):\n{_re_json.dumps(_fzc_trim(job.get('ticket') or {}), ensure_ascii=False)[:60000]}\n\n"
