@@ -3045,6 +3045,12 @@ class Handler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             path = self.path.split("?")[0]
 
+            if path == "/square-webhook":   # 📨 Square: a client paid their agreement (engagement_mailer.py checks the signature)
+                from engagement_mailer import handle_square_webhook
+                code, msg = handle_square_webhook(body, self.headers.get('x-square-hmacsha256-signature', ''))
+                self.send_response(code); self.send_header('Content-Type', 'text/plain'); self.end_headers()
+                self.wfile.write(msg.encode()); return
+
             if path == "/prereg-parse":
                 # Parse WVSAO Pre-Registration PDF using pdftotext -layout
                 # Body is multipart/form-data with the PDF file

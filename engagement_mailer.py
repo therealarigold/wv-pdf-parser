@@ -4,7 +4,15 @@ A background thread takes one queued email at a time from the database (engageme
 and reports back (engagement_outbox_done):
   agreement_email   — "please review and sign" with the client's private signing link
   signed_copy_email — after signing: their signed agreement as a PDF, and what happens next
-Texts and Square payment links are not handled here yet; those rows stay queued.
+  make_paylink      — (needs SQUARE_ACCESS_TOKEN) a Square payment link for the total; the signing page then
+                      shows the Pay button and a paylink_email goes out
+  paylink_email     — "pay for your title work" with the Square link
+Square's webhook (POST /square-webhook in main.py -> handle_square_webhook) marks the agreement paid when
+the payment completes; the liens' holds lift and Fernando starts.
+Texts are not handled here yet; those rows stay queued.
+Square env: SQUARE_ACCESS_TOKEN, SQUARE_LOCATION_ID, SQUARE_WEBHOOK_SIGNATURE_KEY
+            (SQUARE_WEBHOOK_URL defaults to https://wv-pdf-parser.onrender.com/square-webhook).
+In TEST MODE the payment link is for $1.00, and a completed $1 test payment counts as paying the agreement.
 
 Render environment:
   RESEND_API_KEY   — needed; without it the thread only waits (nothing is sent)
@@ -13,11 +21,11 @@ Render environment:
   ENG_FROM         — default "Marci at Anne Labes, Esq. <marci@annelabes.com>"
   ENG_REPLY_TO     — default marci@annelabes.com
 """
-import base64, html, json, os, time, urllib.request, urllib.error
+import base64, hashlib, hmac, html, json, os, time, urllib.request, urllib.error
 from datetime import datetime, timezone, timedelta
 
 SB_URL = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
-KINDS = ["agreement_email", "signed_copy_email"]
+KINDS = ["agreement_email", "signed_copy_email"]   # + paylink_email / make_paylink when their keys are set
 try:
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
@@ -146,7 +154,89 @@ def build_email(kind, e):
         pdf = signed_pdf(e)
         safe = "".join(c for c in (name or "client") if c.isalnum() or c in " -_").strip().replace(" ", "-") or "client"
         return subject, _wrap(body), text, [{"filename": f"Signed-Agreement-{safe}.pdf", "content": base64.b64encode(pdf).decode()}]
+    if kind == "paylink_email":
+        url = e.get("pay_link_url") or e["link"]
+        subject = "Payment for your title work — " + total
+        body = (f"<p>Hi {html.escape(first)},</p><p>Thank you for signing. The last step is the fee for your title work: "
+                f"<b>{n} × $500 = {total}</b>.</p><p><b>Liens:</b> {liens}</p>"
+                + _button(url, "Pay " + total + " securely") +
+                "<p>Payment is handled by Square. We start the title work as soon as it's paid (the agreement asks for payment "
+                "within 7 days of signing). Prefer to pay by check? Just reply to this email.</p>")
+        text = f"Hi {first},\n\nPlease pay {total} for your title work here:\n{url}\n\nMarci · Office of Anne Labes, Esq."
+        return subject, _wrap(body), text, None
     raise ValueError("unknown kind " + kind)
+
+
+# ── Square ────────────────────────────────────────────────────────────────────────────────────
+SQ_API = "https://connect.squareup.com"
+
+
+def _square(method, path, body=None):
+    req = urllib.request.Request(SQ_API + path, data=json.dumps(body).encode() if body is not None else None, method=method,
+                                 headers={"Authorization": "Bearer " + _env("SQUARE_ACCESS_TOKEN"), "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def _square_location():
+    loc = _env("SQUARE_LOCATION_ID")
+    if loc:
+        return loc
+    locs = [l for l in _square("GET", "/v2/locations").get("locations", []) if l.get("status") == "ACTIVE"]
+    if not locs:
+        raise RuntimeError("no active Square location")
+    return locs[0]["id"]
+
+
+def make_paylink(job_id, e):
+    live = _env("ENG_LIVE") == "1"
+    f = e.get("fields") or {}
+    n = int(e.get("liens") or 0)
+    cents = int(round(float(e.get("total") or 0) * 100)) if live else 100
+    name = f"Title search fee — {n} tax lien{'' if n == 1 else 's'}" + ("" if live else " [TEST $1]")
+    body = {"idempotency_key": f"eng-{e['id']}-{job_id}",
+            "order": {"location_id": _square_location(), "reference_id": str(e["id"])[:40],
+                      "line_items": [{"name": name[:500], "quantity": "1", "note": (f.get("certificates") or "")[:500],
+                                      "base_price_money": {"amount": cents, "currency": "USD"}}]},
+            "checkout_options": {"redirect_url": e["link"], "ask_for_shipping_address": False},
+            "payment_note": f"Anne Labes agreement {e['id']} · bidder {f.get('bidder', '')}"[:500]}
+    if e.get("email"):
+        body["pre_populated_data"] = {"buyer_email": e["email"]}
+    try:
+        pl = _square("POST", "/v2/online-checkout/payment-links", body)["payment_link"]
+    except urllib.error.HTTPError as ex:
+        err = ex.read().decode("utf-8", "replace")[:300]
+        return ("queued" if ex.code in (429, 500, 502, 503) else "failed"), f"Square HTTP {ex.code}: {err}"
+    _rpc("engagement_set_paylink", {"p_id": e["id"], "p_url": pl["url"], "p_link_id": pl["id"], "p_order_id": pl.get("order_id")})
+    return "sent", ("" if live else "TEST $1 · ") + "link " + pl["id"]
+
+
+def handle_square_webhook(raw, signature):
+    """Square -> POST /square-webhook. Checks Square's signature, then marks the agreement paid."""
+    key = _env("SQUARE_WEBHOOK_SIGNATURE_KEY")
+    if not key:
+        return 503, "webhook signature key not set"
+    url = _env("SQUARE_WEBHOOK_URL", "https://wv-pdf-parser.onrender.com/square-webhook")
+    want = base64.b64encode(hmac.new(key.encode(), url.encode() + raw, hashlib.sha256).digest()).decode()
+    if not hmac.compare_digest(want, (signature or "").strip()):
+        print("[square] webhook with a bad signature ignored", flush=True)
+        return 403, "bad signature"
+    ev = json.loads(raw or b"{}")
+    if ev.get("type") not in ("payment.updated", "payment.created"):
+        return 200, "ignored"
+    p = ((ev.get("data") or {}).get("object") or {}).get("payment") or {}
+    if p.get("status") != "COMPLETED" or not p.get("order_id"):
+        return 200, "not completed"
+    eng = _rpc("engagement_by_order", {"p_order_id": p["order_id"]})
+    if not eng:
+        return 200, "not one of ours"
+    amount = ((p.get("amount_money") or {}).get("amount") or 0) / 100.0
+    method = "Square card"
+    if _env("ENG_LIVE") != "1" and amount <= 1.0:          # the $1 test link pays the test agreement
+        amount, method = float(eng["total"]), "Square TEST ($1 paid)"
+    _rpc("engagement_paid", {"p_id": eng["id"], "p_amount": amount, "p_ref": p["id"], "p_method": method})
+    print(f"[square] agreement {eng['id']} paid {amount} ({p['id']})", flush=True)
+    return 200, "ok"
 
 
 def send(kind, e):
@@ -176,16 +266,23 @@ def send(kind, e):
 
 
 def mailer_loop():
-    print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ")", flush=True)
+    have = lambda k: "yes" if _env(k) else "NO"
+    print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ") — keys: resend " + have("RESEND_API_KEY")
+          + ", square " + have("SQUARE_ACCESS_TOKEN") + ", square location " + have("SQUARE_LOCATION_ID")
+          + ", square webhook " + have("SQUARE_WEBHOOK_SIGNATURE_KEY"), flush=True)
     while True:
         try:
-            if not _env("RESEND_API_KEY") or not _env("SUPABASE_SECRET_KEY"):
+            if not _env("SUPABASE_SECRET_KEY") or not (_env("RESEND_API_KEY") or _env("SQUARE_ACCESS_TOKEN")):
                 time.sleep(60); continue
-            job = _rpc("engagement_outbox_next", {"p_kinds": KINDS})
+            kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
+            job = _rpc("engagement_outbox_next", {"p_kinds": kinds})
             if not job:
                 time.sleep(20); continue
             try:
-                status, detail = send(job["kind"], job["engagement"])
+                if job["kind"] == "make_paylink":
+                    status, detail = make_paylink(job["id"], job["engagement"])
+                else:
+                    status, detail = send(job["kind"], job["engagement"])
             except Exception as ex:
                 status, detail = "failed", str(ex)[:300]
             _rpc("engagement_outbox_done", {"p_id": job["id"], "p_status": status, "p_detail": detail})
