@@ -5729,6 +5729,7 @@ def _fz_step_words(name, args, county):
     if name == "history": return "🕘 Looking at who changed and opened it…"
     if name == "propose_action": return "✍ Preparing that change for you to confirm…"
     if name == "save_lesson": return "🎓 Writing that down so I remember it…"
+    if name == "report_card": return "📋 Pulling up my report card…"
     if name == "lessons_to_approve": return "🎓 Looking at what staff taught me…"
     if name == "decide_lesson": return "🎓 Preparing your decision to confirm…"
     if name == "find_person": return f"🔎 Looking for {(args or {}).get('name')} everywhere…"
@@ -5844,7 +5845,8 @@ def fernando_chat_answer(job, log=print, progress=None):
     ctx_text = (f"Certificate {job['cert']}, {county} County, WV.\n"
                 f"THE TICKET (as {job.get('author') or 'the staff member'} sees it now):\n{_re_json.dumps(_fzc_trim(job.get('ticket') or {}), ensure_ascii=False)[:60000]}\n\n"
                 f"YOUR OWN EARLIER INDEX SEARCH of this certificate ({run.get('status') or 'none'}{', ' + str(run.get('finished_at'))[:10] if run.get('finished_at') else ''}):\n"
-                f"{_re_json.dumps(run.get('report') or {}, ensure_ascii=False)[:30000]}\n\n"
+                f"{_re_json.dumps(run.get('report') or {}, ensure_ascii=False)[:30000]}"
+                f"{_fz_cases_text(county, str((job.get('ticket') or {}).get('description') or '') + ' ' + str(job.get('body') or ''))}\n\n"
                 + ("You can search this county's index with the tools." if can_search else
                    "You can NOT search this county's index (not connected) - answer from the ticket and your earlier search, and say what staff should look up themselves."))
     msgs = [{"role": "user", "content": ctx_text + "\n\n(The conversation on this ticket follows.)"},
@@ -5937,7 +5939,8 @@ def fernando_heirs(county, cert, owner, descr, rep, log=print, staff_notes=None)
             "follow the book/pages they give):\n" + "\n".join(f"- {n.get('by')} ({n.get('on')}): {n.get('said')}" for n in staff_notes)) if staff_notes else ""
     msgs = [{"role": "user", "content":
         f"Certificate {cert}, {county} County, WV. Owner on the tax ticket: {owner}\nProperty on the certificate: {descr or '(no description)'}\n\n"
-        f"Your county-index search of the owner so far:\n{_re_json.dumps(small, ensure_ascii=False)[:30000]}{told}\n\n"
+        f"Your county-index search of the owner so far:\n{_re_json.dumps(small, ensure_ascii=False)[:30000]}{told}"
+        f"{_fz_cases_text(county, f'{owner} {descr} heirs estate deceased')}\n\n"
         "Trace the heirs and who must be served, then call report_heirs."}]
     sites = _FzcSites(county)
     try:
@@ -6119,6 +6122,9 @@ _FZG_OWNER_TOOLS = [
      "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "cert": {"type": "string"}}, "required": ["county", "cert"]}},
     {"name": "buyer_spend", "description": "Owners only: certificates bought and known prices per buyer per sale year (competitors' budgets).",
      "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}}},
+    {"name": "report_card", "description": "Owners only: how Fernando's own searches compare with the tickets staff finished - right / partly / wrong "
+        "per part (owner, sale, chain, debts, people), per county, and his recent misses with the reason. county optional.",
+     "input_schema": {"type": "object", "properties": {"county": {"type": "string"}}}},
     {"name": "lessons_to_approve", "description": "Owners only: what staff tried to teach Fernando that waits for an owner's OK (id, lesson, who, ticket).",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "decide_lesson", "description": "Owners only: prepare the owner's decision on one staff lesson (approve = Fernando follows it from now on, "
@@ -6196,6 +6202,9 @@ def _fzg_tool_fn(role, actions=None):
             return _re_json.dumps(_fz_rpc("fz_overview", {"p_what": args.get("what") or "surplus", "p_stage": args.get("stage") or None}), ensure_ascii=False)[:60000]
         if name == "propose_action":
             return _fzg_propose(args, actions)
+        if name == "report_card":
+            if role != "owner": return "Only owners can see Fernando's report card - tell the manager to ask Ari or Anne."
+            return _re_json.dumps(_fz_rpc("fz_report_card", {"p_county": (args.get("county") or None)}), ensure_ascii=False)[:20000]
         if name == "lessons_to_approve":
             if role != "owner": return "Only owners (Ari, Anne) decide what Fernando learns."
             return _re_json.dumps(_fz_rpc("fernando_lessons_pending", {}), ensure_ascii=False)[:20000]
@@ -6525,6 +6534,120 @@ def fernando_chat_loop(n=0):
             except Exception as e:
                 print(f"[fernando-gchat] {e}", flush=True); worked = False
         _t.sleep(1 if worked else 1.5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📋 REPORT CARD + 🧠 CASE MEMORY (Ari 2026-09-28): every ticket staff finished is compared with Fernando's own search of
+# it - right / partly / wrong per part, what he missed and why. Each becomes a short CASE he recalls on similar tickets,
+# and clear general rules become lesson suggestions for Anne / Ari (fernando_lesson, proposed).
+# ─────────────────────────────────────────────────────────────────────────────
+_FZ_GRADE_MODEL = os.environ.get("FERNANDO_GRADE_MODEL", "claude-opus-5-5")
+_FZ_GRADE_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    "scores": {"type": "object", "additionalProperties": False, "properties": {
+        k: {"type": "string", "enum": ["right", "partly", "wrong", "n/a"]} for k in ("owner", "sale", "chain", "debts", "people")},
+        "required": ["owner", "sale", "chain", "debts", "people"]},
+    "missed": {"type": "array", "items": {"type": "string"}},
+    "extra": {"type": "array", "items": {"type": "string"}},
+    "why": {"type": "string"},
+    "lessons": {"type": "array", "items": {"type": "string"}},
+    "county_notes": {"type": "array", "items": {"type": "string"}},
+    "cases": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {
+        "kind": {"type": "string"}, "situation": {"type": "string"}, "lesson": {"type": "string"}}, "required": ["kind", "situation", "lesson"]}}},
+    "required": ["scores", "missed", "extra", "why", "lessons", "county_notes", "cases"]}
+_FZ_GRADE_PROMPT = """You are the senior title abstractor of a West Virginia tax-lien law office, grading your junior, Fernando.
+Below: (A) the title search ticket our staff FINISHED for a certificate (their final work - treat it as the truth, though
+a 'complete' ticket not yet 'verified' can still hold a staff slip), and (B) Fernando's own county-index search of the
+same certificate. Staff items marked fzSeen were also found by Fernando; fzMissing = Fernando could not confirm that staff
+item (often older than the computer index - then it is not his fault, say so).
+
+Grade each part: owner (current owner of record), sale (did the owner sell / tax deed - right if both agree), chain (the
+deeds back), debts (open mortgages / liens / judgments that must be served), people (who must be served, heirs).
+right = matches, partly = some, wrong = missed or wrong, n/a = nothing to compare.
+missed = what staff had that Fernando lacked (short, with book/page). extra = what Fernando had that staff did not keep
+(and whether staff may have missed it). why = one or two plain sentences on the main reason for the differences.
+lessons = 0-2 GENERAL rules a junior should learn from this (only if clearly supported; not about this one ticket).
+county_notes = 0-2 habits of THIS county's records you can see (where papers are filed, how books are named, index quirks).
+cases = exactly 1 short case for his memory: kind (mineral / surface / company / estate / ...), situation (what the
+ticket looked like: property, owner status, what made it hard), lesson (what the finished ticket shows, what to do next
+time). Plain English, no names of staff."""
+
+
+def _fz_trim_ticket(t):
+    keep = ("cert", "county", "status", "ownerName", "description", "district", "bookPage", "deedChain", "debts", "persons", "notes",
+            "propClass", "legalDescription", "assessedOwner")
+    out = {k: t.get(k) for k in keep if t.get(k) not in (None, "", [])}
+    notes = t.get("internalNotes") or ""
+    out["internalNotes_staff_only"] = "\n".join(x for x in notes.split("\n\n") if not x.strip().startswith("🤖"))[:3000]
+    return out
+
+
+def _fz_trim_report(r):
+    keep = ("owner", "district", "sold", "sale_checks", "chain", "open_debts", "debts", "prior_owners", "estate", "spouses", "heirs",
+            "bookpage_check", "owner_note", "other_sales")
+    return {k: r.get(k) for k in keep if r.get(k) not in (None, "", [])}
+
+
+def fernando_grade_one():
+    if _ai_paused() or _mem_used() > _FZ_MEM_MAX: return False
+    job = _fz_rpc("fz_grade_next", {})
+    if not job: return False
+    county, cert, t = job["county"], job["cert"], job.get("ticket") or {}
+    _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_grade", county, cert
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
+        body = (f"Certificate {cert}, {county} County. Tax-ticket owner: {job.get('owner')}. Property: {job.get('descr')}\n\n"
+                f"(A) STAFF'S FINISHED TICKET:\n{_re_json.dumps(_fz_trim_ticket(t), ensure_ascii=False)[:40000]}\n\n"
+                f"(B) FERNANDO'S SEARCH:\n{_re_json.dumps(_fz_trim_report(job.get('report') or {}), ensure_ascii=False)[:40000]}")
+        try:
+            msg = client.messages.create(model=_FZ_GRADE_MODEL, max_tokens=3000, system=_FZ_GRADE_PROMPT,
+                                         messages=[{"role": "user", "content": body}],
+                                         extra_body={"output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": _FZ_GRADE_SCHEMA}}})
+        except Exception as e:
+            _ai_pause_check(e); raise
+        _ai_log(msg, "fernando_grade")
+        text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+        g = json.loads(text)
+        _fz_rpc("fz_grade_save", {"p": dict(g, county=county, cert=cert, ts_id=t.get("id"), ts_status=t.get("status"),
+                                             run_finished_at=job.get("run_finished_at"))})
+        FERNANDO["graded"] = FERNANDO.get("graded", 0) + 1
+    except FzPaused:
+        return False
+    except Exception as e:
+        print(f"[grade] {county} {cert}: {str(e)[:200]}", flush=True)
+        # never grade-loop on a broken one: save an empty grade so it is not picked again
+        try: _fz_rpc("fz_grade_save", {"p": {"county": county, "cert": cert, "ts_id": t.get("id"), "ts_status": t.get("status"),
+                                              "run_finished_at": job.get("run_finished_at"), "why": f"could not grade: {str(e)[:150]}"}})
+        except Exception: pass
+    finally:
+        _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
+    return True
+
+
+def fernando_grade_loop():
+    """Grades in the background, gently: one ticket every ~90 s while there is work, at most 40 an hour."""
+    import time as _t
+    _t.sleep(240)
+    done_hour, hour = 0, int(_t.time() // 3600)
+    while True:
+        try:
+            if int(_t.time() // 3600) != hour: done_hour, hour = 0, int(_t.time() // 3600)
+            worked = done_hour < 40 and fernando_grade_one()
+            if worked: done_hour += 1
+        except Exception as e:
+            print(f"[grade] {e}", flush=True); worked = False
+        _t.sleep(90 if worked else 600)
+
+
+def _fz_cases_text(county, text, n=4):
+    """Similar past cases (same county first) for his prompt."""
+    try:
+        cs = _fz_rpc("fz_cases_similar", {"p_county": county, "p_text": text or "", "p_limit": n}) or []
+    except Exception:
+        return ""
+    if not cs: return ""
+    return ("\n\nSIMILAR PAST CASES FROM YOUR MEMORY (finished tickets - learn from them, but check this one on its own papers):\n" +
+            "\n".join(f"- [{c.get('county')} {c.get('cert') or ''}, {c.get('kind') or ''}] {c.get('situation')} -> {c.get('lesson')}" for c in cs))
 
 
 def fernando_loop(n=0):
@@ -7064,6 +7187,8 @@ if __name__ == '__main__':
         for _w in range(int(os.environ.get("FERNANDO_WORKERS", "3"))):   # 🤖 Fernando: 3 at once, each on a different county
             _og_threading.Thread(target=fernando_loop, args=(_w,), daemon=True).start()
         _og_threading.Thread(target=fz_harness_loop, daemon=True).start()          # ✅ quality test runs when asked
+        if os.environ.get("FERNANDO_GRADER", "1") == "1":
+            _og_threading.Thread(target=fernando_grade_loop, daemon=True).start()  # 📋 report card + 🧠 case memory
         for _q in range(int(os.environ.get("FERNANDO_CHAT_WORKERS", "2"))):   # 💬 question-only workers (2 = two staff asking at once)
             _og_threading.Thread(target=fernando_chat_loop, args=(_q,), daemon=True).start()
         if os.environ.get("SAO_READER", "1") == "1":
