@@ -4761,6 +4761,60 @@ def _idx2_match_read(rd, prof):
     return None, ""
 
 
+# 📋 The boxes under the index grid (Ari 2026-09-28): clicking a line - before any image - fills Names (every party + role),
+# Description (the FULL text behind "Additional..."), Cross references (related papers), and the Legal / Return / Notes tabs.
+# Often enough to tell which property a paper is about, so it is checked before paying to read the scan.
+_IDX2_DETAIL = """() => {
+  const grid = sfx => { const g = document.querySelector('table[id$="' + sfx + '_DXMainTable"]');
+    return g ? [...g.querySelectorAll('tr[id*="_DXDataRow"]')].map(tr => [...tr.querySelectorAll('td')].map(t => t.innerText.replace(/\\s+/g, ' ').trim())) : []; };
+  const memo = sfx => { const t = document.querySelector('[id$="' + sfx + '_I"]'); return t ? (t.value || t.innerText || '').trim() : ''; };
+  return {names: grid('grdNames'), description: grid('grdDescription').map(r => r.join(' ')).join(' / '),
+          cross: grid('grdCross').map(r => r.filter(Boolean).join(' ')), notes: grid('grdNotes').map(r => r.filter(Boolean).join(' ')),
+          legal: memo('txtLegalDescription'), return_to: memo('txtReturn')}; }"""
+
+
+_IDX2_BOOK_PREFIX = {"": ["DEED BOOK"], "D": ["DEED BOOK"], "DB": ["DEED BOOK"], "W": ["WILL BOOK"], "WB": ["WILL BOOK"],
+                     "A": ["APPRAISEMENT BOOK"], "AB": ["APPRAISEMENT BOOK"], "S": ["SETTLEMENT BOOK"], "SB": ["SETTLEMENT BOOK"],
+                     "O": ["ORDER BOOK"], "OB": ["ORDER BOOK"], "M": ["MISC BOOK"], "MB": ["MISC BOOK"],
+                     "F": ["FIDUCIARY BOND", "WILL BOOK"], "FB": ["FIDUCIARY BOND"]}
+
+
+def _idx2_detail(pg, bookpage, doc=None):
+    """The boxes under the grid for the paper at 'BOOK @ PAGE' (one Book & Page search + one click)."""
+    b, pgno = _idx2_bp(bookpage)
+    if not b: return None
+    rows = [r for r in _idx2_search(pg, 2, {"txtBook": b, "txtPage": pgno}, "txtPage") if _idx2_bp(r["bookpage"]) == (b, pgno)]
+    if doc: rows = [r for r in rows if r["doc"].upper() == doc.upper()] or rows
+    if not rows: return None
+    prev = pg.evaluate(_IDX2_DETAIL)
+    pg.locator("#" + rows[0]["_rid"]).locator("td").nth(3).click()
+    det = prev
+    for _ in range(24):
+        pg.wait_for_timeout(250)
+        if pg.evaluate("() => (window.grdNames && grdNames.InCallback()) || grd.InCallback()"): continue
+        det = pg.evaluate(_IDX2_DETAIL)
+        if det != prev and det.get("names"): break
+    det["names"] = [" ".join(x for x in n if x) for n in det.get("names") or []]
+    return det
+
+
+def _idx2_match_detail(det, prof):
+    """'yes' / 'no' / None + why, from the index boxes alone (full description, legal, cross references)."""
+    if not det: return None, ""
+    text = " ".join([det.get("description") or "", det.get("legal") or ""])
+    for c in det.get("cross") or []:
+        bp = _re_re.search(r"(\w+)\s*@\s*(\w+)", c) or _re_re.search(r"\b(\d+)\s*[/-]\s*(\d+)\b", c)
+        if bp and (bp.group(1).lstrip("0"), bp.group(2).lstrip("0")) in prof.get("deeds", set()):
+            return "yes", f"the index cross-references our deed ({c})"
+    for ours in (prof.get("desc"), prof.get("legal_text")):
+        m = _idx2_same_mineral(text, ours) if ours and text.strip() else None
+        if m == "yes": return "yes", f"index description names the same interest / lot ({text[:120]})"
+        if m == "no": return "no", f"index description names another interest / lot ({text[:120]})"
+    lw = _idx2_words(text) - _DESC_COMMON
+    if len(lw & (prof.get("legal", set()) - _DESC_COMMON)) >= 3: return "yes", f"index description matches ({text[:120]})"
+    return None, ""
+
+
 def _idx2_relevant(debts, prop_words, owned_from=None, owned_until=None, prior=False, prop_desc=None):
     """Split one person's debts into (count, skipped) by Ari's rules. owned_from / owned_until: YYYYMMDD of their purchase / sale."""
     keep, skip = [], []
@@ -4819,7 +4873,7 @@ def _idx2_name(s):
     return (n[0], n[1]) if len(n) >= 2 else (None, None)
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=20, middle=None, firm=None):
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=24, middle=None, firm=None):
     """firm: a company owner - searched in the index's Firm mode; last/first are ignored."""
     core = _idx2_firm_core(firm) if firm else ""
     if firm: last, first = core, ""
@@ -4851,7 +4905,12 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 item["read"] = {"error": str(e)[:200]}
             return item["read"]
 
-        def old_chain(ref, said, steps=4):
+        back_to = _re_dt.utcnow().year - 30
+        def far_enough(date_text):
+            ys = _re_re.findall(r"\b(1[89]\d\d|20\d\d)\b", date_text or "")
+            return bool(ys) and int(ys[-1]) <= back_to
+
+        def old_chain(ref, said, steps=8):
             """Older than the computer index: open the deed book page itself (Image Search), read it, and follow its own
             'being the same property ... Book X Page Y' back, up to `steps` deeds."""
             for _ in range(steps):
@@ -4880,7 +4939,22 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 if not m2: return
                 nref = (m2.group(1).lstrip("0"), m2.group(2).lstrip("0"))
                 if nref == ref: return
+                if far_enough(entry.get("date")): return          # 30 years back - enough
                 ref, said = nref, rd2.get("prior_deed_reference")
+
+        details = {}
+        def look(kind, item, bookpage, doc=None):
+            """Index boxes first; read the scanned paper only when they can't tell. -> (verdict, why)"""
+            if bookpage not in details:
+                try: details[bookpage] = _idx2_detail(pg, bookpage, doc)
+                except Exception as e: details[bookpage] = {"error": str(e)[:120]}
+            det = details[bookpage]
+            item["index_detail"] = det
+            v, why = _idx2_match_detail(det if det and not det.get("error") else None, prof_ref[0])
+            if v: return v, "index: " + why
+            v, why = _idx2_match_read(read_item(kind, item) or {}, prof_ref[0])
+            return v, ("read the paper: " + why) if v else ""
+        prof_ref = [{}]
 
         seen_people = {}
         def person(l, f):
@@ -4932,36 +5006,54 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                 bp_check = {"bookpage": f"{want_bp[0]} @ {want_bp[1]}",
                             "found": sorted(set(f'{r["doc"]}: {r["name"]}' for r in bp))[:6] or ["nothing at this book/page in the computer index"]}
                 if not bp and read and reads["n"] < max_reads:
-                    # older than the computer index: the deed book page itself, read by Fernando
-                    banked = _bank_get(county, "book", book_type="DEED BOOK", book=want_bp[0], page=want_bp[1])
-                    if banked and banked.get("fields") and banked.get("doc_kind") == "deed":
-                        imgs, rd0b_banked = [None], banked["fields"]
-                    else:
-                        rd0b_banked = None
-                        try:
-                            imgs = _idx2_book_images(ctx, url, "DEED BOOK", want_bp[0], want_bp[1], 3)
-                        except Exception:
-                            imgs = []
-                    if imgs:
-                        if rd0b_banked is not None:
-                            rd0b = rd0b_banked
-                        else:
+                    # older than the computer index: open the book page itself in the Image Search. The letter in front of the
+                    # book number says which book (Ari 2026-09-28): W108 = WILL BOOK 108, A = appraisement, S = settlement, O / OB = order.
+                    pre = (_re_re.match(r"\s*([A-Za-z]*)", str(book)).group(1) or "").upper()
+                    types = _IDX2_BOOK_PREFIX.get(pre, ["DEED BOOK"])
+                    for btype in types:
+                        kind = "deed" if btype in ("DEED BOOK", "MISC BOOK") else "will"
+                        banked = _bank_get(county, "book", book_type=btype, book=want_bp[0], page=want_bp[1])
+                        rd0b = banked["fields"] if banked and banked.get("fields") and banked.get("doc_kind") == kind else None
+                        if rd0b is None:
+                            if reads["n"] >= max_reads: break
+                            try: imgs = _idx2_book_images(ctx, url, btype, want_bp[0], want_bp[1], 3)
+                            except Exception as e: imgs = []; bp_check.setdefault("tried", []).append(f"{btype}: {str(e)[:60]}")
+                            if not imgs: continue
                             reads["n"] += 1
-                            rd0b = _idx2_read_doc("deed", imgs)
-                            _bank_put(county, "book", rd0b, doc_kind="deed", pages=len(imgs), book_type="DEED BOOK", book=want_bp[0], page=want_bp[1])
-                        bp_check["old_book"] = rd0b
-                        gs = " ".join((rd0b or {}).get("grantees") or []).upper()
-                        if last and last in gs:
-                            # it is the owner's own deed: start the chain there and follow it back
-                            chain.append({"date": rd0b.get("deed_date") or "", "type": "DEED (old book, read from the scanned page)",
-                                          "bookpage": bp_check["bookpage"], "grantor": "; ".join(rd0b.get("grantors") or []),
-                                          "grantee": "; ".join(rd0b.get("grantees") or []), "desc": rd0b.get("legal_description_short") or "",
-                                          "read": rd0b, "found_by": "book/page given - old deed book page (read by Fernando)"})
-                            m3 = _re_re.search(r"Book\s+(?:No\.?\s*)?(\d+)\s*,?\s*(?:at\s+)?Page\s+(?:No\.?\s*)?(\d+)", rd0b.get("prior_deed_reference") or "", _re_re.I)
-                            if m3: old_chain((m3.group(1).lstrip("0"), m3.group(2).lstrip("0")), rd0b.get("prior_deed_reference"), 3)
+                            rd0b = _idx2_read_doc(kind, imgs)
+                            _bank_put(county, "book", rd0b, doc_kind=kind, pages=len(imgs), book_type=btype, book=want_bp[0], page=want_bp[1])
+                        bp_check["old_book"], bp_check["book_type"] = rd0b, btype
+                        if kind == "deed":
+                            gs = " ".join((rd0b or {}).get("grantees") or []).upper()
+                            if last and last in gs:
+                                # it is the owner's own deed: start the chain there and follow it back
+                                chain.append({"date": rd0b.get("deed_date") or "", "type": "DEED (old book, read from the scanned page)",
+                                              "bookpage": bp_check["bookpage"], "grantor": "; ".join(rd0b.get("grantors") or []),
+                                              "grantee": "; ".join(rd0b.get("grantees") or []), "desc": rd0b.get("legal_description_short") or "",
+                                              "read": rd0b, "found_by": "book/page given - old deed book page (read by Fernando)"})
+                                m3 = _re_re.search(r"Book\s+(?:No\.?\s*)?(\d+)\s*,?\s*(?:at\s+)?Page\s+(?:No\.?\s*)?(\d+)", rd0b.get("prior_deed_reference") or "", _re_re.I)
+                                if m3: old_chain((m3.group(1).lstrip("0"), m3.group(2).lstrip("0")), rd0b.get("prior_deed_reference"), 8)
+                        else:
+                            # a will / appraisement / settlement / order: the owner inherited - then follow the DECEASED's own purchase
+                            dec = (rd0b or {}).get("deceased") or ""
+                            chain.append({"date": (rd0b or {}).get("will_date") or "", "type": f"{btype} (read from the scanned page)",
+                                          "bookpage": f"{btype} {want_bp[0]} @ {want_bp[1]}", "grantor": f"(estate of {dec})" if dec else "(estate)",
+                                          "grantee": "; ".join((rd0b or {}).get("beneficiaries") or []), "desc": (rd0b or {}).get("real_estate_mentioned") or "",
+                                          "read": rd0b, "kind": "will", "found_by": "book/page given - " + btype.lower() + " (read by Fernando)"})
+                            dl, df = _idx2_name(dec)
+                            if dl:
+                                try:
+                                    buys = [r for r in person(dl, df) if _idx2_is_deed(r) and r["role"] == "GRANTEE"]
+                                    sim = [r for r in buys if _idx2_desc_match(r["desc"], desc or "")] or buys
+                                    if sim:
+                                        cur, how = sorted(sim, key=lambda r: _idx2_day(r["date"]), reverse=True), f"the deceased's purchase ({dec})"
+                                except Exception:
+                                    pass
+                        break
             seen = set()
-            for step in range(6):
+            for step in range(12):                                # until 30 years back (12 deeds at most)
                 if not cur: break
+                if chain and far_enough(chain[-1].get("date")): break
                 d = cur[0]
                 entry = {"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d["other"], "grantee": d["name"],
                          "desc": d["desc"], "image_id": d.get("image_id") or None, "found_by": how}
@@ -4978,7 +5070,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                             if _idx2_bp(r["bookpage"]) == ref and _idx2_is_deed(r) and r["role"] == "GRANTEE"]
                     if prow:
                         cur, how = prow, "named in the deed text"; continue
-                    old_chain(ref, rd.get("prior_deed_reference"))
+                    if not far_enough(d["date"]): old_chain(ref, rd.get("prior_deed_reference"))
                     break
                 # 2. the seller's own purchase with a similar description
                 srows = person(sl, sf)
@@ -5027,6 +5119,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         prof = {"deeds": set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")), "addr": _idx2_addr(profile["address"]),
                 "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words,
                 "desc": desc or "", "legal_text": profile["legal"]}
+        prof_ref[0] = prof
 
         def settle(keep, skip):
             """Ari: read every open mortgage / property lien and decide by what the document itself says (the index line is not enough).
@@ -5034,7 +5127,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             for x in list(keep) + list(skip):
                 if x.get("kind") not in ("mortgage", "property") or x.get("released"): continue
                 if (x.get("why") or "").startswith(("before they owned", "recorded after")): continue
-                verdict, why = _idx2_match_read(read_item("debt", x) or {}, prof)
+                verdict, why = look("debt", x, x.get("bookpage"), x.get("type"))
                 if verdict == "yes":
                     x["why"], x["check"] = "on this property - " + why, False
                     if x in skip: skip.remove(x); keep.append(x)
@@ -5051,12 +5144,14 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         chosen, sale_checks = None, []
         for r in cands[:4]:
             item = {"image_id": r.get("image_id"), "bookpage": r["bookpage"]}
-            verdict, why = _idx2_match_read(read_item("deed", item) or {}, prof)
+            verdict, why = look("deed", item, r["bookpage"], r["doc"])
             sale_checks.append({"bookpage": r["bookpage"], "name": r["other"], "date": r["date"], "verdict": verdict or "could not tell",
                                 "why": why or ("no image to read" if not r.get("image_id") else "the deed does not say enough"),
                                 "index_matched": r in sales})
+            det = item.get("index_detail") or {}
+            if det.get("names"): sale_checks[-1]["parties"] = det["names"]
             if verdict == "yes":
-                chosen = dict(r, _how="read the deed: " + why); break
+                chosen = dict(r, _how=why, _parties=det.get("names")); break
         if not chosen:
             unsure = [r for r, c in zip(cands, sale_checks) if c["verdict"] == "could not tell" and c["index_matched"]]
             if unsure: chosen = dict(unsure[0], _check=True)
@@ -5088,6 +5183,7 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
             s = sales[0]
             new_owner = {"name": s["other"], "date": s["date"], "bookpage": s["bookpage"], "desc": s["desc"], "type": s["doc"]}
             if s.get("_how"): new_owner["confirmed"] = s["_how"]
+            if s.get("_parties"): new_owner["parties"] = s["_parties"]
             if s.get("_check"):
                 new_owner["check"] = "could not confirm from the deed itself that it is this property - open the deed and compare"
             bl, bf = _idx2_name(s["other"])
