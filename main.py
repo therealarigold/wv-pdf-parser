@@ -2914,7 +2914,7 @@ class Handler(BaseHTTPRequestHandler):
             out["avg_response_s"] = round(sum(r) / len(r), 2) if r else None
             out["max_response_s"] = max(r) if r else None
             out["avg_cert_s"] = round(sum(c) / len(c), 1) if c else None
-            out["readers"] = int(os.environ.get("SAO_THREADS", "2"))
+            out["readers"] = int(os.environ.get("SAO_THREADS", "1"))
             return self.respond(out)
 
         if path == "/fernando-status":
@@ -6812,6 +6812,6 @@ if __name__ == '__main__':
         for _q in range(int(os.environ.get("FERNANDO_CHAT_WORKERS", "2"))):   # 💬 question-only workers (2 = two staff asking at once)
             _og_threading.Thread(target=fernando_chat_loop, args=(_q,), daemon=True).start()
         if os.environ.get("SAO_READER", "1") == "1":
-            for _s in range(int(os.environ.get("SAO_THREADS", "2"))):   # 🧾 State Auditor documents (plain HTTP): 1 by day, 2 at night; 3 slowed the site down (2026-09-27)
+            for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP): 1 by day, 2 at night; 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
     HTTPServer(('0.0.0.0', port), Handler).serve_forever()
