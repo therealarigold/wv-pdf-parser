@@ -6846,13 +6846,28 @@ def _fz_cases_text(county, text, n=4):
 # ─────────────────────────────────────────────────────────────────────────────
 def _client_mail_body(job):
     import html as _h
-    link = f"https://portal.annelabes.com/set-password.html?t={job['token']}"
     name = (job.get("name") or "").strip()
     hi = f"Hello {_h.escape(name)}," if name else "Hello,"
+    if job["kind"] == "thanks":
+        amt = job.get("amount")
+        try: amt_txt = f"${float(amt):,.2f}"
+        except Exception: amt_txt = ""
+        certs = [c.strip() for c in (job.get("certs") or []) if c and c.strip()]
+        lst = "".join(f"<li>{_h.escape(c.title())}</li>" for c in certs[:40])
+        nxt = ("You can follow the progress in your client portal at <a href='https://portal.annelabes.com'>portal.annelabes.com</a>."
+               if job.get("portal_account") else
+               "In a separate email you will get a link to choose the password for your client portal, where you can follow the progress.")
+        body = (f"<div style='font-family:Georgia,serif;font-size:15px;color:#1f2937;max-width:560px'>"
+                f"<p>{hi}</p><p>Thank you - we received your payment{(' of <b>' + amt_txt + '</b>') if amt_txt else ''} and our title work has started"
+                f"{' on ' + str(job.get('liens')) + (' certificates' if job.get('liens') != 1 else ' certificate') if job.get('liens') else ''}:</p>"
+                f"{('<ul>' + lst + '</ul>') if lst else ''}"
+                f"<p>{nxt}</p><p>If you have any questions, just reply to this email.</p>"
+                f"<p>Thank you for your business,<br>Marci<br>Anne Labes, Esq.</p></div>")
+        return "Payment received - thank you | Anne Labes, Esq.", body
+    link = f"https://portal.annelabes.com/set-password.html?t={job['token']}"
     if job["kind"] == "welcome":
         subj = "Your client portal account - Anne Labes, Esq."
-        lead = ("Thank you - your payment was received and our title work has started. You also have a client portal account "
-                "where you can follow your certificates and title searches.")
+        lead = "Your client portal account is ready - there you can follow your certificates and title searches."
         valid = "The link works once and is good for 7 days."
     else:
         subj = "Set a new password - Anne Labes, Esq. client portal"
