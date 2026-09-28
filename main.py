@@ -5698,7 +5698,10 @@ def bank_owner_report(county, last, first, book=None, page=None, desc=None, dist
         if x.get("kind") in ("mortgage", "property") and not x.get("released"):
             x.setdefault("check", True); x["why"] = (x.get("why") or "") + " - Putnam: from the index line only, the paper was not read"
     # did the owner sell it? (index lines only - always 'check')
-    sells = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and not state_cert(r) and _idx2_day(r["date"]) >= (bought or "0")],
+    # not a sale: a mobile / manufactured home title cancelled to join the land (Putnam 2025-C-000588), corrections, affidavits
+    not_sale = lambda r: bool(_re_re.search(r"CANCELL?ATION OF TITLE|MOBILE|MANUFACTURED HOME|CORRECTI|AFFIDAVIT", (r["doc"] + " " + r["desc"]).upper()))
+    sells = sorted([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTOR" and not state_cert(r) and not not_sale(r)
+                    and _idx2_day(r["date"]) >= (bought or "0")],
                    key=lambda r: _idx2_day(r["date"]), reverse=True)
     other_interest = lambda r: _idx2_same_mineral(r["desc"], desc or "") == "no" or _idx2_other_district(r["desc"], district)
     sold_rows = [r for r in sells if not other_interest(r) and (_idx2_same_mineral(r["desc"], desc or "") == "yes"
