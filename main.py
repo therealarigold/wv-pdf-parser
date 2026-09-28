@@ -5399,8 +5399,23 @@ def _fz_rpc(name, args):
         return _re_json.loads(body) if body else None
 
 
+def _mem_used():
+    """Bytes this service uses now (the container's own count - what Render's 2 GB limit is checked against); 0 if unknown."""
+    for f in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(f) as fh: return int(fh.read().strip())
+        except Exception: pass
+    return 0
+
+
+_FZ_MEM_MAX = int(float(os.environ.get("FERNANDO_MEM_MAX_GB", "1.3")) * 1024 ** 3)
+
+
 def fernando_work_one():
     if _ai_paused(): return False
+    if _mem_used() > _FZ_MEM_MAX:            # each search opens its own browser - wait until memory frees up (no crash)
+        FERNANDO["waiting_memory"] = round(_mem_used() / 1024 ** 3, 2); return False
+    FERNANDO.pop("waiting_memory", None)
     run = _fz_rpc("fernando_claim", {})
     if not run: return False
     county, cert = run["county"], run["cert"]
