@@ -6128,14 +6128,18 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
     budget = {"reads": 0}
     tools = list(tools) + ([final_tool] if final_tool else [])
     for step in range(max_steps):
-        last_round = step >= max_steps - 2
+        last_round = step >= max_steps - 3
         if progress and step: progress("🤔 Thinking about what I found…")
         _fz_cache_mark(msgs)
         kw = dict(model=model, max_tokens=4000, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], messages=msgs,
                   extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
                   extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
         if last_round and final_tool:
-            kw["tools"], kw["tool_choice"] = [final_tool], {"type": "tool", "name": final_tool["name"]}
+            # newer models refuse a FORCED tool while thinking (400 "tool_choice ... not supported"): offer only the report
+            # form and ask for it; if he answers in words, the loop below asks again
+            kw["tools"], kw["tool_choice"] = [final_tool], {"type": "auto"}
+            if msgs and msgs[-1].get("role") == "user" and isinstance(msgs[-1].get("content"), list)                     and not any(isinstance(c, dict) and c.get("type") == "text" and "last step" in c.get("text", "") for c in msgs[-1]["content"]):
+                msgs[-1]["content"].append({"type": "text", "text": f"This is your last step: call {final_tool['name']} now with what you have."})
         elif not last_round and tools:
             kw["tools"] = tools
             if max_searches and budget.get("searches", 0) >= max_searches:
