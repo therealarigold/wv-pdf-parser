@@ -3894,7 +3894,13 @@ async def run_wvsao_refresh(scope='daily_recent'):
         # for a pushback this refresh does not knock either; two connection failures in a row pause both (same backoff)
         import time as _t
         fails, stop = 0, False
-        if _t.time() < SAO.get("pause_until", 0):
+        try: sao_on = (_fz_rpc("fz_config_get", {"p_key": "sao_render"}) or "on") != "off"
+        except Exception: sao_on = True
+        if not sao_on and os.environ.get("SAO_LOCAL", "").strip() != "1":
+            print('[refresh] skipped - State Auditor reading is off on the server (sao_render = off)', flush=True)
+            years, stop = [], True
+            log['notes'] = 'skipped: State Auditor reading is off on the server'
+        elif _t.time() < SAO.get("pause_until", 0):
             print(f'[refresh] skipped - the State Auditor site is blocking us (paused {int((SAO["pause_until"] - _t.time()) / 60)} more min)', flush=True)
             years, stop = [], True
             log['notes'] = 'skipped: State Auditor site blocking the server'
@@ -3902,6 +3908,10 @@ async def run_wvsao_refresh(scope='daily_recent'):
             if stop: break
             for county in _WV_COUNTIES_ALL:
                 log['counties_scraped'] += 1
+                t_wait = _t.time()
+                while not _fz_rpc("sao_pace_take", {"p_by": "refresh"}):        # the same ~2-minute shared pace as the letters
+                    if _t.time() - t_wait > 3600: break
+                    await _re_asyncio.sleep(20)
                 _RE_LAST_ERR["msg"] = ""
                 rows = await _re_scrape_county_year(page, year, county)
                 if _re_re.search(r"TIMED_OUT|CONNECTION_|Timeout|timed out|ERR_", _RE_LAST_ERR["msg"]):
@@ -7385,11 +7395,19 @@ def sao_loop(n=0):
     (plain HTTP, no browser). If the site pushes back (403 / 429 / 503 / block page) every reader pauses 30 minutes
     and the pushback is listed in /sao-status - never worked around."""
     import time as _t
-    _t.sleep(90 + 7 * n)
+    local = os.environ.get("SAO_LOCAL", "").strip() == "1"     # the office PC (sao_local.py) - see sao_render below
+    _t.sleep(5 if local else 90 + 7 * n)
     SAO.setdefault("careful", 20)                          # after a restart: start slow; the first sign of pushback pauses
     site, done_here = SaoHttp(), 0
     while True:
         try:
+            # 🛑 the State Auditor's county firewall blocked this server (2026-09-28); their office said (2026-09-29) we may read
+            # from another computer at ~30 letters an hour. fz_config 'sao_render' = 'off' keeps the server quiet meanwhile.
+            if not local:
+                try: on = (_fz_rpc("fz_config_get", {"p_key": "sao_render"}) or "on") != "off"
+                except Exception: on = True
+                if not on:
+                    SAO["state"] = "off on the server - reading from the office PC"; _t.sleep(600); continue
             if _t.time() < SAO.get("pause_until", 0):
                 SAO["state"] = "paused - the site pushed back"; _t.sleep(60); continue
             if n >= 1:
@@ -7402,7 +7420,7 @@ def sao_loop(n=0):
             if done_here >= 150: site, done_here = SaoHttp(), 0     # a fresh session now and then
             job = _fz_rpc("sao_claim", {})
             if not job:
-                SAO["state"] = "idle"; _t.sleep(300); continue
+                SAO["state"] = "waiting (shared pace ~30 letters / hour)"; _t.sleep(20 if local else 300); continue
             SAO["state"] = "working"
             SAO.setdefault("current", {})[n] = f"{job['county']} {job['cert']}"
             t0 = _t.time()
