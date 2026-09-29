@@ -7621,6 +7621,24 @@ class SmartSkipSite:
         return txt, before, self.balance()
 
 
+def _smartskip_lookup(first, last, middle="", city="", state="", address=""):
+    """One SmartSkip look-up in its OWN thread: a worker thread can run only one Playwright, and Fernando's county-index browser is
+    already open in his (the first real searches failed with that). Signs in, checks Records (free), else one paid search, closes.
+    -> (text, paid, balance_after)"""
+    import concurrent.futures as _cf
+    def run():
+        site = SmartSkipSite()
+        try:
+            old = site.from_records(first.title(), last.title())
+            if old: return old, False, site.balance()
+            txt, before, after = site.search(first, last, middle, city, state, address)
+            return txt, True, after
+        finally:
+            site.close()
+    with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(run).result(timeout=240)
+
+
 _SKIP_TOOL = {"name": "skip_trace", "description": (
     "SmartSkip people search - LAST RESORT, costs the office 15 cents each. Only for a NAMED person who is likely ALIVE and whose "
     "current address / phone the papers and web did not give. Needs first + last name and a city or state (or a mailing address). "
@@ -7747,14 +7765,12 @@ def surplus_fz_one():
             if skip["used"] >= skip["limit"]:
                 return f"Not searched: this case's SmartSkip allowance ({skip['limit']}) is used up. Call ask_for_more_searches if more are truly needed."
             try:
-                if skip["site"] is None: skip["site"] = SmartSkipSite()
-                old = skip["site"].from_records(key[0].title(), key[1].title())
-                if old:
-                    skip["done"][key] = old
+                txt, paid, after = _smartskip_lookup(inp.get("first"), inp.get("last"), inp.get("middle") or "", inp.get("city") or "",
+                                                     inp.get("state") or "", inp.get("address") or "")
+                if not paid:
+                    skip["done"][key] = txt
                     _surp_step(job, f"4. SmartSkip: {key[0].title()} {key[1].title()} - found in past searches (no charge)")
-                    return "From SmartSkip's saved records (searched before, no charge):\n" + old
-                txt, before, after = skip["site"].search(inp.get("first"), inp.get("last"), inp.get("middle") or "", inp.get("city") or "",
-                                                         inp.get("state") or "", inp.get("address") or "")
+                    return "From SmartSkip's saved records (searched before, no charge):\n" + txt
                 skip["used"] += 1
                 skip["done"][key] = txt
                 bal = f" (balance ${after:.2f})" if after is not None else ""
@@ -7765,6 +7781,7 @@ def surplus_fz_one():
                 skip["stop"] = str(e)
                 return f"SmartSkip stopped: {e}. Do not try it again on this case; list who still needs it in still_needed."
             except Exception as e:
+                print(f"[surplus] SmartSkip error: {str(e)[:300]}", flush=True)
                 return f"SmartSkip failed this time: {str(e)[:150]}"
         try:
             out = _fz_agent(_SURP_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH, _SKIP_TOOL, _SKIP_ASK], sites,
@@ -7772,7 +7789,6 @@ def surplus_fz_one():
                             max_steps=24, tag=f"surplus {county} {cert}", model=_FZH_MODEL, max_searches=10)
         finally:
             sites.close()
-            if skip["site"]: skip["site"].close()
         if isinstance(out, dict) and "__stop__" in out:           # he wants more searches: ask the owners, keep what he has
             ask = out["__stop__"]
             _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "needs_approval", "p_step": f"Asked for {ask.get('more')} more SmartSkip searches",
