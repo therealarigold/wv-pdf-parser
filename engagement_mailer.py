@@ -334,6 +334,28 @@ def send_call(kind, p):
     return _resend(to, subject, body, text, attachments)
 
 
+# 📅 Client calls onto Marci's Gold Standard calendar (the real estate app on Render). Waits until
+# PORTAL_INTEGRATION_SECRET is set here and in Gold Standard (same value); until then the rows just wait in line.
+_GS_PAUSE = [0.0]
+
+
+def send_gs_call(p):
+    url = _env("GS_URL", "https://real-estate-app-hr1c.onrender.com").rstrip("/") + "/integrations/portal-call"
+    req = urllib.request.Request(url, data=json.dumps(p).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "X-Portal-Secret": _env("PORTAL_INTEGRATION_SECRET"),
+                                          "User-Agent": "annelabes-portal/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            out = json.loads(r.read() or b"{}")
+        return "sent", f"{p.get('action')} → {out.get('calendar_of') or ('removed' if out.get('removed') else 'ok')}"
+    except urllib.error.HTTPError as ex:
+        err = ex.read().decode("utf-8", "replace")[:200]
+        # Gold Standard asleep / restarting, or not configured yet: try again later
+        return ("queued" if ex.code in (429, 500, 502, 503, 504) else "failed"), f"HTTP {ex.code}: {err}"
+    except urllib.error.URLError as ex:
+        return "queued", f"unreachable: {ex.reason}"
+
+
 def mailer_loop():
     have = lambda k: "yes" if _env(k) else "NO"
     print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ") — keys: resend " + have("RESEND_API_KEY")
@@ -345,6 +367,19 @@ def mailer_loop():
                 time.sleep(60); continue
             kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
             job = _rpc("engagement_outbox_next", {"p_kinds": kinds})
+            if not job and _env("PORTAL_INTEGRATION_SECRET") and time.time() >= _GS_PAUSE[0]:
+                g = _rpc("mail_outbox_next", {"p_kinds": ["gs_call"]})
+                if g:
+                    try:
+                        status, detail = send_gs_call(g["payload"] or {})
+                    except Exception as ex:
+                        status, detail = "failed", str(ex)[:300]
+                    _rpc("mail_outbox_done", {"p_id": g["id"], "p_status": status, "p_detail": detail})
+                    print(f"[mailer] gs_call #{g['id']}: {status} {detail[:120]}", flush=True)
+                    if status == "queued":
+                        _GS_PAUSE[0] = time.time() + 300   # Gold Standard not answering: let the emails go on, retry in 5 min
+                    else:
+                        time.sleep(2); continue
             if not job and _env("RESEND_API_KEY"):
                 m = _rpc("mail_outbox_next", {"p_kinds": ["call_booked_staff", "call_booked_client", "call_callback_staff"]})
                 if m:
