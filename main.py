@@ -5800,7 +5800,7 @@ def bank_image(county, bookpage, note=None):
     term = f"{b}/{pg}"
     def got():
         rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
-        return [(r.get("mime") or "image/jpeg", r["b64"]) for r in rows if r.get("b64") and (r.get("mime") or "").lower() in ("image/jpeg", "image/png", "")][:3]
+        return [(r.get("mime") or "image/jpeg", r["b64"]) for r in rows if r.get("b64") and (r.get("mime") or "").lower() in ("image/jpeg", "image/png", "")][:8]
     have = got()
     if have: return have
     try:
@@ -7184,11 +7184,12 @@ class PutnamSite:
             try: f()
             except Exception: pass
 
-    def step(self):
-        """Wait for our turn: one Putnam step every 60-90 s, daily cap."""
+    def step(self, kind="search"):
+        """Wait for our turn (Ari 2026-09-29): 'doc' = opening a document, 60-90 s apart, 300 a day; 'page' = the next page
+        of that document, ~8-14 s (skimming), not counted; 'search' = sign-in / search pages, 60-90 s, own cap."""
         import time as _t
         while True:
-            r = _fz_rpc("putnam_pace_take", {})
+            r = _fz_rpc("putnam_pace_take", {"p_kind": kind})
             if r == "ok": return
             if r == "off": raise PutnamStop("Putnam is switched off (fz_config putnam_server)")
             if r == "cap": raise PutnamStop("daily cap reached")
@@ -7293,21 +7294,21 @@ class PutnamSite:
         saved = 0
         for r in hits[:3]:
             iid = r["id"]
-            self.step()
+            self.step("doc")
             det = self.page.request.get(f"{_PH}/api/PutnamWV/Imaging/Document/Details/{iid}?indexTypeId=0&receiptId=0&lastIndexId=0&indexingModule=&QueueName=")
             try: info = det.json()
             except Exception: info = {}
             if info.get("ImageViewPurchaseRequired"):
                 raise PutnamStop(f"viewing {term} would cost money (ImageViewPurchaseRequired) - stopped")
-            self.step()
+            self.step("page")
             self.page.goto(f"{_PH}/PutnamWV/Search/Records/Details?IndexId={iid}", wait_until="domcontentloaded")
             self.check("document viewer")
             try: self.page.wait_for_selector("img[src*='Imaging/Document/Image']", timeout=60000)
             except Exception: continue
             srcs = self.page.evaluate("() => [...new Set([...document.images].map(i => i.src).filter(s => s.includes('Imaging/Document/Image')))]")
-            for n, src in enumerate(srcs[:3], 1):
+            for n, src in enumerate(srcs[:30], 1):                   # every page (Ari: skimming a long deed is normal)
                 full = _re_re.sub(r"&thumbnailSize=\d+", "", src)
-                self.step()
+                self.step("page")
                 resp = self.page.request.get(full, headers={"Referer": self.page.url})
                 body = resp.body() if resp.ok else b""
                 if not body: continue
