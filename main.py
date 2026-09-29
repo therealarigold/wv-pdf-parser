@@ -7648,10 +7648,13 @@ Rules:
    an obituary is fine as city/state only. Anything not confirmed gets confidence low.
 4. Every person gets their sources (the letter, book/page, or the URL). Keep it plain for office ladies.
 5. LAST, and only if still needed: skip_trace (SmartSkip, 15 cents each) for a NAMED person who is likely alive, when the papers and
-   the web gave no current address / phone. Give the city or state you know. Its results are only POSSIBLE. Match on: name + middle
-   initial, age vs the death / deed dates, spouse and relative names from the deeds, wills, obituaries and letters, and the MAILING
-   address on the State Auditor letters / tax records. Do NOT match on where the property is (Ari): owners often live in another county
-   or inherited the land, so a different county in the address history is not evidence against a match. No clear match: confidence low, say why.
+   the web gave no current address / phone. Give the city or state you know. Its results are only POSSIBLE. How to match (Ari):
+   - The DECIDING check: where the owner was actually SERVED (the notice-to-redeem / State Auditor letter service addresses) and
+     their MAILING ADDRESS on the tax records and letters. Compare those to the SmartSkip address history. A SmartSkip address that
+     matches a service or mailing address = strong evidence. None match = weaker; then rely on name + middle initial, ages vs the
+     death / deed dates, and spouse / relative names from the deeds, wills, obituaries and letters.
+   - A person with no tie at all to the property's area is only a weak warning sign: lower the confidence a little, but it is NOT a
+     reason to eliminate them (owners often live elsewhere or inherited the land).
    Its "possible relatives" are leads to confirm with the obituary, not heirs by themselves. Source: "SmartSkip (possible relative: Child)".
    Never search the same person twice. If the allowance runs out and more searches are truly needed, call ask_for_more_searches
    with a plain question; else list them in still_needed.
