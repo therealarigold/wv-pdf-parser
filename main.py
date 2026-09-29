@@ -7510,6 +7510,143 @@ def client_fz_loop():
 
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔎 SURPLUS: FERNANDO FINDS THE HEIRS (Ari 2026-09-29). Only owners send him (surplus_fz_request). Order of work, a step
+# logged after each: 1) State Auditor letters for the certificate (who was notified, "heirs of", addresses), 2) the county
+# index (owner's deeds, wills, estate papers - our bank for Putnam), 3) the web (obituaries "survived by...", probate), each
+# with its link. 4) SmartSkip (15 cents a search) - not connected yet: we have not seen their search flow / API; until then
+# Fernando lists who still needs a skip trace. Staff-only data; never invents an address or phone.
+# ─────────────────────────────────────────────────────────────────────────────
+_SURP_SYSTEM = """You are Fernando, working for a West Virginia tax-lien office on SURPLUS cases: a tax sale produced more money
+than was owed, and the surplus belongs to the former owner - or, when they died, to their heirs. Your job: find the people
+entitled to it and how to reach them, from the papers already gathered and the web.
+
+Rules:
+1. Start from the facts given: the owner on the tax ticket, the State Auditor letters (who the Notice to Redeem went to, "heirs of",
+   "et al", the addresses they were mailed to), and the county index search (deeds, wills, estate / appraisement papers).
+2. If the owner is dead: find the obituary / death notice (name + town / years). Accept it only when the town, dates or family names
+   match our papers; otherwise mark it "possible, not confirmed". The survivors named there ("survived by ...") are the likely heirs;
+   a will names the devisees and the executor. Check whether a survivor has died too (then their own heirs / estate).
+3. Addresses and phones: ONLY from a paper, a State Auditor letter, or a page you cite. Never guess or build one. "Lives in <city>" from
+   an obituary is fine as city/state only. Anything not confirmed gets confidence low.
+4. Every person gets their sources (the letter, book/page, or the URL). Keep it plain for office ladies.
+5. You do not have a skip-trace (people-search) service. If someone needs one to find a current address or phone, say so in
+   still_needed - name, why, and what is already known (city, age, relatives).
+
+Call report_surplus_heirs once at the end."""
+
+_SURP_REPORT = {"name": "report_surplus_heirs", "description": "Your finished heir search for this surplus case.",
+    "input_schema": {"type": "object", "properties": {
+        "summary": {"type": "string", "description": "3-8 plain sentences: who owned it, alive or not, who is entitled, what is still open"},
+        "people": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "relation": {"type": "string", "description": "e.g. owner, son of John Smith, executor"},
+            "status": {"type": "string", "enum": ["alive", "deceased", "unknown"]},
+            "address": {"type": "string", "description": "ONLY from a paper, a letter or a cited page; else empty"},
+            "phone": {"type": "string", "description": "ONLY from a cited source; else empty"},
+            "email": {"type": "string", "description": "ONLY from a cited source; else empty"},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "sources": {"type": "array", "items": {"type": "string", "description": "a paper (letter / book-page) or a URL"}}},
+            "required": ["name", "relation", "status", "confidence", "sources"]}},
+        "sources": {"type": "array", "items": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}},
+                                               "required": ["title"]}},
+        "still_needed": {"type": "array", "items": {"type": "string"}, "description": "people who need a skip trace / what staff should still check"}},
+        "required": ["summary", "people"]}}
+
+
+def _surp_step(job, text, **kw):
+    r = _fz_rpc("surplus_fz_update", dict({"p_id": job["id"], "p_status": "working", "p_step": text, "p_report": None,
+                                           "p_skip_used": None, "p_question": None}, **kw)) or {}
+    if r.get("cancelled"): raise FzPaused("cancelled by the office")
+    return r
+
+
+def surplus_fz_one():
+    job = _fz_rpc("surplus_fz_next", {})
+    if not job: return False
+    county, cert, year = (job.get("county") or "").upper(), job.get("cert") or "", str(job.get("year") or "")
+    _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_surplus", county, cert
+    print(f"[surplus] {county} {cert} ({year}) started", flush=True)
+    try:
+        from urllib.parse import quote as q
+        wv = (_re_sb_get(f"wvsao_certs?select=taxpayer,buyer_name_raw,description,status&year=eq.{q(year)}&cert_number=eq.{q(cert)}"
+                         f"&county=ilike.{q(county)}&limit=1") or [{}])[0]
+        owner = (wv.get("taxpayer") or "").split("\n")[0].strip()
+        # 1) State Auditor letters
+        sao = (_re_sb_get(f"sao_cert?select=docs,ntr,mail,sale,status&county=eq.{q(county)}&cert=eq.{q(cert)}&limit=1") or [{}])[0]
+        people = _re_sb_get(f"sao_person?select=name,address,source,doc_date&county=eq.{q(county)}&cert=eq.{q(cert)}&limit=60") or []
+        _surp_step(job, f"1. State Auditor letters: {len(people)} people / addresses on the letters"
+                        + ("" if sao else " (letters for this certificate not read yet)"))
+        # 2) county index
+        idx, note = {}, ""
+        last, first, note = fernando_owner_name(owner)
+        try:
+            if last:
+                if county in BANK_COUNTIES:
+                    idx = bank_owner_report(county, last, first, desc=wv.get("description"))
+                else:
+                    if county not in IDX2_URLS and county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
+                    idx = idx2_owner_report(county, last, first, desc=wv.get("description"), middle=fernando_owner_middle(owner))
+            small = {k: idx.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "sold", "property", "prior_owners")} if idx else {}
+            _surp_step(job, f"2. County index: {len(idx.get('deeds') or [])} deeds, {len(idx.get('estate') or [])} estate / will papers for {last} {first}"
+                            if last else f"2. County index: skipped ({note or 'no person name'})")
+        except FzPaused:
+            raise
+        except Exception as e:
+            small = {}
+            _surp_step(job, f"2. County index: could not search ({str(e)[:80]})")
+        # 3) web + reasoning (Fernando's agent with the index tools and web search)
+        prior = job.get("report") or {}
+        msgs = [{"role": "user", "content":
+            f"Surplus case {year} {county} County, certificate {cert}.\nOwner on the tax ticket: {owner or '(unknown)'} {('(' + note + ')') if note else ''}\n"
+            f"Property: {wv.get('description') or '(no description)'}\nBought at the sale by: {wv.get('buyer_name_raw') or '-'}\n"
+            f"Office note: {job.get('note') or '-'}\nPeople of interest the office already listed: {_re_json.dumps((job.get('case') or {}).get('people_of_interest'), ensure_ascii=False)[:3000]}\n\n"
+            f"STATE AUDITOR LETTERS (documents: {_re_json.dumps(sao.get('docs'), ensure_ascii=False)[:500]}; notice to redeem: "
+            f"{_re_json.dumps(sao.get('ntr'), ensure_ascii=False)[:1500]}):\n{_re_json.dumps(people, ensure_ascii=False)[:6000]}\n\n"
+            f"COUNTY INDEX SEARCH:\n{_re_json.dumps(small, ensure_ascii=False)[:20000]}\n\n"
+            + (f"YOUR EARLIER REPORT ON THIS CASE (continue from it, do not start over):\n{_re_json.dumps(prior, ensure_ascii=False)[:8000]}\n\n" if prior else "")
+            + "Find the people entitled to the surplus and how to reach them, then call report_surplus_heirs."}]
+        _surp_step(job, "3. Web: obituaries, death notices and probate mentions")
+        sites = _FzcSites(county)
+        try:
+            out = _fz_agent(_SURP_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_surplus",
+                            final_tool=_SURP_REPORT, max_steps=18, tag=f"surplus {county} {cert}", model=_FZH_MODEL, max_searches=10)
+        finally:
+            sites.close()
+        if not isinstance(out, dict): out = {"summary": str(out or "No report."), "people": []}
+        need = out.get("still_needed") or []
+        if need:
+            out["summary"] = (out.get("summary") or "") + " Skip tracing (SmartSkip) is not connected yet - the people under 'still needed' need it."
+        for s_ in out.get("sources") or []:
+            if isinstance(s_, dict) and not s_.get("url"): s_.pop("url", None)
+        _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "done", "p_step": "4. Done" + (f" - {len(need)} still need a skip trace" if need else ""),
+                                      "p_report": out, "p_skip_used": None, "p_question": None})
+        print(f"[surplus] {county} {cert}: done, {len(out.get('people') or [])} people", flush=True)
+    except FzPaused as e:
+        if "cancelled" in str(e):
+            print(f"[surplus] {county} {cert}: cancelled", flush=True)
+        else:     # Anthropic credits / pause: back in line
+            try: _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "failed", "p_step": "paused: " + str(e)[:120], "p_report": None, "p_skip_used": None, "p_question": None})
+            except Exception: pass
+    except Exception as e:
+        print(f"[surplus] {county} {cert} failed: {str(e)[:200]}", flush=True)
+        try: _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "failed", "p_step": "failed: " + str(e)[:150], "p_report": None, "p_skip_used": None, "p_question": None})
+        except Exception: pass
+    return True
+
+
+def surplus_fz_loop():
+    import time as _t
+    _t.sleep(150)
+    while True:
+        try:
+            if _mem_used() > _FZ_MEM_MAX: _t.sleep(60); continue
+            worked = surplus_fz_one()
+        except Exception as e:
+            print(f"[surplus] {e}", flush=True); worked = False
+        _t.sleep(5 if worked else 30)
+
+
+
 def fz_compare_loop():
     """🔬 One-off model comparison (fz_read_compare rows): the same paper read by the current and the candidate model."""
     import time as _t
@@ -8103,6 +8240,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=fz_compare_loop, daemon=True).start()         # 🔬 reader model comparison (one-off rows)
         _og_threading.Thread(target=putnam_loop, daemon=True).start()             # 🏛 Putnam with Fernando's own login (slow)
         _og_threading.Thread(target=client_fz_loop, daemon=True).start()          # 💬 clients ask Fernando about their own file
+        _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
