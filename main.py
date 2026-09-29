@@ -2752,6 +2752,54 @@ async def scrape_sheriff_v2(county, ticket, cert, auction_name, page):
     return result
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+# 🔒 SECURITY (audit 2026-09-29, Ari's go): the web routes had no login. Office pages now send the signed-in staff
+# member's Supabase token; the Render cron sends X-Worker-Key (WORKER_KEY env). WORKER_AUTH=enforce refuses the rest;
+# until then (log mode) requests without a valid login are only written to the log, so nothing breaks while we learn
+# who calls what. Square's webhook has its own signature check and is never gated.
+_AUTH_OPEN = {"/", "/health", "/square-webhook"}
+_AUTH_CACHE = {}
+
+
+def _auth_ok(headers):
+    """-> (ok, who)"""
+    import time as _t
+    wk = os.environ.get("WORKER_KEY", "").strip()
+    if wk and (headers.get("X-Worker-Key") or "").strip() == wk: return True, "worker-key"
+    tok = (headers.get("Authorization") or "").replace("Bearer", "").strip()
+    if tok.count(".") != 2: return False, "no staff login"
+    hit = _AUTH_CACHE.get(tok)
+    if hit and hit[1] > _t.time(): return hit[0], hit[2]
+    ok, who = False, "invalid login"
+    try:
+        req = _re_ur.Request(f"{_RE_SUPABASE_URL}/auth/v1/user",
+                             headers={"apikey": "sb_publishable_X1nUMQ4GQfiPj-AsVvigwQ_7g3d4i95", "Authorization": "Bearer " + tok})
+        with _re_ur.urlopen(req, timeout=10) as r:
+            u = _re_json.loads(r.read() or b"{}")
+        if u.get("id"): ok, who = True, (u.get("email") or u["id"])
+    except Exception:
+        pass
+    if len(_AUTH_CACHE) > 500: _AUTH_CACHE.clear()
+    _AUTH_CACHE[tok] = (ok, _t.time() + 600, who)
+    return ok, who
+
+
+def _auth_gate(handler, path):
+    """True = go ahead. In enforce mode answers 401 itself and returns False."""
+    if path in _AUTH_OPEN: return True
+    ok, who = _auth_ok(handler.headers)
+    if ok: return True
+    ref = (handler.headers.get("Referer") or handler.headers.get("Origin") or "-")[:80]
+    if os.environ.get("WORKER_AUTH", "").strip().lower() == "enforce":
+        print(f"[auth] REFUSED {path} ({who}) from {ref}", flush=True)
+        body = b'{"error":"sign in required"}'
+        handler.send_response(401); handler.send_header('Content-Type', 'application/json'); handler._cors()
+        handler.send_header('Content-Length', len(body)); handler.end_headers(); handler.wfile.write(body)
+        return False
+    print(f"[auth] would refuse {path} ({who}) from {ref}", flush=True)
+    return True
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
@@ -2761,11 +2809,12 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header('Access-Control-Allow-Origin','*')
         self.send_header('Access-Control-Allow-Methods','POST, GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers','Content-Type')
+        self.send_header('Access-Control-Allow-Headers','Content-Type, Authorization, X-Worker-Key')
 
     def do_GET(self):
         path = self.path.split("?")[0]
         print(f"[GET] {path}", flush=True)
+        if not _auth_gate(self, path): return
         if path == "/counties":
             return self.respond({"success": True, "counties": get_county_registry()})
 
@@ -3051,6 +3100,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length',0))
             body = self.rfile.read(length)
             path = self.path.split("?")[0]
+            if not _auth_gate(self, path): return
 
             if path == "/square-webhook":   # 📨 Square: a client paid their agreement (engagement_mailer.py checks the signature)
                 from engagement_mailer import handle_square_webhook
