@@ -2775,6 +2775,13 @@ class Handler(BaseHTTPRequestHandler):
             target = qs.get('url', [None])[0]
             if not target:
                 return self.respond({"error": "No URL provided"})
+            # 🔒 security audit 2026-09-29: this route was an open proxy (any URL, incl. internal addresses). No portal page uses
+            # it any more - only https State Auditor pages are allowed.
+            u = urlparse(target)
+            host = (u.hostname or "").lower()
+            if u.scheme != "https" or not (host == "wvsao.gov" or host.endswith(".wvsao.gov")):
+                print(f"[proxy] refused {host or target[:60]}", flush=True)
+                return self.respond({"error": "not allowed"})
             try:
                 import urllib.request as ur
                 req = ur.Request(target, headers={
