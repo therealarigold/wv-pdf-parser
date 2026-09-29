@@ -7189,7 +7189,7 @@ class PutnamSite:
         self.search_page(term)
         rows = self.rows()
         got = self.ingest_rows(rows)
-        for i in range(0, len(got), 1500):
+        for i in range(0, max(len(got), 1), 1500):      # also when nothing was found, so the name counts as searched
             _fz_rpc("idx_ingest_srv", {"p_county": "PUTNAM", "p_search": "name:" + term, "p_rows": got[i:i + 1500], "p_page": 0, "p_pages": 1})
         return len(rows)
 
@@ -7256,6 +7256,22 @@ def putnam_loop():
         except Exception as e:
             print(f"[putnam] queue: {e}", flush=True); _t.sleep(60); continue
         if not req:
+            # 🗂 collecting owners for our bank (not title work): only 7-9 pm New York time (Ari), names only, no pictures
+            try: term = _fz_rpc("putnam_bank_next_srv", {})
+            except Exception: term = None
+            if term:
+                try:
+                    if site is None: site = PutnamSite()
+                    print(f"[putnam] bank {term}: {site.name_search(term)}", flush=True)
+                except PutnamStop as e:
+                    if "daily cap" not in str(e) and "switched off" not in str(e):
+                        _fz_rpc("putnam_stop", {"p_reason": str(e)}); print(f"[putnam] STOPPED: {e}", flush=True)
+                    if site: site.close(); site = None
+                except Exception as e:
+                    print(f"[putnam] bank {term} failed: {str(e)[:200]}", flush=True)
+                    if site: site.close(); site = None
+                    _t.sleep(300)
+                continue
             _t.sleep(30); continue
         try:
             if site is None: site = PutnamSite()
