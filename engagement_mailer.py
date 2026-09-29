@@ -291,8 +291,19 @@ def _when(ts):
 
 def build_call_email(kind, p):
     name = (p.get("name") or "").strip()
-    when = _when(p["slot_at"])
     esc = html.escape
+    if kind == "call_callback_staff":     # none of the call times worked: call them back / leave a voicemail
+        who = name or ("Bidder #" + str(p.get("bidder") or ""))
+        link = "https://portal.annelabes.com/#client=" + urllib.parse.quote(str(p.get("bidder") or ""))
+        phone = str(p.get("phone") or "")
+        body = (f"<p><b>{esc(who)}</b> couldn't make any of the call times and asked us to call them back.</p>"
+                f"<p>Phone: <a href='tel:{esc(phone, quote=True)}'>{esc(phone)}</a></p>"
+                + (f"<p>Good time to reach them: “{esc(p['note'])}”</p>" if p.get("note") else "")
+                + "<p>Call when you can, or leave a voicemail. Then click <b>✓ Talked</b> or <b>Left voicemail</b> in the portal's call list.</p>"
+                + _button(link, "Open the client's file"))
+        text = f"{who} asked for a call back at {phone}." + (f" Good time: {p['note']}." if p.get("note") else "") + " Client file: " + link
+        return f"📞 Please call back: {who}", _wrap(body), text, []
+    when = _when(p["slot_at"])
     if kind == "call_booked_staff":
         who = name or ("Bidder #" + str(p.get("bidder") or ""))
         link = "https://portal.annelabes.com/#client=" + urllib.parse.quote(str(p.get("bidder") or ""))
@@ -335,7 +346,7 @@ def mailer_loop():
             kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
             job = _rpc("engagement_outbox_next", {"p_kinds": kinds})
             if not job and _env("RESEND_API_KEY"):
-                m = _rpc("mail_outbox_next", {"p_kinds": ["call_booked_staff", "call_booked_client"]})
+                m = _rpc("mail_outbox_next", {"p_kinds": ["call_booked_staff", "call_booked_client", "call_callback_staff"]})
                 if m:
                     try:
                         status, detail = send_call(m["kind"], m["payload"] or {})
