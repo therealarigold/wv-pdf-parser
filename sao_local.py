@@ -4,7 +4,7 @@ The State Auditor's office wrote that automated reading is fine at a reasonable 
 may read from another computer while the county firewall blocks our server. This runs ONLY the letters reader, one letter at a
 time, on the shared pace kept in the database (one State Auditor visit every ~2 minutes for ALL readers together).
 
-Start:  double-click sao_local.bat   (or:  python sao_local.py)
+Start:  double-click sao_local.bat   (or:  python sao_local.py;  add --check-now for a catch-up certificate check now)
 Stop:   close the window (or Ctrl+C)
 
 It needs a file named .env next to this one with the line
@@ -28,7 +28,36 @@ sys.path.insert(0, here)
 
 import main  # noqa: E402  (loads the shared code; the web server is not started)
 
-print("State Auditor letters reader - office PC. Shared pace ~30 letters / hour. Close this window to stop.", flush=True)
+
+def nightly_certificate_check():
+    """The State Auditor certificate check (redeemed / deeded / new buyers) once a night, starting 1 am New York time, on
+    this PC while the Auditor's firewall blocks our server (Ari 2026-09-29). Every county page takes a slot of the same
+    shared ~2-minute pace as the letters, so together we stay at ~30 an hour. Pass --check-now for a catch-up run now."""
+    import time, datetime
+    def ny_now():      # New York time without tz data (Windows has none): EDT from the 2nd Sunday of March to the 1st of November
+        u = datetime.datetime.utcnow()
+        def sunday(y, m, n):
+            d = datetime.datetime(y, m, 1)
+            return d + datetime.timedelta(days=(6 - d.weekday()) % 7 + 7 * (n - 1))
+        start, end = sunday(u.year, 3, 2) + datetime.timedelta(hours=7), sunday(u.year, 11, 1) + datetime.timedelta(hours=6)
+        return u - datetime.timedelta(hours=4 if start <= u < end else 5)
+    now_run = "--check-now" in sys.argv
+    last_day = None
+    while True:
+        t = ny_now()
+        if now_run or (t.hour >= 1 and t.hour < 6 and last_day != t.date()):
+            now_run, last_day = False, t.date()
+            print(f"[night check] starting the certificate check {t:%Y-%m-%d %H:%M} New York", flush=True)
+            try: main.run_wvsao_refresh_sync(scope="daily_recent")
+            except Exception as e: print(f"[night check] failed: {e}", flush=True)
+            print("[night check] done", flush=True)
+        time.sleep(300)
+
+
+import threading
+threading.Thread(target=nightly_certificate_check, daemon=True).start()
+print("State Auditor reader - office PC: letters all day + the certificate check every night at 1 am New York.", flush=True)
+print("Shared pace ~30 an hour. Close this window to stop.", flush=True)
 try:
     main.sao_loop(0)
 except KeyboardInterrupt:

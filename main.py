@@ -4137,6 +4137,12 @@ async def run_wvsao_refresh(scope='daily_recent'):
 
     duration = (_re_dt.now() - start_ts).total_seconds()
     log['duration_seconds'] = int(duration)
+    if log.get('counties_scraped') and not log.get('total_certs_seen') and not str(log.get('notes') or '').startswith('skipped'):
+        log['status'] = 'failed'
+        log['notes'] = (str(log.get('notes') or '') + ' 0 certificates seen - the State Auditor site did not answer').strip()
+        try: _fz_rpc("owner_alert", {"p_title": "⚠ Certificate check failed",
+                                     "p_body": "Last night's State Auditor certificate check saw 0 certificates - redemptions / deeds were NOT updated. It tries again tonight."})
+        except Exception as e: print(f"[refresh] alert failed: {e}", flush=True)
 
     # 6. Write log entry
     _re_sb_insert('wvsao_refresh_log', [log])
