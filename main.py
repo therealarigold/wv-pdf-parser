@@ -7123,15 +7123,15 @@ class PutnamSite:
         user, pw = os.environ.get("PUTNAM_USER", "").strip(), os.environ.get("PUTNAM_PASS", "").strip()
         if not (user and pw): raise PutnamStop("PUTNAM_USER / PUTNAM_PASS not set on the server")
         self.step()
-        self.page.goto(_PH + "/PutnamWV/Account/Login", wait_until="domcontentloaded")
+        self.page.goto(_PH + "/Portal/Account/Login?returnUrl=/PutnamWV/Search/Records", wait_until="domcontentloaded")
         self.check("sign-in page")
         self.page.fill("#UserName", user)
         self.page.fill("#Password", pw)
         self.step()
         with self.page.expect_navigation(wait_until="domcontentloaded"):
-            self.page.locator("#login [type=submit], #login button").first.click()
+            self.page.click("#login #submit")
         self.check("after sign-in")
-        if "Account/Login" in (self.page.url or ""):
+        if "Account/Login" in (self.page.url or "") or self.page.locator("#SearchTerm").count() == 0 and "/PutnamWV/" not in (self.page.url or ""):
             raise PutnamStop("sign-in refused - check PUTNAM_USER / PUTNAM_PASS in Render")
         self.signed_in = True
         print("[putnam] signed in", flush=True)
