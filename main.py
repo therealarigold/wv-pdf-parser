@@ -7283,58 +7283,70 @@ class PutnamSite:
 
 
 def putnam_loop():
-    """Serves Putnam requests with Fernando's own membership, one at a time, at the county's pace."""
+    """Serves Putnam requests with Fernando's own membership, one at a time, at the county's pace.
+    Never dies: any error (a database hiccup included) closes the browser, waits a minute and carries on."""
     import time as _t
     if not os.environ.get("PUTNAM_USER", "").strip(): return
     _t.sleep(120)
-    site = None
+    st = {"site": None}
     while True:
         try:
-            if (_fz_rpc("fz_config_get", {"p_key": "putnam_server"}) or "on") != "on":
-                if site: site.close(); site = None
-                _t.sleep(600); continue
-            req = _fz_rpc("idx_live_next_srv", {"p_county": "PUTNAM"})
+            _putnam_tick(st)
         except Exception as e:
-            print(f"[putnam] queue: {e}", flush=True); _t.sleep(60); continue
-        if not req:
-            # 🗂 collecting owners for our bank (not title work): only 7-9 pm New York time (Ari), names only, no pictures
-            try: term = _fz_rpc("putnam_bank_next_srv", {})
-            except Exception: term = None
-            if term:
-                try:
-                    if site is None: site = PutnamSite()
-                    print(f"[putnam] bank {term}: {site.name_search(term)}", flush=True)
-                except PutnamStop as e:
-                    if "daily cap" not in str(e) and "switched off" not in str(e):
-                        _fz_rpc("putnam_stop", {"p_reason": str(e)}); print(f"[putnam] STOPPED: {e}", flush=True)
-                    if site: site.close(); site = None
-                except Exception as e:
-                    print(f"[putnam] bank {term} failed: {str(e)[:200]}", flush=True)
-                    if site: site.close(); site = None
-                    _t.sleep(300)
-                continue
-            _t.sleep(30); continue
-        try:
-            if site is None: site = PutnamSite()
-            n = site.name_search(req["term"]) if req.get("kind") != "image" else site.images(req["term"])
-            _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": n, "p_error": None if n or req.get("kind") != "image" else "not found"})
-            print(f"[putnam] {req.get('kind')} {req['term']}: {n}", flush=True)
-        except PutnamStop as e:
-            msg = str(e)
-            if "daily cap" in msg or "switched off" in msg:
-                _fz_rpc("idx_live_requeue_srv", {"p_id": req["id"]})          # back in line for tomorrow / when switched on
-                print(f"[putnam] {msg} - resting", flush=True)
-                _t.sleep(1800); continue
-            _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": 0, "p_error": msg})
-            _fz_rpc("putnam_stop", {"p_reason": msg})
-            print(f"[putnam] STOPPED: {msg}", flush=True)
-            if site: site.close(); site = None
-        except Exception as e:
-            _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": 0, "p_error": str(e)[:200]})
-            print(f"[putnam] {req['term']} failed: {str(e)[:200]}", flush=True)
-            if site: site.close(); site = None
+            print(f"[putnam] loop error (carrying on): {str(e)[:200]}", flush=True)
+            try:
+                if st["site"]: st["site"].close()
+            except Exception: pass
+            st["site"] = None
             _t.sleep(60)
 
+
+def _putnam_tick(st):
+    """One round: serve one title request, or (7-9 pm New York) one bank name, or rest. Errors go up to putnam_loop."""
+    import time as _t
+    def close():
+        if st["site"]: st["site"].close()
+        st["site"] = None
+    if (_fz_rpc("fz_config_get", {"p_key": "putnam_server"}) or "on") != "on":
+        close(); _t.sleep(600); return
+    req = _fz_rpc("idx_live_next_srv", {"p_county": "PUTNAM"})
+    if not req:
+        # 🗂 collecting owners for our bank (not title work): only 7-9 pm New York time (Ari), names only, no pictures
+        term = _fz_rpc("putnam_bank_next_srv", {})
+        if not term:
+            _t.sleep(30); return
+        try:
+            if st["site"] is None: st["site"] = PutnamSite()
+            print(f"[putnam] bank {term}: {st['site'].name_search(term)}", flush=True)
+        except PutnamStop as e:
+            if "daily cap" not in str(e) and "switched off" not in str(e):
+                _fz_rpc("putnam_stop", {"p_reason": str(e)}); print(f"[putnam] STOPPED: {e}", flush=True)
+            close(); _t.sleep(600)
+        return
+    try:
+        if st["site"] is None: st["site"] = PutnamSite()
+        n = st["site"].name_search(req["term"]) if req.get("kind") != "image" else st["site"].images(req["term"])
+        _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": n, "p_error": None if n or req.get("kind") != "image" else "not found"})
+        print(f"[putnam] {req.get('kind')} {req['term']}: {n}", flush=True)
+    except PutnamStop as e:
+        msg = str(e)
+        if "daily cap" in msg or "switched off" in msg:
+            _fz_rpc("idx_live_requeue_srv", {"p_id": req["id"]})          # back in line for tomorrow / when switched on
+            print(f"[putnam] {msg} - resting", flush=True)
+            close(); _t.sleep(1800); return
+        _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": 0, "p_error": msg})
+        _fz_rpc("putnam_stop", {"p_reason": msg})
+        print(f"[putnam] STOPPED: {msg}", flush=True)
+        close()
+    except Exception as e:
+        # a hiccup: back in line (up to 3 tries, then failed) so it is not lost; putnam_loop waits a minute
+        fails = st.setdefault("fails", {})
+        fails[req["id"]] = fails.get(req["id"], 0) + 1
+        try:
+            if fails[req["id"]] >= 3: _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": 0, "p_error": str(e)[:200]})
+            else: _fz_rpc("idx_live_requeue_srv", {"p_id": req["id"]})
+        except Exception: pass
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
