@@ -4576,7 +4576,21 @@ def _ai_paused():
         return False
 
 
-def _idx2_read_doc(kind, images):
+_READ_MODEL = {"name": "claude-opus-5", "at": 0.0}
+
+
+def _fz_read_model():
+    """The deed reader's model (fz_config 'read_model', checked every 5 min) - Ari 2026-09-29: opus-5-5 only after a
+    10-paper comparison shows it reads as well or better."""
+    import time as _t
+    if _t.time() - _READ_MODEL["at"] > 300:
+        try: _READ_MODEL["name"] = _fz_rpc("fz_config_get", {"p_key": "read_model"}) or "claude-opus-5"
+        except Exception: pass
+        _READ_MODEL["at"] = _t.time()
+    return _READ_MODEL["name"]
+
+
+def _idx2_read_doc(kind, images, model=None):
     """Read scanned pages with Claude; returns the fields asked for (blank when not on the pages)."""
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key:
@@ -4600,7 +4614,7 @@ def _idx2_read_doc(kind, images):
     client = anthropic.Anthropic(api_key=key)
     if _ai_paused(): raise FzPaused(FZ_PAUSE_MSG)
     try:
-        msg = _idx2_read_call(client, content, schema)
+        msg = _idx2_read_call(client, content, schema, model)
     except Exception as e:
         _ai_pause_check(e); raise
     _ai_log(msg)
@@ -4614,9 +4628,9 @@ def _idx2_read_doc(kind, images):
         return json.loads(m.group(0)) if m else {"error": "unreadable answer"}
 
 
-def _idx2_read_call(client, content, schema):
+def _idx2_read_call(client, content, schema, model=None):
     return client.messages.create(
-        model="claude-opus-5", max_tokens=4000,
+        model=model or _fz_read_model(), max_tokens=4000,
         messages=[{"role": "user", "content": content}],
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
         extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
@@ -7034,6 +7048,34 @@ def client_mail_one():
     return True
 
 
+def fz_compare_loop():
+    """🔬 One-off model comparison (fz_read_compare rows): the same paper read by the current and the candidate model."""
+    import time as _t
+    _t.sleep(120)
+    while True:
+        try:
+            job = _fz_rpc("fz_compare_next", {})
+        except Exception:
+            job = None
+        if not job:
+            _t.sleep(300); continue
+        _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_read_compare", job["county"], job["bookpage"]
+        out = {"id": job["id"], "old_model": "claude-opus-5", "new_model": "claude-opus-5-5"}
+        try:
+            imgs = bank_image(job["county"], job["bookpage"].replace("/", " @ "))
+            if not imgs: raise RuntimeError("no picture for " + job["bookpage"])
+            out["old_read"] = _idx2_read_doc(job["kind"], imgs, model="claude-opus-5")
+            out["new_read"] = _idx2_read_doc(job["kind"], imgs, model="claude-opus-5-5")
+            out["status"] = "done"
+        except FzPaused:
+            _t.sleep(1800); continue
+        except Exception as e:
+            out.update(status="failed", error=str(e)[:300])
+        try: _fz_rpc("fz_compare_save", {"p": out})
+        except Exception as e: print(f"[compare] save failed: {e}", flush=True)
+        _t.sleep(5)
+
+
 def client_mail_loop():
     import time as _t
     _t.sleep(60)
@@ -7588,6 +7630,7 @@ if __name__ == '__main__':
             for _s in range(int(os.environ.get("SAO_THREADS", "1"))):   # 🧾 State Auditor documents (plain HTTP): 1 by day, 2 at night; 3 slowed the site down (2026-09-27)
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
         _og_threading.Thread(target=client_mail_loop, daemon=True).start()        # 🔑 client portal login emails
+        _og_threading.Thread(target=fz_compare_loop, daemon=True).start()         # 🔬 reader model comparison (one-off rows)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
