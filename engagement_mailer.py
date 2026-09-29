@@ -21,7 +21,7 @@ Render environment:
   ENG_FROM         — default "Marci at Anne Labes, Esq. <marci@annelabes.com>"
   ENG_REPLY_TO     — default marci@annelabes.com
 """
-import base64, hashlib, hmac, html, json, os, re, time, urllib.request, urllib.error
+import base64, hashlib, hmac, html, json, os, re, time, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 SB_URL = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
@@ -245,6 +245,10 @@ def send(kind, e):
     if not to:
         return "skipped", "no email address"
     subject, body, text, attachments = build_email(kind, e)
+    return _resend(to, subject, body, text, attachments)
+
+
+def _resend(to, subject, body, text, attachments=None):
     live = _env("ENG_LIVE") == "1"
     rcpt = [to] if live else [x.strip() for x in _env("ENG_TEST_TO", "ari@eqoppa.com").split(",") if x.strip()]
     if not live:
@@ -266,6 +270,59 @@ def send(kind, e):
         return ("queued" if ex.code in (429, 500, 502, 503) else "failed"), f"HTTP {ex.code}: {err}"
 
 
+# ── 📞 Client calls booked from the client portal (mail_outbox: call_booked_staff / call_booked_client) ──────────
+def _ics(p, summary, desc):
+    start = datetime.fromisoformat(str(p["slot_at"]).replace("Z", "+00:00")).astimezone(timezone.utc)
+    end = start + timedelta(minutes=int(p.get("minutes") or 10))
+    f = lambda d: d.strftime("%Y%m%dT%H%M%SZ")
+    esc = lambda t: str(t or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+    return "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Anne Labes Esq//Client calls//EN", "METHOD:PUBLISH",
+                         "BEGIN:VEVENT", f"UID:client-call-{p.get('call_id')}@annelabes.com", "DTSTAMP:" + f(datetime.now(timezone.utc)),
+                         "DTSTART:" + f(start), "DTEND:" + f(end), "SUMMARY:" + esc(summary), "DESCRIPTION:" + esc(desc),
+                         "BEGIN:VALARM", "TRIGGER:-PT10M", "ACTION:DISPLAY", "DESCRIPTION:" + esc(summary), "END:VALARM",
+                         "END:VEVENT", "END:VCALENDAR", ""])
+
+
+def _when(ts):
+    d = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(ET)
+    day = d.strftime("%A, %B ") + str(d.day)
+    return day + " at " + d.strftime("%I:%M %p").lstrip("0") + " (Eastern)"
+
+
+def build_call_email(kind, p):
+    name = (p.get("name") or "").strip()
+    when = _when(p["slot_at"])
+    esc = html.escape
+    if kind == "call_booked_staff":
+        who = name or ("Bidder #" + str(p.get("bidder") or ""))
+        link = "https://portal.annelabes.com/#client=" + urllib.parse.quote(str(p.get("bidder") or ""))
+        desc = f"Call {who} at {p.get('phone') or '(no phone)'}.\n" + (f"About: {p['note']}\n" if p.get("note") else "") + "Client file: " + link
+        subject = f"📞 Client call: {who} — {when}"
+        body = (f"<p><b>{esc(who)}</b> booked a {int(p.get('minutes') or 10)}-minute call from the client portal.</p>"
+                f"<p>When: <b>{esc(when)}</b><br>Phone: <a href='tel:{esc(str(p.get('phone') or ''), quote=True)}'>{esc(str(p.get('phone') or ''))}</a></p>"
+                + (f"<p>About: “{esc(p['note'])}”</p>" if p.get("note") else "")
+                + _button(link, "Open the client's file") + "<p style='color:#6b7280;font-size:13px'>The calendar invite is attached.</p>")
+        return subject, _wrap(body), desc, [{"filename": "client-call.ics", "content": base64.b64encode(_ics(p, "Call " + who, desc).encode()).decode(),
+                                              "content_type": "text/calendar"}]
+    first = name.split()[0] if name else ""
+    subject = "Your call with our office — " + when
+    body = (f"<p>{('Hi ' + esc(first) + ',') if first else 'Hello,'}</p>"
+            f"<p>Thank you for scheduling a call. We'll call you on <b>{esc(when)}</b>"
+            + (f" at <b>{esc(str(p['phone']))}</b>" if p.get("phone") else "") + ". It takes about 10 minutes, and we'll have your file open.</p>"
+            "<p>If you need to change the time, you can cancel it on your portal page and pick a new one, or just reply to this email.</p>")
+    text = f"Thank you for scheduling a call. We'll call you on {when}. To change it, cancel it on your portal page or reply to this email."
+    return subject, _wrap(body), text, [{"filename": "call.ics", "content": base64.b64encode(_ics(p, "Call with Anne Labes' office", text).encode()).decode(),
+                                          "content_type": "text/calendar"}]
+
+
+def send_call(kind, p):
+    to = (p.get("to") or "").strip()
+    if not to:
+        return "skipped", "no email address"
+    subject, body, text, attachments = build_call_email(kind, p)
+    return _resend(to, subject, body, text, attachments)
+
+
 def mailer_loop():
     have = lambda k: "yes" if _env(k) else "NO"
     print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ") — keys: resend " + have("RESEND_API_KEY")
@@ -277,6 +334,16 @@ def mailer_loop():
                 time.sleep(60); continue
             kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
             job = _rpc("engagement_outbox_next", {"p_kinds": kinds})
+            if not job and _env("RESEND_API_KEY"):
+                m = _rpc("mail_outbox_next", {"p_kinds": ["call_booked_staff", "call_booked_client"]})
+                if m:
+                    try:
+                        status, detail = send_call(m["kind"], m["payload"] or {})
+                    except Exception as ex:
+                        status, detail = "failed", str(ex)[:300]
+                    _rpc("mail_outbox_done", {"p_id": m["id"], "p_status": status, "p_detail": detail})
+                    print(f"[mailer] {m['kind']} #{m['id']}: {status} {detail[:120]}", flush=True)
+                    time.sleep(2 if status != "queued" else 60); continue
             if not job:
                 time.sleep(20); continue
             try:
