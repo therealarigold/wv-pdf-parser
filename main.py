@@ -5674,7 +5674,7 @@ _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses
 # is included in the subscription (Ari 2026-09-28) - the window fetches the viewer's pages (kind 'image'); copies are never bought. Fernando: bank first, a live request only for a name the bank lacks (a few per ticket).
 # ─────────────────────────────────────────────────────────────────────────────
 BANK_COUNTIES = {"PUTNAM"}
-_BANK_LIVE_WAIT = 180
+_BANK_LIVE_WAIT = 900
 
 
 def bank_owner_rows(county, last, first="", live=True, note=None):
@@ -5701,7 +5701,7 @@ def bank_owner_rows(county, last, first="", live=True, note=None):
     return rows
 
 
-_BANK_IMAGE_WAIT = 600
+_BANK_IMAGE_WAIT = 1500
 _BANK_MAX_READS = 8
 
 
@@ -7058,6 +7058,228 @@ def client_mail_one():
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🏛 PUTNAM ON THE SERVER (Ari 2026-09-29): Fernando's OWN RecordHub membership (PUTNAM_USER / PUTNAM_PASS, typed by Ari in
+# Render; the office keeps the other login). The county allows automation at a normal user's pace, title work only. So:
+#  - one page at a time, one step every 60-90 s (putnam_pace_take, shared in the DB), at most putnam_daily_cap views a day -
+#    every page load, search page and picture counts as a view
+#  - signs in once and stays signed in; a captcha / "are you a robot" / terms screen / any price or cart = STOP (putnam_stop),
+#    never solved or clicked through
+#  - viewer pictures only (viewing is included in the membership); never any purchase / print / certified-copy call
+# It serves the same request queue the office window served (idx_live_request: 'name' searches -> our Putnam bank,
+# 'image' book/page -> idx_image), so Fernando's code does not change.
+# ─────────────────────────────────────────────────────────────────────────────
+_PH = "https://recordhub.cottsystems.com"
+_PH_STOP_RE = _re_re.compile(r"captcha|are you a robot|not a robot|verify you are human|unusual traffic|too many requests|access denied", _re_re.I)
+
+
+class PutnamStop(Exception):
+    pass
+
+
+class PutnamSite:
+    def __init__(self):
+        from playwright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        self.browser = self._pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        self.ctx = self.browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+                                            viewport={"width": 1400, "height": 1000})
+        self.page = self.ctx.new_page()
+        self.page.set_default_timeout(60000)
+        self.signed_in = False
+
+    def close(self):
+        for f in (self.ctx.close, self.browser.close, self._pw.stop):
+            try: f()
+            except Exception: pass
+
+    def step(self):
+        """Wait for our turn: one Putnam step every 60-90 s, daily cap."""
+        import time as _t
+        while True:
+            r = _fz_rpc("putnam_pace_take", {})
+            if r == "ok": return
+            if r == "off": raise PutnamStop("Putnam is switched off (fz_config putnam_server)")
+            if r == "cap": raise PutnamStop("daily cap reached")
+            _t.sleep(10)
+
+    def check(self, where):
+        txt = ""
+        try: txt = self.page.inner_text("body")[:20000]
+        except Exception: pass
+        m = _PH_STOP_RE.search(txt)
+        # the login page itself loads Google's script; only a VISIBLE challenge / notice counts
+        # (the cart icon and "purchase copies" buttons are always there - money is checked by ImageViewPurchaseRequired)
+        if (m and (self.page.locator("iframe[src*='recaptcha'], .g-recaptcha").count() or not _re_re.search("captcha", m.group(0), _re_re.I)))                 or self.page.locator("iframe[src*='recaptcha/api2/bframe'], iframe[title*='challenge' i]").count():
+            raise PutnamStop(f"{where}: the site shows '{m.group(0) if m else 'a robot check'}' - stopped, a person has to look")
+
+    def signed_out(self):
+        u = self.page.url or ""
+        if _re_re.search(r"Account/Log(on|in)|SignIn|/Home/Index", u, _re_re.I): return True
+        try: return self.page.locator("#SearchTerm").count() == 0 and "Login" in self.page.inner_text("header")
+        except Exception: return False
+
+    def login(self):
+        user, pw = os.environ.get("PUTNAM_USER", "").strip(), os.environ.get("PUTNAM_PASS", "").strip()
+        if not (user and pw): raise PutnamStop("PUTNAM_USER / PUTNAM_PASS not set on the server")
+        self.step()
+        self.page.goto(_PH + "/PutnamWV/Account/Login", wait_until="domcontentloaded")
+        self.check("sign-in page")
+        self.page.fill("#UserName", user)
+        self.page.fill("#Password", pw)
+        self.step()
+        with self.page.expect_navigation(wait_until="domcontentloaded"):
+            self.page.locator("#login [type=submit], #login button").first.click()
+        self.check("after sign-in")
+        if "Account/Login" in (self.page.url or ""):
+            raise PutnamStop("sign-in refused - check PUTNAM_USER / PUTNAM_PASS in Render")
+        self.signed_in = True
+        print("[putnam] signed in", flush=True)
+
+    def search_page(self, term):
+        for attempt in range(2):
+            if not self.signed_in: self.login()
+            self.step()
+            self.page.goto(_PH + "/PutnamWV/Search/Records", wait_until="domcontentloaded")
+            if self.signed_out():
+                self.signed_in = False; continue
+            self.check("search page")
+            self.page.fill("#SearchTerm", term)
+            self.page.click("#search-btn")
+            self.page.wait_for_selector("#search-results-table tbody tr", timeout=90000)
+            self.check("search results")
+            return
+        raise PutnamStop("could not stay signed in")
+
+    _ROWS = """() => [...document.querySelectorAll('#search-results-table tbody tr')].map(tr => {
+        const td = [...tr.querySelectorAll('td')].map(t => (t.innerText || '').trim());
+        const b = tr.querySelector('[data-indexid]'); const oc = (tr.querySelector('[onclick*="viewDetails"]') || {}).getAttribute;
+        let id = b ? b.getAttribute('data-indexid') : '';
+        if (!id) { const x = tr.querySelector('[onclick*="viewDetails"]'); const m = x && x.getAttribute('onclick').match(/viewDetails\\((\\d+)\\)/); id = m ? m[1] : ''; }
+        return {cells: td, id};
+      })"""
+
+    def rows(self, max_pages=4):
+        out, n = [], 0
+        while True:
+            out += [r for r in self.page.evaluate(self._ROWS) if len(r["cells"]) >= 11]
+            n += 1
+            nxt = self.page.locator(".paginate_button.next:not(.disabled)")
+            if n >= max_pages or not nxt.count(): break
+            self.step()
+            nxt.first.click()
+            self.page.wait_for_timeout(4000)
+        return out
+
+    @staticmethod
+    def ingest_rows(rows):
+        """idx_ingest row format (same as the office window): one row per party."""
+        res = []
+        for r in rows:
+            c = r["cells"]
+            date, typ = c[4], (c[5].split("\n")[-1] or c[5]).strip()
+            bp = _re_re.sub(r"\s+", "", c[10])
+            inst = ("BP" + bp) if bp and bp != "/" else ("F" + c[9].strip() if c[9].strip() else "D" + "|".join([date, typ, c[6][:40], c[7][:40]]))
+            parties = [("GRANTOR", x.strip()) for x in c[6].split("\n") if x.strip()] + [("GRANTEE", x.strip()) for x in c[7].split("\n") if x.strip()]
+            for role, name in (parties or [("", "")]):
+                res.append([inst, date, typ, bp if bp != "/" else "", c[3].strip(), role, name, "", "", c[8].replace("\n", " ").strip()])
+        return res
+
+    def name_search(self, term):
+        self.search_page(term)
+        rows = self.rows()
+        got = self.ingest_rows(rows)
+        for i in range(0, len(got), 1500):
+            _fz_rpc("idx_ingest_srv", {"p_county": "PUTNAM", "p_search": "name:" + term, "p_rows": got[i:i + 1500], "p_page": 0, "p_pages": 1})
+        return len(rows)
+
+    def images(self, term):
+        """term 'book/page' -> the viewer's page pictures of every paper at that book/page (first 3 pages each)."""
+        import base64 as _b64
+        self.search_page(term)
+        want = _re_re.sub(r"\s+", "", term)
+        hits = [r for r in self.rows(max_pages=1) if _re_re.sub(r"\s+", "", r["cells"][10]) == want and r["id"]]
+        saved = 0
+        for r in hits[:3]:
+            iid = r["id"]
+            self.step()
+            det = self.page.request.get(f"{_PH}/api/PutnamWV/Imaging/Document/Details/{iid}?indexTypeId=0&receiptId=0&lastIndexId=0&indexingModule=&QueueName=")
+            try: info = det.json()
+            except Exception: info = {}
+            if info.get("ImageViewPurchaseRequired"):
+                raise PutnamStop(f"viewing {term} would cost money (ImageViewPurchaseRequired) - stopped")
+            self.step()
+            self.page.goto(f"{_PH}/PutnamWV/Search/Records/Details?IndexId={iid}", wait_until="domcontentloaded")
+            self.check("document viewer")
+            try: self.page.wait_for_selector("img[src*='Imaging/Document/Image']", timeout=60000)
+            except Exception: continue
+            srcs = self.page.evaluate("() => [...new Set([...document.images].map(i => i.src).filter(s => s.includes('Imaging/Document/Image')))]")
+            for n, src in enumerate(srcs[:3], 1):
+                full = _re_re.sub(r"&thumbnailSize=\d+", "", src)
+                self.step()
+                resp = self.page.request.get(full, headers={"Referer": self.page.url})
+                body = resp.body() if resp.ok else b""
+                if not body: continue
+                mime, data = self._jpeg(body)
+                _fz_rpc("idx_image_put_srv", {"p_county": "PUTNAM", "p_index_id": int(iid), "p_book_page": want, "p_page_no": n,
+                                              "p_mime": mime, "p_b64": _b64.b64encode(data).decode()})
+                saved += 1
+        return saved
+
+    def _jpeg(self, body):
+        """The viewer serves TIF/PNG/JPEG; Claude reads JPEG / PNG - convert in the browser (no extra Python packages)."""
+        import base64 as _b64
+        if body[:3] == b"\xff\xd8\xff": return "image/jpeg", body
+        if body[:8] == b"\x89PNG\r\n\x1a\n": return "image/png", body
+        b64 = _b64.b64encode(body).decode()
+        out = self.page.evaluate("""async (b64) => {
+            const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            const img = await createImageBitmap(new Blob([bin]));
+            const c = new OffscreenCanvas(img.width, img.height); c.getContext('2d').drawImage(img, 0, 0);
+            const blob = await c.convertToBlob({type: 'image/jpeg', quality: 0.85});
+            const buf = new Uint8Array(await blob.arrayBuffer()); let s = ''; for (const x of buf) s += String.fromCharCode(x); return btoa(s); }""", b64)
+        return "image/jpeg", _b64.b64decode(out)
+
+
+def putnam_loop():
+    """Serves Putnam requests with Fernando's own membership, one at a time, at the county's pace."""
+    import time as _t
+    if not os.environ.get("PUTNAM_USER", "").strip(): return
+    _t.sleep(120)
+    site = None
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "putnam_server"}) or "on") != "on":
+                if site: site.close(); site = None
+                _t.sleep(600); continue
+            req = _fz_rpc("idx_live_next_srv", {"p_county": "PUTNAM"})
+        except Exception as e:
+            print(f"[putnam] queue: {e}", flush=True); _t.sleep(60); continue
+        if not req:
+            _t.sleep(30); continue
+        try:
+            if site is None: site = PutnamSite()
+            n = site.name_search(req["term"]) if req.get("kind") != "image" else site.images(req["term"])
+            _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": n, "p_error": None if n or req.get("kind") != "image" else "not found"})
+            print(f"[putnam] {req.get('kind')} {req['term']}: {n}", flush=True)
+        except PutnamStop as e:
+            msg = str(e)
+            if "daily cap" in msg or "switched off" in msg:
+                _fz_rpc("idx_live_requeue_srv", {"p_id": req["id"]})          # back in line for tomorrow / when switched on
+                print(f"[putnam] {msg} - resting", flush=True)
+                _t.sleep(1800); continue
+            _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": 0, "p_error": msg})
+            _fz_rpc("putnam_stop", {"p_reason": msg})
+            print(f"[putnam] STOPPED: {msg}", flush=True)
+            if site: site.close(); site = None
+        except Exception as e:
+            _fz_rpc("idx_live_done_srv", {"p_id": req["id"], "p_records": 0, "p_error": str(e)[:200]})
+            print(f"[putnam] {req['term']} failed: {str(e)[:200]}", flush=True)
+            if site: site.close(); site = None
+            _t.sleep(60)
+
+
+
 def fz_compare_loop():
     """🔬 One-off model comparison (fz_read_compare rows): the same paper read by the current and the candidate model."""
     import time as _t
@@ -7649,6 +7871,7 @@ if __name__ == '__main__':
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
         _og_threading.Thread(target=client_mail_loop, daemon=True).start()        # 🔑 client portal login emails
         _og_threading.Thread(target=fz_compare_loop, daemon=True).start()         # 🔬 reader model comparison (one-off rows)
+        _og_threading.Thread(target=putnam_loop, daemon=True).start()             # 🏛 Putnam with Fernando's own login (slow)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
