@@ -4514,7 +4514,7 @@ _IDX2_ASK = {
     "deed": ("a recorded deed", {
         "grantors": "array", "grantees": "array", "grantee_mailing_address": "string", "property_address": "string",
         "legal_description_short": "string", "prior_deed_reference": "string", "consideration": "string", "tax_ids": "array",
-        "deed_date": "string"}),
+        "deed_date": "string", "tract_sources": "array"}),
 }
 
 
@@ -4619,6 +4619,8 @@ def _idx2_read_doc(kind, images, model=None):
         "transcription (page reads only) = the full text of the pages, line by line, handwriting included (write [illegible] "
         "where you cannot read). prior_deed_reference = the 'being the same property conveyed by ... in Deed Book X page Y' "
         "clause (for a deed of trust: the deed that gave the borrower the property, often in the exhibit), if present. "
+        "tract_sources (deeds) = one entry PER TRACT / PARCEL conveyed: its short description, then the deed it came from exactly "
+        "as written (e.g. 'Tract 2: 1/5 acre on Main St, Poca - same property conveyed by X to Y, Deed Book 500 page 10'). "
         "tax_ids = tax map / parcel numbers as written."})
     import anthropic
     client = anthropic.Anthropic(api_key=key)
@@ -4853,12 +4855,33 @@ def _idx2_nums(ids):
     return set(_re_re.sub(r"[^0-9A-Z]", "", str(x).upper()) for x in (ids or []) if str(x).strip())
 
 
+_REF_RE = _re_re.compile(r"(?:\bBook|\bD\.?\s?B\.?)\s*(?:No\.?\s*)?(\d+)\s*[,/]?\s*(?:at\s+)?(?:Page|Pg\.?|P\.?|PG)\s*(?:No\.?\s*)?(\d+)", _re_re.I)
+
+
+def _idx2_refs(rd):
+    """Every 'Book X Page Y' named in the paper's source clauses (all tracts) - not map / plat / will books."""
+    out = []
+    for txt in [rd.get("prior_deed_reference") or ""] + [str(x) for x in (rd.get("tract_sources") or [])]:
+        for m in _REF_RE.finditer(txt):
+            before = txt[max(0, m.start() - 25):m.start()].upper()
+            if _re_re.search(r"MAP|PLAT|WILL|SURVEY|CABINET|SLIDE", before): continue
+            bp = (m.group(1).lstrip("0"), m.group(2).lstrip("0"))
+            if bp not in out: out.append(bp)
+    return out
+
+
 def _idx2_match_read(rd, prof):
     """Is the document read from the images about the property in the profile? 'yes' / 'no' / None (can't tell) + why."""
     if not rd or rd.get("error"): return None, ""
-    ref = _re_re.search(r"Book\s+(?:No\.?\s*)?(\d+)\s*,?\s*(?:at\s+)?Page\s+(?:No\.?\s*)?(\d+)", rd.get("prior_deed_reference") or "", _re_re.I)
-    if ref and (ref.group(1).lstrip("0"), ref.group(2).lstrip("0")) in prof.get("deeds", set()):
-        return "yes", f"it names the deed {ref.group(1)}/{ref.group(2)}"
+    refs = _idx2_refs(rd)
+    ours = [r for r in refs if r in prof.get("deeds", set())]
+    if ours:
+        if prof.get("deeds_sure", True):
+            return "yes", f"it names the owner's deed for this property ({ours[0][0]}/{ours[0][1]})"
+        return None, f"it names the owner's deed {ours[0][0]}/{ours[0][1]}, but the owner bought more than one property - check"
+    others = [r for r in refs if r in prof.get("other_deeds", set())]
+    if others and len(others) == len(refs):
+        return "no", f"it comes from the owner's other purchase ({others[0][0]}/{others[0][1]}), not this property"
     a, b = _idx2_addr(rd.get("property_address")), prof.get("addr")
     if a and b:
         if a == b: return "yes", f"same address {rd.get('property_address')}"
@@ -4873,8 +4896,10 @@ def _idx2_match_read(rd, prof):
     if _idx2_other_district(legal, prof.get("district")):
         return "no", f"another district - ours is {prof.get('district')} ({legal[:90]})"
     lw = _idx2_words(legal) - _DESC_COMMON
-    if len(lw & (prof.get("legal", set()) - _DESC_COMMON)) >= 3: return "yes", "legal description matches"
-    if ref and prof.get("deeds"): return "no", f"it names another deed ({ref.group(1)}/{ref.group(2)})"
+    if refs and prof.get("deeds") and prof.get("deeds_sure", True):
+        return "no", f"it names other deeds ({', '.join(a + '/' + b for a, b in refs[:3])}), not the owner's deed for this property"
+    if len(lw & (prof.get("legal", set()) - _DESC_COMMON)) >= 3:
+        return None, "similar wording only - check"             # Ari: similar words are never proof
     return None, ""
 
 
@@ -5270,7 +5295,11 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
                    "legal": rd0.get("legal_description_short") or "", "tax_ids": rd0.get("tax_ids") or [], "description": desc or ""}
         prof = {"deeds": set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")), "addr": _idx2_addr(profile["address"]),
                 "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words,
-                "desc": desc or "", "legal_text": profile["legal"], "district": district or ""}
+                "desc": desc or "", "legal_text": profile["legal"], "district": district or "",
+                "other_deeds": set(_idx2_bp(r["bookpage"]) for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE")
+                               - set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")),
+                "deeds_sure": bool(chain) and ("latest purchase" not in (chain[0].get("found_by") or "")
+                                               or len([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"]) <= 1)}
         prof_ref[0] = prof
 
         def settle(keep, skip):
@@ -5740,7 +5769,8 @@ def bank_read(county, kind, bookpage, reads, note=None):
     if not (b and pg): return None
     key = f"{county}:BP{b}/{pg}"
     banked = _bank_get(county, "document", image_id=key)
-    if banked and banked.get("fields") and banked.get("doc_kind") == kind: return banked["fields"]
+    if banked and banked.get("fields") and banked.get("doc_kind") == kind and (kind != "deed" or "tract_sources" in banked["fields"]):
+        return banked["fields"]
     if reads["n"] >= _BANK_MAX_READS: return None
     imgs = bank_image(county, bookpage, note)
     if not imgs: return None
@@ -5810,7 +5840,11 @@ def bank_owner_report(county, last, first, book=None, page=None, desc=None, dist
                "legal": rd0.get("legal_description_short") or "", "tax_ids": rd0.get("tax_ids") or [], "description": desc or ""}
     prof = {"deeds": set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")), "addr": _idx2_addr(profile["address"]),
             "tax": _idx2_nums(profile["tax_ids"]), "legal": _idx2_words(profile["legal"]) | prop_words,
-            "desc": desc or "", "legal_text": profile["legal"], "district": district or ""}
+            "desc": desc or "", "legal_text": profile["legal"], "district": district or "",
+                "other_deeds": set(_idx2_bp(r["bookpage"]) for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE")
+                               - set(_idx2_bp(c["bookpage"]) for c in chain if c.get("bookpage")),
+                "deeds_sure": bool(chain) and ("latest purchase" not in (chain[0].get("found_by") or "")
+                                               or len([r for r in mine if _idx2_is_deed(r) and r["role"] == "GRANTEE"]) <= 1)}
     for x in list(keep):
         if x.get("kind") not in ("mortgage", "property") or x.get("released"): continue
         v, why = _idx2_match_read(bank_read(county, "debt", x.get("bookpage"), reads, notes) or {}, prof)
