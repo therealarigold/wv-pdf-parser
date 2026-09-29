@@ -7517,6 +7517,123 @@ def client_fz_loop():
 # with its link. 4) SmartSkip (15 cents a search) - not connected yet: we have not seen their search flow / API; until then
 # Fernando lists who still needs a skip trace. Staff-only data; never invents an address or phone.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔎 SMARTSKIP (skip tracing, 15 cents a search; no API - the site, which SmartSkip told Ari is fine for scripts). Ari's rules:
+# LAST resort, only named people who are likely alive, at most skip_limit searches a case (10), then ask an owner; stop and
+# ask when the balance is under $5; look in Records first so a name is never paid for twice. Login from env SMARTSKIP_USER /
+# SMARTSKIP_PASS (never logged). Results are only "possible" - Fernando must match them against our papers.
+# ─────────────────────────────────────────────────────────────────────────────
+_SS = "https://app.smartskip.io"
+
+
+class SmartSkipStop(Exception):
+    pass
+
+
+class SmartSkipSite:
+    def __init__(self):
+        user, pw = os.environ.get("SMARTSKIP_USER", "").strip(), os.environ.get("SMARTSKIP_PASS", "").strip()
+        if not (user and pw): raise SmartSkipStop("SmartSkip login not set on the server")
+        from playwright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        self.browser = self._pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+        self.ctx = self.browser.new_context(viewport={"width": 1400, "height": 1000},
+                                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+        self.page = self.ctx.new_page()
+        self.page.set_default_timeout(45000)
+        self.page.goto(_SS + "/login", wait_until="domcontentloaded")
+        self.page.wait_for_timeout(1500)
+        self.page.locator("input[type=email], input[name*=mail i], input[name*=user i]").first.fill(user)
+        self.page.locator("input[type=password]").first.fill(pw)
+        self.page.locator("button[type=submit], button:has-text('Log in'), button:has-text('Login'), button:has-text('Sign in')").first.click()
+        self.page.wait_for_timeout(5000)
+        if "/login" in (self.page.url or ""):
+            raise SmartSkipStop("SmartSkip sign-in refused - check SMARTSKIP_USER / SMARTSKIP_PASS")
+
+    def close(self):
+        for f in (self.ctx.close, self.browser.close, self._pw.stop):
+            try: f()
+            except Exception: pass
+
+    def balance(self):
+        try: txt = self.page.inner_text("body")
+        except Exception: return None
+        m = _re_re.search(r"\$\s?([\d,]+\.\d\d)", txt or "")
+        return float(m.group(1).replace(",", "")) if m else None
+
+    _EXPAND = """() => { const out = [];
+        const rows = [...document.querySelectorAll('*')].filter(e => e.children.length < 6 && /\\b\\d{1,3}\\s*y\\.o\\./i.test(e.innerText || '') && (e.innerText || '').length < 120);
+        return rows.length; }"""
+
+    def _results_text(self):
+        """Expand every result row (free) and return the text of the results."""
+        pg = self.page
+        heads = pg.locator("text=/\\d{1,3}\\s*y\\.o\\./i")
+        n = min(heads.count(), 8)
+        for i in range(n):
+            try: heads.nth(i).click(timeout=5000); pg.wait_for_timeout(400)
+            except Exception: pass
+        txt = pg.inner_text("main") if pg.locator("main").count() else pg.inner_text("body")
+        return _re_re.sub(r"\n{3,}", "\n\n", txt)[:12000]
+
+    def from_records(self, first, last):
+        """Already searched before? (their Records keep every search) -> text or None."""
+        try:
+            self.page.goto(_SS + "/records", wait_until="domcontentloaded"); self.page.wait_for_timeout(3000)
+            want = f"{first} {last}".upper()
+            hit = self.page.locator(f"text=/{_re_re.escape(first)}.*{_re_re.escape(last)}/i").first
+            if not hit.count() or want.split()[0] not in (self.page.inner_text("body") or "").upper(): return None
+            hit.click(timeout=5000); self.page.wait_for_timeout(3000)
+            return self._results_text()
+        except Exception:
+            return None
+
+    def _fill(self, label, value):
+        if not value: return
+        ok = self.page.evaluate("""([label, value]) => {
+            const want = label.toUpperCase();
+            for (const l of document.querySelectorAll('label, span, div, p')) {
+              if ((l.innerText || '').trim().toUpperCase() !== want) continue;
+              let inp = l.control || l.parentElement && l.parentElement.querySelector('input');
+              if (!inp) { let n = l.nextElementSibling; while (n && !inp) { inp = n.matches && n.matches('input') ? n : n.querySelector && n.querySelector('input'); n = n.nextElementSibling; } }
+              if (inp) { const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; set.call(inp, value);
+                         inp.dispatchEvent(new Event('input', {bubbles: true})); inp.dispatchEvent(new Event('change', {bubbles: true})); return true; }
+            } return false; }""", [label, value])
+        if not ok: raise SmartSkipStop(f"SmartSkip form changed - no '{label}' box")
+
+    def search(self, first, last, middle="", city="", state="", address="", zip_=""):
+        """ONE paid search (15 cents). -> (text, balance_before, balance_after)."""
+        pg = self.page
+        pg.goto(_SS + "/manual-skip", wait_until="domcontentloaded"); pg.wait_for_timeout(2500)
+        before = self.balance()
+        if before is not None and before < 5: raise SmartSkipStop(f"SmartSkip balance is ${before:.2f} - under $5")
+        self._fill("FIRST NAME", first); self._fill("LAST NAME", last); self._fill("MIDDLE NAME OR INITIAL", middle)
+        self._fill("CITY", city); self._fill("STATE", state); self._fill("MAILING ADDRESS", address); self._fill("ZIP CODE", zip_)
+        pg.locator("button:has-text('Search')").last.click()
+        try: pg.wait_for_selector("text=/\\d+\\s+Results?|No results/i", timeout=40000)
+        except Exception: pass
+        pg.wait_for_timeout(1500)
+        txt = self._results_text()
+        return txt, before, self.balance()
+
+
+_SKIP_TOOL = {"name": "skip_trace", "description": (
+    "SmartSkip people search - LAST RESORT, costs the office 15 cents each. Only for a NAMED person who is likely ALIVE and whose "
+    "current address / phone the papers and web did not give. Needs first + last name and a city or state (or a mailing address). "
+    "Results are only POSSIBLE matches: compare age, towns and relatives with our papers before trusting one."),
+    "input_schema": {"type": "object", "properties": {
+        "first": {"type": "string"}, "last": {"type": "string"}, "middle": {"type": "string"},
+        "city": {"type": "string"}, "state": {"type": "string", "description": "2 letters, e.g. WV"},
+        "address": {"type": "string", "description": "a mailing address from a paper, if any"},
+        "why": {"type": "string", "description": "who this is to the case and why the search is needed"}},
+        "required": ["first", "last", "why"]}}
+_SKIP_ASK = {"name": "ask_for_more_searches", "description": "The case needs more SmartSkip searches than allowed - ask the owners (Ari / Anne).",
+    "input_schema": {"type": "object", "properties": {
+        "more": {"type": "integer", "description": "how many more searches"},
+        "question": {"type": "string", "description": "plain question, e.g. 'I need 4 more searches to reach the grandchildren of John Smith.'"}},
+        "required": ["more", "question"]}}
+
+
 _SURP_SYSTEM = """You are Fernando, working for a West Virginia tax-lien office on SURPLUS cases: a tax sale produced more money
 than was owed, and the surplus belongs to the former owner - or, when they died, to their heirs. Your job: find the people
 entitled to it and how to reach them, from the papers already gathered and the web.
@@ -7530,8 +7647,14 @@ Rules:
 3. Addresses and phones: ONLY from a paper, a State Auditor letter, or a page you cite. Never guess or build one. "Lives in <city>" from
    an obituary is fine as city/state only. Anything not confirmed gets confidence low.
 4. Every person gets their sources (the letter, book/page, or the URL). Keep it plain for office ladies.
-5. You do not have a skip-trace (people-search) service. If someone needs one to find a current address or phone, say so in
-   still_needed - name, why, and what is already known (city, age, relatives).
+5. LAST, and only if still needed: skip_trace (SmartSkip, 15 cents each) for a NAMED person who is likely alive, when the papers and
+   the web gave no current address / phone. Give the city or state you know. Its results are only POSSIBLE. Match on: name + middle
+   initial, age vs the death / deed dates, spouse and relative names from the deeds, wills, obituaries and letters, and the MAILING
+   address on the State Auditor letters / tax records. Do NOT match on where the property is (Ari): owners often live in another county
+   or inherited the land, so a different county in the address history is not evidence against a match. No clear match: confidence low, say why.
+   Its "possible relatives" are leads to confirm with the obituary, not heirs by themselves. Source: "SmartSkip (possible relative: Child)".
+   Never search the same person twice. If the allowance runs out and more searches are truly needed, call ask_for_more_searches
+   with a plain question; else list them in still_needed.
 
 Call report_surplus_heirs once at the end."""
 
@@ -7607,19 +7730,60 @@ def surplus_fz_one():
             + "Find the people entitled to the surplus and how to reach them, then call report_surplus_heirs."}]
         _surp_step(job, "3. Web: obituaries, death notices and probate mentions")
         sites = _FzcSites(county)
+        skip = {"used": int(job.get("skip_used") or 0), "limit": int(job.get("skip_limit") or 10), "site": None, "done": {}}
+        def tool_fn(sites_, name, inp, budget):
+            if name != "skip_trace": return _fzc_tool(sites_, name, inp, budget)
+            key = (str(inp.get("first") or "").upper().strip(), str(inp.get("last") or "").upper().strip(), str(inp.get("city") or inp.get("state") or "").upper().strip())
+            if key in skip["done"]: return "Already searched this person on this case:\n" + skip["done"][key]
+            if not (key[0] and key[1]) or not (inp.get("city") or inp.get("state") or inp.get("address")):
+                return "Not searched: SmartSkip needs first + last name and a city or state (or a mailing address)."
+            if skip["used"] >= skip["limit"]:
+                return f"Not searched: this case's SmartSkip allowance ({skip['limit']}) is used up. Call ask_for_more_searches if more are truly needed."
+            try:
+                if skip["site"] is None: skip["site"] = SmartSkipSite()
+                old = skip["site"].from_records(key[0].title(), key[1].title())
+                if old:
+                    skip["done"][key] = old
+                    _surp_step(job, f"4. SmartSkip: {key[0].title()} {key[1].title()} - found in past searches (no charge)")
+                    return "From SmartSkip's saved records (searched before, no charge):\n" + old
+                txt, before, after = skip["site"].search(inp.get("first"), inp.get("last"), inp.get("middle") or "", inp.get("city") or "",
+                                                         inp.get("state") or "", inp.get("address") or "")
+                skip["used"] += 1
+                skip["done"][key] = txt
+                bal = f" (balance ${after:.2f})" if after is not None else ""
+                _surp_step(job, f"4. SmartSkip search {skip['used']}/{skip['limit']}: {key[0].title()} {key[1].title()}, {key[2].title()} - {inp.get('why', '')[:80]}{bal}",
+                           p_skip_used=skip["used"])
+                return f"SmartSkip results (POSSIBLE matches only - compare with our papers):\n{txt}"
+            except SmartSkipStop as e:
+                skip["stop"] = str(e)
+                return f"SmartSkip stopped: {e}. Do not try it again on this case; list who still needs it in still_needed."
+            except Exception as e:
+                return f"SmartSkip failed this time: {str(e)[:150]}"
         try:
-            out = _fz_agent(_SURP_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH], sites, "fernando_surplus",
-                            final_tool=_SURP_REPORT, max_steps=18, tag=f"surplus {county} {cert}", model=_FZH_MODEL, max_searches=10)
+            out = _fz_agent(_SURP_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH, _SKIP_TOOL, _SKIP_ASK], sites,
+                            "fernando_surplus", final_tool=_SURP_REPORT, stop_tool="ask_for_more_searches", tool_fn=tool_fn,
+                            max_steps=24, tag=f"surplus {county} {cert}", model=_FZH_MODEL, max_searches=10)
         finally:
             sites.close()
+            if skip["site"]: skip["site"].close()
+        if isinstance(out, dict) and "__stop__" in out:           # he wants more searches: ask the owners, keep what he has
+            ask = out["__stop__"]
+            _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "needs_approval", "p_step": f"Asked for {ask.get('more')} more SmartSkip searches",
+                                          "p_report": prior or None, "p_skip_used": skip["used"], "p_question": ask.get("question")})
+            print(f"[surplus] {county} {cert}: asks for {ask.get('more')} more searches", flush=True)
+            return True
+        if skip.get("stop") and "under $5" in skip["stop"]:
+            _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "needs_approval", "p_step": "SmartSkip balance under $5",
+                                          "p_report": out if isinstance(out, dict) else prior or None, "p_skip_used": skip["used"],
+                                          "p_question": "The SmartSkip balance is under $5 - please add funds, then approve so I can finish."})
+            return True
         if not isinstance(out, dict): out = {"summary": str(out or "No report."), "people": []}
         need = out.get("still_needed") or []
-        if need:
-            out["summary"] = (out.get("summary") or "") + " Skip tracing (SmartSkip) is not connected yet - the people under 'still needed' need it."
+        if skip.get("stop"): out["summary"] = (out.get("summary") or "") + f" (SmartSkip: {skip['stop']})"
         for s_ in out.get("sources") or []:
             if isinstance(s_, dict) and not s_.get("url"): s_.pop("url", None)
-        _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "done", "p_step": "4. Done" + (f" - {len(need)} still need a skip trace" if need else ""),
-                                      "p_report": out, "p_skip_used": None, "p_question": None})
+        _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "done", "p_step": f"Done - {skip['used']} SmartSkip search(es)" + (f", {len(need)} still open" if need else ""),
+                                      "p_report": out, "p_skip_used": skip["used"], "p_question": None})
         print(f"[surplus] {county} {cert}: done, {len(out.get('people') or [])} people", flush=True)
     except FzPaused as e:
         if "cancelled" in str(e):
