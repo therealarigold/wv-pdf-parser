@@ -3787,7 +3787,11 @@ async def _re_scrape_county_year(page, year, county):
 
     except Exception as e:
         print(f'[refresh] scrape {year}/{county} error: {e}', flush=True)
+        _RE_LAST_ERR["msg"] = str(e)
         return []
+
+
+_RE_LAST_ERR = {"msg": ""}
 
 
 def _re_parse_cert_row(row, year, county):
@@ -3886,10 +3890,33 @@ async def run_wvsao_refresh(scope='daily_recent'):
         ctx = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         page = await ctx.new_page()
 
+        # 🛑 (Ari 2026-09-29) the State Auditor's site blocks our server now and then: while the letters reader is paused
+        # for a pushback this refresh does not knock either; two connection failures in a row pause both (same backoff)
+        import time as _t
+        fails, stop = 0, False
+        if _t.time() < SAO.get("pause_until", 0):
+            print(f'[refresh] skipped - the State Auditor site is blocking us (paused {int((SAO["pause_until"] - _t.time()) / 60)} more min)', flush=True)
+            years, stop = [], True
+            log['notes'] = 'skipped: State Auditor site blocking the server'
         for year in years:
+            if stop: break
             for county in _WV_COUNTIES_ALL:
                 log['counties_scraped'] += 1
+                _RE_LAST_ERR["msg"] = ""
                 rows = await _re_scrape_county_year(page, year, county)
+                if _re_re.search(r"TIMED_OUT|CONNECTION_|Timeout|timed out|ERR_", _RE_LAST_ERR["msg"]):
+                    fails += 1
+                    if fails >= 2:
+                        SAO["pause_n"] = SAO.get("pause_n", 0) + 1
+                        mins = min(30 * 2 ** (SAO["pause_n"] - 1), 480)
+                        SAO["pause_until"] = _t.time() + mins * 60
+                        SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z refresh: {_RE_LAST_ERR['msg'][:80]} - pause {mins} min")
+                        print(f'[refresh] the State Auditor site is not answering - refresh stops, everything pauses {mins} min', flush=True)
+                        log['notes'] = 'stopped early: State Auditor site not answering'
+                        stop = True
+                        break
+                else:
+                    fails = 0
                 for raw in rows:
                     parsed = _re_parse_cert_row(raw, year, county)
                     if not parsed: continue
