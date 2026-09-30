@@ -8199,6 +8199,8 @@ def sao_loop(n=0):
                     SAO.setdefault("extra", {})[n] = "resting (daytime or after a pushback)"; _t.sleep(300); continue
                 SAO.setdefault("extra", {})[n] = "reading"
             if done_here >= 150: site, done_here = SaoHttp(), 0     # a fresh session now and then
+            if SAO.get("night_check"):              # the office PC's nightly certificate check has every Auditor turn (Ari)
+                SAO["state"] = "waiting - the nightly certificate check is running"; _t.sleep(60); continue
             job = _fz_rpc("sao_claim", {})
             if not job:
                 SAO["state"] = "waiting (shared pace ~30 letters / hour)"; _t.sleep(20 if local else 300); continue
