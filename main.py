@@ -5797,7 +5797,7 @@ class _FzcCounty:
 
 
 # counties Fernando may not search automatically (site terms / captcha / not working yet)
-_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "WETZEL"}
+_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "WETZEL", "HARRISON"}   # HARRISON: 403 for everyone since 9/30 - wait for the clerk's rules (Ari)
 _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
 
 
