@@ -7058,6 +7058,10 @@ def fernando_grade_one():
         client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
         known = _fz_lessons_text(county) or "\n\n(no lessons yet)"
         pend = "; ".join(x.get("lesson", "")[:160] for x in (_fz_rpc("fernando_lessons_pending", {}) or [])[:60])
+        try:   # already declined or combined by the owners (Anne's review) - never suggest those again either
+            done = _fz_rpc("fernando_lessons_decided", {}) or []
+            pend += "; DECLINED OR ALREADY COMBINED: " + "; ".join(x.get("lesson", "")[:120] for x in done[:150])
+        except Exception: pass
         body = (f"LESSONS HE ALREADY HAS:{known}\nALREADY SUGGESTED (do not repeat): {pend}\n\n"
                 f"Certificate {cert}, {county} County. Tax-ticket owner: {job.get('owner')}. Property: {job.get('descr')}\n\n"
                 f"(A) STAFF'S FINISHED TICKET:\n{_re_json.dumps(_fz_trim_ticket(t), ensure_ascii=False)[:40000]}\n\n"
