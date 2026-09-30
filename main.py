@@ -4167,6 +4167,11 @@ async def run_wvsao_refresh(scope='daily_recent'):
 
     # 6. Write log entry
     _re_sb_insert('wvsao_refresh_log', [log])
+    # newly deeded / changed certificates go straight to the front of the letters line (the 09:30 UTC job can run before the
+    # office PC's nightly check has finished - 9/30: 223 new deeds waited at priority 2)
+    if log.get('status_changes'):
+        try: print(f"[refresh] letters line updated: {_fz_rpc('sao_refresh_queue', {})} certificates", flush=True)
+        except Exception as e: print(f"[refresh] could not update the letters line: {e}", flush=True)
 
     print(f'[refresh] DONE: {log["new_certs"]} new, {log["status_changes"]} changed, {log["new_buyers"]} new buyers, {log["late_round_flips"]} late flips, {duration:.0f}s', flush=True)
 
