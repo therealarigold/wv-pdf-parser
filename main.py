@@ -7620,16 +7620,16 @@ class SmartSkipSite:
             except Exception: pass
 
     def balance(self):
-        """The wallet badge (top-right button, e.g. "$65.57") - NOT any other $ on the page: the search page also shows the
-        15-cent price, which was read as the balance (9/30: 'under $5' with $65.57 in the account). Unknown -> None."""
+        """The wallet badge ONLY: <span class="wallet-btn__text">$63.62</span> in the top bar (seen 9/30). Other $ figures on the
+        page (the 15-cent price) are never used. Not found -> None, which means carry on - never a reason to stop."""
         try:
-            self.page.wait_for_timeout(1500)
-            vals = self.page.evaluate(r"""() => [...document.querySelectorAll('button, header a, .v-btn')]
-                .map(b => (b.innerText || '').replace(/\s+/g, ' ').trim()).filter(t => /^\$\s?[\d,]+\.\d\d$/.test(t))""")
+            loc = self.page.locator("span.wallet-btn__text")
+            loc.first.wait_for(timeout=10000)
+            txt = loc.first.inner_text()
         except Exception:
             return None
-        nums = [float(v.replace("$", "").replace(",", "").strip()) for v in vals or []]
-        return nums[0] if nums else None
+        m = _re_re.search(r"\$\s?([\d,]+\.\d\d)", txt or "")
+        return float(m.group(1).replace(",", "")) if m else None
 
     _EXPAND = """() => { const out = [];
         const rows = [...document.querySelectorAll('*')].filter(e => e.children.length < 6 && /\\b\\d{1,3}\\s*y\\.o\\./i.test(e.innerText || '') && (e.innerText || '').length < 120);
