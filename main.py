@@ -6164,14 +6164,17 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
     client = anthropic.Anthropic(api_key=key)
     budget = {"reads": 0}
     tools = list(tools) + ([final_tool] if final_tool else [])
+    resume_tools = None                  # after a pause_turn the server resumes ITS OWN search: same tools, nothing added
     for step in range(max_steps):
         last_round = step >= max_steps - 3
         if progress and step: progress("🤔 Thinking about what I found…")
         _fz_cache_mark(msgs)
-        kw = dict(model=model, max_tokens=4000, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], messages=msgs,
+        kw = dict(model=model, max_tokens=8000, system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], messages=msgs,
                   extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
                   extra_body={"output_config": {"effort": "medium"}, "fallbacks": "default"})
-        if last_round and final_tool:
+        if resume_tools is not None:
+            kw["tools"] = resume_tools
+        elif last_round and final_tool:
             # newer models refuse a FORCED tool while thinking (400 "tool_choice ... not supported"): offer only the report
             # form and ask for it; if he answers in words, the loop below asks again
             kw["tools"], kw["tool_choice"] = [final_tool], {"type": "auto"}
@@ -6209,10 +6212,18 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
         stop = getattr(msg, "stop_reason", "")
         if stop == "refusal": return None if final_tool else "Sorry — I can't help with that one."
         blocks = [b.model_dump(mode="json", exclude_none=True) for b in msg.content]
+        if stop == "max_tokens":
+            # cut off mid-way: a server search / code run without its result would make the next request fail (400) - drop it
+            done_ids = {b.get("tool_use_id") for b in blocks if str(b.get("type", "")).endswith("_tool_result")}
+            blocks = [b for b in blocks if not (b.get("type") == "server_tool_use" and b.get("id") not in done_ids)]
+            blocks = [b for b in blocks if not (b.get("type") == "tool_use" and b is blocks[-1] and not b.get("input"))]
+            if not blocks: blocks = [{"type": "text", "text": "(cut off)"}]
         msgs.append({"role": "assistant", "content": blocks})
         if stop == "pause_turn":                                # the web search wants to keep going
             if progress: progress("🌐 Searching the web…")
+            resume_tools = kw.get("tools")
             continue
+        resume_tools = None
         uses = [b for b in blocks if b.get("type") == "tool_use"]
         fin = next((u for u in uses if final_tool and u["name"] == final_tool["name"]), None)
         if fin: return fin.get("input") or {}
