@@ -3943,7 +3943,12 @@ async def run_wvsao_refresh(scope='daily_recent'):
     new_buyer_norms_seen = {}  # norm -> {display_name, is_entity}
     
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote'])
+        launch = dict(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote'])
+        if os.environ.get("SAO_LOCAL", "").strip() != "1" and os.environ.get("WVSAO_PROXY", "").strip():
+            from urllib.parse import urlparse as _up
+            _px = _up(os.environ["WVSAO_PROXY"].strip())
+            launch["proxy"] = {"server": f"{_px.scheme}://{_px.hostname}:{_px.port}", "username": _px.username or "", "password": _px.password or ""}
+        browser = await pw.chromium.launch(**launch)
         ctx = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
         page = await ctx.new_page()
 
@@ -3951,12 +3956,19 @@ async def run_wvsao_refresh(scope='daily_recent'):
         # for a pushback this refresh does not knock either; two connection failures in a row pause both (same backoff)
         import time as _t
         fails, stop = 0, False
+        local = os.environ.get("SAO_LOCAL", "").strip() == "1"
+        runner = "pc" if local else "server"
         try: sao_on = (_fz_rpc("fz_config_get", {"p_key": "sao_server_refresh"}) or "off") == "on"
         except Exception: sao_on = False
-        if not sao_on and os.environ.get("SAO_LOCAL", "").strip() != "1":
-            print('[refresh] skipped - State Auditor reading is off on the server (sao_render = off)', flush=True)
+        if not local and not (sao_on and os.environ.get("WVSAO_PROXY", "").strip()):
+            print('[refresh] skipped - the server backup is off (the office PC does the nightly check)', flush=True)
             years, stop = [], True
             log['notes'] = 'skipped: State Auditor reading is off on the server'
+        elif not _fz_rpc("refresh_night_claim", {"p_runner": runner}):
+            # ONE runner a night (Ari): the office PC at 1 am, the server only as the backup when the PC did not start
+            print(f'[refresh] skipped - tonight\'s check is already done / running on the other computer', flush=True)
+            years, stop = [], True
+            log['notes'] = 'skipped: tonight\'s check is done or running on the other computer'
         elif _t.time() < SAO.get("pause_until", 0):
             print(f'[refresh] skipped - the State Auditor site is blocking us (paused {int((SAO["pause_until"] - _t.time()) / 60)} more min)', flush=True)
             years, stop = [], True
@@ -3966,7 +3978,9 @@ async def run_wvsao_refresh(scope='daily_recent'):
             for county in _WV_COUNTIES_ALL:
                 log['counties_scraped'] += 1
                 t_wait = _t.time()
-                while not _fz_rpc("sao_pace_take", {"p_by": "refresh"}):        # the same ~2-minute shared pace as the letters
+                try: _fz_rpc("refresh_night_beat", {"p_runner": runner, "p_done": False})
+                except Exception: pass
+                while not _fz_rpc("sao_pace_take", {"p_by": "refresh", "p_lane": runner}):   # this computer's own Auditor pace
                     if _t.time() - t_wait > 3600: break
                     await _re_asyncio.sleep(20)
                 _RE_LAST_ERR["msg"] = ""
@@ -4137,6 +4151,10 @@ async def run_wvsao_refresh(scope='daily_recent'):
 
     duration = (_re_dt.now() - start_ts).total_seconds()
     log['duration_seconds'] = int(duration)
+    try:
+        if log.get('total_certs_seen'):
+            _fz_rpc("refresh_night_beat", {"p_runner": "pc" if os.environ.get("SAO_LOCAL", "").strip() == "1" else "server", "p_done": True})
+    except Exception: pass
     if log.get('counties_scraped') and not log.get('total_certs_seen') and not str(log.get('notes') or '').startswith('skipped'):
         log['status'] = 'failed'
         log['notes'] = (str(log.get('notes') or '') + ' 0 certificates seen - the State Auditor site did not answer').strip()
