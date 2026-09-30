@@ -3943,7 +3943,10 @@ async def run_wvsao_refresh(scope='daily_recent'):
     new_buyer_norms_seen = {}  # norm -> {display_name, is_entity}
     
     async with async_playwright() as pw:
-        launch = dict(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--single-process','--no-zygote'])
+        # '--single-process' / '--no-zygote' keep Render's memory down, but on Windows (the office PC) Chrome crashes on the
+        # Auditor's page with them - every county came back empty on 9/30 - so only the server uses them
+        args = ['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'] + ([] if os.environ.get("SAO_LOCAL", "").strip() == "1" else ['--single-process','--no-zygote'])
+        launch = dict(headless=True, args=args)
         if os.environ.get("SAO_LOCAL", "").strip() != "1" and os.environ.get("WVSAO_PROXY", "").strip():
             from urllib.parse import urlparse as _up
             _px = _up(os.environ["WVSAO_PROXY"].strip())
