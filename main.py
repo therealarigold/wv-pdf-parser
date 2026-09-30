@@ -4737,11 +4737,24 @@ def _idx2_open(pg, county, url):
         if "Login.aspx" in pg.url:
             pg.goto(url, wait_until="networkidle", timeout=60000)
     pg.wait_for_function("() => typeof cboKey !== 'undefined' && typeof grd !== 'undefined'", timeout=30000)
+    pg._fz_county = county
+
+
+# 🏛 Mercer (2026-09-30, Ari: scripts OK, VIEWING images is free - never download / print): the newer IDX layout. Same grid,
+# boxes and image viewer, but the name goes in ONE box ("LAST FIRST", mode "Name"), and the ribbon's Index Search button
+# runs the search (Enter does not).
+_IDX2_NEWER = {"MERCER": {0: "Name", 1: "Name", 2: "Book & Page"}}
+_IDX2_SEARCH_BTN = "#CallFormPanel_contentSplitter_CallToolPanel_rc_T0G2I2"
 
 
 def _idx2_search(pg, mode, fields, enter_in):
     """mode: 0 Individual, 2 Book & Page. fields: {'txtLname': 'MOAG', ...}. Typed like a person would."""
-    label = _IDX2_MODES[mode]
+    newer = _IDX2_NEWER.get(getattr(pg, "_fz_county", ""))
+    if newer:
+        if mode in (0, 1) and ("txtLname" in fields or "txtFname" in fields):
+            fields = {"txtFirm": " ".join(x for x in (fields.get("txtLname"), fields.get("txtFname")) if x)}
+            enter_in = "txtFirm"
+    label = newer[mode] if newer else _IDX2_MODES[mode]
     if pg.evaluate("() => cboKey.GetText()") != label:
         # the real dropdown (switching from script leaves the new boxes hidden)
         pg.locator(_IDX2_P + "cboKey_I").click()
@@ -4753,7 +4766,10 @@ def _idx2_search(pg, mode, fields, enter_in):
         box.click(); box.press("Control+a"); box.press("Delete")
         if v: box.type(str(v), delay=20)
     before = pg.evaluate("() => [...document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]')].map(t => t.innerText).join('|')")
-    pg.locator(_IDX2_P + enter_in + "_I").press("Enter")
+    if newer and pg.locator(_IDX2_SEARCH_BTN).count():
+        pg.locator(_IDX2_SEARCH_BTN).click()
+    else:
+        pg.locator(_IDX2_P + enter_in + "_I").press("Enter")
     # wait for THIS search's answer: the site went busy and came back, or the rows changed
     seen_busy, quiet = False, 0
     for _ in range(180):                                      # up to 90 s: big counties answer slowly ("Thinking...")
@@ -5755,7 +5771,7 @@ class _FzcCounty:
 
 
 # counties Fernando may not search automatically (site terms / captcha / not working yet)
-_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "WETZEL", "MERCER"}
+_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "WETZEL"}
 _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
 
 
