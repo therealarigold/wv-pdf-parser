@@ -7546,11 +7546,14 @@ class SmartSkipSite:
         self.page = self.ctx.new_page()
         self.page.set_default_timeout(45000)
         self.page.goto(_SS + "/login", wait_until="domcontentloaded")
-        self.page.wait_for_timeout(1500)
-        self.page.locator("input[type=email], input[name*=mail i], input[name*=user i]").first.fill(user)
+        # their sign-in page (seen 2026-09-29): a text box "Enter Email", a password box, a "Sign In" button
+        self.page.wait_for_selector("input[placeholder='Enter Email'], input[type=email]", timeout=30000)
+        self.page.locator("input[placeholder='Enter Email'], input[type=email]").first.fill(user)
         self.page.locator("input[type=password]").first.fill(pw)
-        self.page.locator("button[type=submit], button:has-text('Log in'), button:has-text('Login'), button:has-text('Sign in')").first.click()
-        self.page.wait_for_timeout(5000)
+        self.page.locator("button:has-text('Sign In')").first.click()
+        try: self.page.wait_for_url(lambda u: "/login" not in u, timeout=30000)
+        except Exception: pass
+        self.page.wait_for_timeout(2000)
         if "/login" in (self.page.url or ""):
             raise SmartSkipStop("SmartSkip sign-in refused - check SMARTSKIP_USER / SMARTSKIP_PASS")
 
@@ -7592,28 +7595,28 @@ class SmartSkipSite:
         except Exception:
             return None
 
+    _BOX = {"FIRST NAME": "input[name='firstName']", "LAST NAME": "input[name='lastName']",
+            "MIDDLE NAME OR INITIAL": "input[placeholder='Enter Middle Name']", "CITY": "input[name='city']",
+            "STATE": "input[placeholder='Enter State']", "MAILING ADDRESS": "input[name='mailing-address']",
+            "ZIP CODE": "input[placeholder='Enter Zip']"}
+
     def _fill(self, label, value):
         if not value: return
-        ok = self.page.evaluate("""([label, value]) => {
-            const want = label.toUpperCase();
-            for (const l of document.querySelectorAll('label, span, div, p')) {
-              if ((l.innerText || '').trim().toUpperCase() !== want) continue;
-              let inp = l.control || l.parentElement && l.parentElement.querySelector('input');
-              if (!inp) { let n = l.nextElementSibling; while (n && !inp) { inp = n.matches && n.matches('input') ? n : n.querySelector && n.querySelector('input'); n = n.nextElementSibling; } }
-              if (inp) { const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; set.call(inp, value);
-                         inp.dispatchEvent(new Event('input', {bubbles: true})); inp.dispatchEvent(new Event('change', {bubbles: true})); return true; }
-            } return false; }""", [label, value])
-        if not ok: raise SmartSkipStop(f"SmartSkip form changed - no '{label}' box")
+        box = self.page.locator(self._BOX[label])
+        if not box.count(): raise SmartSkipStop(f"SmartSkip form changed - no '{label}' box")
+        box.first.fill(str(value))
 
     def search(self, first, last, middle="", city="", state="", address="", zip_=""):
         """ONE paid search (15 cents). -> (text, balance_before, balance_after)."""
         pg = self.page
-        pg.goto(_SS + "/manual-skip", wait_until="domcontentloaded"); pg.wait_for_timeout(2500)
+        pg.goto(_SS + "/manual-skip", wait_until="domcontentloaded")
+        try: pg.wait_for_selector("input[name='firstName']", timeout=30000)
+        except Exception: raise SmartSkipStop("SmartSkip search page did not open (still signed in?)")
         before = self.balance()
         if before is not None and before < 5: raise SmartSkipStop(f"SmartSkip balance is ${before:.2f} - under $5")
         self._fill("FIRST NAME", first); self._fill("LAST NAME", last); self._fill("MIDDLE NAME OR INITIAL", middle)
         self._fill("CITY", city); self._fill("STATE", state); self._fill("MAILING ADDRESS", address); self._fill("ZIP CODE", zip_)
-        pg.locator("button:has-text('Search')").last.click()
+        pg.get_by_role("button", name="Search", exact=True).first.click()
         try: pg.wait_for_selector("text=/\\d+\\s+Results?|No results/i", timeout=40000)
         except Exception: pass
         pg.wait_for_timeout(1500)
