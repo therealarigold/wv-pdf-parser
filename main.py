@@ -7727,26 +7727,28 @@ def surplus_fz_one():
         people = _re_sb_get(f"sao_person?select=name,address,source,doc_date&county=eq.{q(county)}&cert=eq.{q(cert)}&limit=60") or []
         _surp_step(job, f"1. State Auditor letters: {len(people)} people / addresses on the letters"
                         + ("" if sao else " (letters for this certificate not read yet)"))
-        # 2) county index
-        idx, note = {}, ""
+        # 2) county index - not again when the case comes back after a report (approval / SmartSkip): he continues from it
+        idx, note, small = {}, "", {}
         last, first, note = fernando_owner_name(owner)
-        try:
-            if last:
-                if county in BANK_COUNTIES:
-                    idx = bank_owner_report(county, last, first, desc=wv.get("description"))
-                else:
-                    if county not in IDX2_URLS and county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
-                    idx = idx2_owner_report(county, last, first, desc=wv.get("description"), middle=fernando_owner_middle(owner))
-            small = {k: idx.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "sold", "property", "prior_owners")} if idx else {}
-            _surp_step(job, f"2. County index: {len(idx.get('deeds') or [])} deeds, {len(idx.get('estate') or [])} estate / will papers for {last} {first}"
-                            if last else f"2. County index: skipped ({note or 'no person name'})")
-        except FzPaused:
-            raise
-        except Exception as e:
-            small = {}
-            _surp_step(job, f"2. County index: could not search ({str(e)[:80]})")
-        # 3) web + reasoning (Fernando's agent with the index tools and web search)
         prior = job.get("report") or {}
+        if prior and prior.get("people"):
+            _surp_step(job, "2. County index: already done - continuing from the earlier report")
+        else:
+            try:
+                if last:
+                    if county in BANK_COUNTIES:
+                        idx = bank_owner_report(county, last, first, desc=wv.get("description"))
+                    else:
+                        if county not in IDX2_URLS and county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
+                        idx = idx2_owner_report(county, last, first, desc=wv.get("description"), middle=fernando_owner_middle(owner))
+                small = {k: idx.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "sold", "property", "prior_owners")} if idx else {}
+                _surp_step(job, f"2. County index: {len(idx.get('deeds') or [])} deeds, {len(idx.get('estate') or [])} estate / will papers for {last} {first}"
+                                if last else f"2. County index: skipped ({note or 'no person name'})")
+            except FzPaused:
+                raise
+            except Exception as e:
+                _surp_step(job, f"2. County index: could not search ({str(e)[:80]})")
+        # 3) web + reasoning (Fernando's agent with the index tools and web search)
         msgs = [{"role": "user", "content":
             f"Surplus case {year} {county} County, certificate {cert}.\nOwner on the tax ticket: {owner or '(unknown)'} {('(' + note + ')') if note else ''}\n"
             f"Property: {wv.get('description') or '(no description)'}\nBought at the sale by: {wv.get('buyer_name_raw') or '-'}\n"
@@ -7754,7 +7756,7 @@ def surplus_fz_one():
             f"STATE AUDITOR LETTERS (documents: {_re_json.dumps(sao.get('docs'), ensure_ascii=False)[:500]}; notice to redeem: "
             f"{_re_json.dumps(sao.get('ntr'), ensure_ascii=False)[:1500]}):\n{_re_json.dumps(people, ensure_ascii=False)[:6000]}\n\n"
             f"COUNTY INDEX SEARCH:\n{_re_json.dumps(small, ensure_ascii=False)[:20000]}\n\n"
-            + (f"YOUR EARLIER REPORT ON THIS CASE (continue from it, do not start over):\n{_re_json.dumps(prior, ensure_ascii=False)[:8000]}\n\n" if prior else "")
+            + (f"YOUR EARLIER REPORT ON THIS CASE - continue from it, do NOT redo what it already found; only do what is still needed (its still_needed list, what the office approved, a skip trace):\n{_re_json.dumps(prior, ensure_ascii=False)[:12000]}\n\n" if prior else "")
             + "Find the people entitled to the surplus and how to reach them, then call report_surplus_heirs."}]
         _surp_step(job, "3. Web: obituaries, death notices and probate mentions")
         sites = _FzcSites(county)
