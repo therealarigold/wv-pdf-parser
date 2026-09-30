@@ -7620,16 +7620,20 @@ class SmartSkipSite:
             except Exception: pass
 
     def balance(self):
-        """The wallet badge ONLY: <span class="wallet-btn__text">$63.62</span> in the top bar (seen 9/30). Other $ figures on the
-        page (the 15-cent price) are never used. Not found -> None, which means carry on - never a reason to stop."""
-        try:
-            loc = self.page.locator("span.wallet-btn__text")
-            loc.first.wait_for(timeout=10000)
-            txt = loc.first.inner_text()
-        except Exception:
-            return None
-        m = _re_re.search(r"\$\s?([\d,]+\.\d\d)", txt or "")
-        return float(m.group(1).replace(",", "")) if m else None
+        """The wallet badge ONLY (span.wallet-btn__text, e.g. "$63.62"). It first shows "$0.00" while the page loads its data - that
+        placeholder made Fernando stop on 9/30 ('balance $0'). So: wait up to 15 s for a real amount; a $0.00 that never changes =
+        unknown (None), which never stops a case (SmartSkip itself refuses a search when the account is really empty)."""
+        import time as _t
+        t0 = _t.time()
+        while _t.time() - t0 < 15:
+            try:
+                txt = self.page.locator("span.wallet-btn__text").first.inner_text(timeout=3000)
+                m = _re_re.search(r"\$\s?([\d,]+\.\d\d)", txt or "")
+                if m and float(m.group(1).replace(",", "")) > 0: return float(m.group(1).replace(",", ""))
+            except Exception:
+                pass
+            self.page.wait_for_timeout(1000)
+        return None
 
     _EXPAND = """() => { const out = [];
         const rows = [...document.querySelectorAll('*')].filter(e => e.children.length < 6 && /\\b\\d{1,3}\\s*y\\.o\\./i.test(e.innerText || '') && (e.innerText || '').length < 120);
