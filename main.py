@@ -7825,6 +7825,13 @@ def surplus_fz_one():
         sites = _FzcSites(county)
         skip = {"used": int(job.get("skip_used") or 0), "limit": int(job.get("skip_limit") or 10), "site": None, "done": {}}
         def tool_fn(sites_, name, inp, budget):
+            if name == "ask_for_more_searches":
+                # Ari: ask ONLY when the allowance is used up - within it, just search
+                left = skip["limit"] - skip["used"]
+                if left > 0:
+                    return f"Not asked: you still have {left} SmartSkip search(es) on this case - just use skip_trace, no approval needed."
+                skip["ask"] = inp
+                return "Asked the owners. Now finish: call report_surplus_heirs with everything you have (list who still needs a search in still_needed)."
             if name != "skip_trace": return _fzc_tool(sites_, name, inp, budget)
             key = (str(inp.get("first") or "").upper().strip(), str(inp.get("last") or "").upper().strip(), str(inp.get("city") or inp.get("state") or "").upper().strip())
             if key in skip["done"]: return "Already searched this person on this case:\n" + skip["done"][key]
@@ -7853,14 +7860,15 @@ def surplus_fz_one():
                 return f"SmartSkip failed this time: {str(e)[:150]}"
         try:
             out = _fz_agent(_SURP_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH, _SKIP_TOOL, _SKIP_ASK], sites,
-                            "fernando_surplus", final_tool=_SURP_REPORT, stop_tool="ask_for_more_searches", tool_fn=tool_fn,
+                            "fernando_surplus", final_tool=_SURP_REPORT, tool_fn=tool_fn,
                             max_steps=24, tag=f"surplus {county} {cert}", model=_FZH_MODEL, max_searches=10)
         finally:
             sites.close()
-        if isinstance(out, dict) and "__stop__" in out:           # he wants more searches: ask the owners, keep what he has
-            ask = out["__stop__"]
+        if skip.get("ask"):                                       # past the allowance and he needs more: ask the owners, keep his report
+            ask = skip["ask"]
             _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "needs_approval", "p_step": f"Asked for {ask.get('more')} more SmartSkip searches",
-                                          "p_report": prior or None, "p_skip_used": skip["used"], "p_question": ask.get("question")})
+                                          "p_report": out if isinstance(out, dict) and out.get("people") is not None else (prior or None),
+                                          "p_skip_used": skip["used"], "p_question": ask.get("question")})
             print(f"[surplus] {county} {cert}: asks for {ask.get('more')} more searches", flush=True)
             return True
         if skip.get("stop") and "under $5" in skip["stop"]:
