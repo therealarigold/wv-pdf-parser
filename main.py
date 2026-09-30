@@ -3951,8 +3951,8 @@ async def run_wvsao_refresh(scope='daily_recent'):
         # for a pushback this refresh does not knock either; two connection failures in a row pause both (same backoff)
         import time as _t
         fails, stop = 0, False
-        try: sao_on = (_fz_rpc("fz_config_get", {"p_key": "sao_render"}) or "on") != "off"
-        except Exception: sao_on = True
+        try: sao_on = (_fz_rpc("fz_config_get", {"p_key": "sao_server_refresh"}) or "off") == "on"
+        except Exception: sao_on = False
         if not sao_on and os.environ.get("SAO_LOCAL", "").strip() != "1":
             print('[refresh] skipped - State Auditor reading is off on the server (sao_render = off)', flush=True)
             years, stop = [], True
@@ -8062,9 +8062,11 @@ class _SaoForm(__import__("html.parser").parser.HTMLParser):
 
 class SaoHttp:
     """County Collections without a browser (tested 2026-09-27: same documents and text as the browser reader, ~10 s a certificate)."""
-    def __init__(self):
+    def __init__(self, proxy=None):
         import http.cookiejar
-        self.op = _re_ur.build_opener(_re_ur.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        hs = [_re_ur.HTTPCookieProcessor(http.cookiejar.CookieJar())]
+        if proxy: hs.append(_re_ur.ProxyHandler({"http": proxy, "https": proxy}))   # the value is never printed
+        self.op = _re_ur.build_opener(*hs)
         self.op.addheaders = [("User-Agent", SAO_UA), ("Accept", "text/html,application/xhtml+xml,application/pdf,*/*"), ("Accept-Language", "en-US,en;q=0.9")]
         self.url, self.html, self.form = None, "", None
 
@@ -8203,7 +8205,8 @@ def sao_loop(n=0):
             if not local:
                 try: on = (_fz_rpc("fz_config_get", {"p_key": "sao_render"}) or "on") != "off"
                 except Exception: on = True
-                if not on:
+                # 🛣 the server reads ONLY through our own dedicated address (Auditor: ~30 an hour per address) - never directly
+                if not on or not os.environ.get("WVSAO_PROXY", "").strip():
                     SAO["state"] = "off on the server - reading from the office PC"; _t.sleep(600); continue
             if _t.time() < SAO.get("pause_until", 0):
                 SAO["state"] = "paused - the site pushed back"; _t.sleep(60); continue
@@ -8214,10 +8217,13 @@ def sao_loop(n=0):
                 if not (0 <= hr < 11) or _t.time() < SAO.get("extra_off_until", 0):
                     SAO.setdefault("extra", {})[n] = "resting (daytime or after a pushback)"; _t.sleep(300); continue
                 SAO.setdefault("extra", {})[n] = "reading"
-            if done_here >= 150: site, done_here = SaoHttp(), 0     # a fresh session now and then
+            lane = "pc" if local else "server"
+            if done_here >= 150 or (lane == "server" and not getattr(site, "_proxied", False)):
+                site = SaoHttp(None if local else os.environ.get("WVSAO_PROXY", "").strip() or None)    # fresh session now and then
+                site._proxied, done_here = not local, 0
             if SAO.get("night_check"):              # the office PC's nightly certificate check has every Auditor turn (Ari)
                 SAO["state"] = "waiting - the nightly certificate check is running"; _t.sleep(60); continue
-            job = _fz_rpc("sao_claim", {})
+            job = _fz_rpc("sao_claim", {"p_lane": lane})
             if not job:
                 SAO["state"] = "waiting (shared pace ~30 letters / hour)"; _t.sleep(20 if local else 300); continue
             SAO["state"] = "working"
@@ -8242,6 +8248,12 @@ def sao_loop(n=0):
                     SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']} - pause {mins} min")
                     SAO["pushback"] = SAO["pushback"][-30:]
                     print(f"[sao] pushback: {e} - all readers pause {mins} min", flush=True)
+                    if not local:     # the server lane stops for good and tells the owners (Ari: any block -> stop + alert)
+                        try:
+                            _fz_rpc("fz_config_set_srv", {"p_key": "sao_render", "p_value": "off"})
+                            _fz_rpc("owner_alert", {"p_title": "⚠ State Auditor: server lane stopped",
+                                                    "p_body": f"The Auditor's site pushed back on the server lane ({e}). It is stopped; the office PC keeps reading."})
+                        except Exception as ex: print(f"[sao] could not stop the lane: {ex}", flush=True)
                     res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site pushed back: {e}"}
                     SAO["slow_last_cert"] = False
             except Exception as e:
