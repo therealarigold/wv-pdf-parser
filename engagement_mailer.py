@@ -147,7 +147,7 @@ def build_email(kind, e):
         if e.get("pay_by") == "bill_later" or e.get("status") == "bill_later":
             nxt = "<p>We're starting your title work now.</p>"
         elif e.get("pay_by") == "check":
-            nxt = f"<p><b>Next step:</b> please mail your check for <b>{total}</b>. We start as soon as it arrives.</p>"
+            nxt = f"<p><b>Next step:</b> please send your payment of <b>{total}</b> by check, or as arranged with our office. We start as soon as it arrives.</p>"
         else:
             nxt = (f"<p><b>Next step:</b> payment of <b>{total}</b>. Your secure payment link will appear on your agreement page "
                    f"(and we'll send it to you). We start the title work as soon as it's paid.</p>" + _button(e["link"], "Open my agreement page"))
