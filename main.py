@@ -6339,6 +6339,67 @@ def fernando_chat_answer(job, log=print, progress=None):
         sites.close()
 
 
+_FZS_CHAT_SYSTEM = """You are Fernando, working with the surplus team of a West Virginia tax-lien law office. A surplus case: a tax
+sale brought more money than was owed; the surplus belongs to the former owner or, if they died, to their heirs. The office
+finds them, contacts them and files for the money. A staff member is asking you about ONE case, or teaching you how they
+work these cases.
+
+You have: the case as the office keeps it (people of interest, notes, stage, amounts), your own earlier heir report and its
+steps (if you were sent on the case), and the State Auditor letters (who was served, where). You can search the county index
+and our page bank, read recorded papers, and search the web (obituaries, probate). You can NOT run paid people-searches
+(SmartSkip) from this chat - if one is needed, say who and why, and that an owner can send you on the case for it.
+
+Answer short, plain and friendly - most important thing first. Say where each fact comes from. Never invent a name, date,
+address, phone or amount. Staff-only information.
+
+When someone TEACHES you how to work surplus cases (who counts as an heir, how to read a paper, what the office does first,
+a county habit), call save_lesson with the rule in one or two plain sentences, so you follow it on every case from now on.
+Lessons from owners count at once; others wait for an owner's OK - say so."""
+
+
+def fernando_surplus_chat(job, log=print, progress=None):
+    """Answer one staff message on a SURPLUS case (kind 'surplus'); returns the reply text."""
+    county = job["county"]
+    t = job.get("ticket") or {}
+    case = t.get("case") or {}
+    can_search = bool(job.get("searchable")) and (county in IDX2_URLS or county in IDX2_SURVEY or county in BANK_COUNTIES) \
+        and county not in _FZ_NO_AUTO
+    try:
+        people = _re_sb_get(f"sao_person?select=name,address,source,doc_date&county=eq.{__import__("urllib.parse").parse.quote(county)}&cert=eq.{__import__("urllib.parse").parse.quote(job["cert"])}&limit=60") or []
+    except Exception:
+        people = []
+    ctx_text = (f"Surplus case: {case.get('year')} {county} County, certificate {job['cert']}.\n"
+                f"THE CASE (as the office keeps it):\n{_re_json.dumps(case, ensure_ascii=False, default=str)[:20000]}\n\n"
+                f"YOUR EARLIER HEIR REPORT ON THIS CASE:\n{_re_json.dumps(t.get('fernando_report') or 'none yet', ensure_ascii=False)[:20000]}\n\n"
+                f"STATE AUDITOR LETTERS - people served / addresses:\n{_re_json.dumps(people, ensure_ascii=False)[:6000]}\n\n"
+                + ("You can search this county's index with the tools." if can_search else
+                   "You can search our saved county index (search_bank) and the web, but not the county's live site."))
+    msgs = [{"role": "user", "content": ctx_text + "\n\n(The conversation on this case follows.)"},
+            {"role": "assistant", "content": "Understood - I have the case, my earlier report and the Auditor letters in front of me."}]
+    for h in job.get("history") or []:
+        if h["role"] == "staff": msgs.append({"role": "user", "content": f"{h.get('author') or 'Staff'}: {h['body']}"})
+        else: msgs.append({"role": "assistant", "content": h["body"]})
+    msgs.append({"role": "user", "content": f"{job.get('author') or 'Staff'}: {job['body']}"})
+    merged = []
+    for m in msgs:
+        if merged and merged[-1]["role"] == m["role"] and isinstance(m["content"], str) and isinstance(merged[-1]["content"], str):
+            merged[-1]["content"] += "\n\n" + m["content"]
+        else: merged.append(m)
+    sites = _FzcSites(county if can_search else None)
+    try:
+        def tool_fn(sites_, name, args, budget):
+            if name == "save_lesson":
+                return _fz_rpc("fernando_lesson_add", {"p_msg_id": job["id"], "p_lesson": "[surplus] " + ((args or {}).get("lesson") or ""),
+                                                       "p_county_only": bool((args or {}).get("county_only"))}) or "saved"
+            return _fzc_tool(sites_, name, args, budget)
+        tools = [x for x in _FZC_TOOLS if can_search or x.get("name") == "search_bank"]
+        return _fz_agent(_FZS_CHAT_SYSTEM + _fz_lessons_text(county), merged, tools + [_FZ_WEB_SEARCH, _FZ_SAVE_LESSON], sites,
+                         "fernando_surplus_chat", max_steps=12, log=log, tag=f"surplus {county} {job['cert']}", progress=progress,
+                         tool_fn=tool_fn, model=_FZH_MODEL, max_searches=6)
+    finally:
+        sites.close()
+
+
 _FZH_SYSTEM = """You are Fernando, the title abstractor of a West Virginia tax-lien office. Before the tax deed the office must
 serve the Notice to Redeem on everyone with an interest - when an owner is dead, that means the heirs / devisees or the
 estate's executor. Your job now: trace the HEIRS for one certificate and report who must be served.
@@ -6482,7 +6543,11 @@ def fernando_chat_one():
             try: _fz_rpc("fernando_chat_progress", {"p_id": job["id"], "p_text": t})
             except Exception: pass
         progress("👀 I'm on it - reading the ticket" + (" and the company page" if job.get("kind") == "company" else " and my earlier search") + "…")
-        if job.get("kind") == "company":
+        if job.get("kind") == "surplus":
+            _AI_CTX.feature = "fernando_surplus_chat"
+            text = fernando_surplus_chat(job, log=lambda m: print(m, flush=True), progress=progress)
+            _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered"})
+        elif job.get("kind") == "company":
             _AI_CTX.feature = "fernando_company"
             text, co = fernando_company_read(job)
             _fz_rpc("fernando_chat_answer", {"p_id": job["id"], "p_body": text[:8000], "p_status": "answered", "p_result": {"company": co} if co else None})
