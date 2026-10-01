@@ -247,10 +247,16 @@ def send(kind, e):
     if not to:
         return "skipped", "no email address"
     subject, body, text, attachments = build_email(kind, e)
-    return _resend(to, subject, body, text, attachments)
+    return _resend(to, subject, body, text, attachments, bcc=True)
 
 
-def _resend(to, subject, body, text, attachments=None):
+# Client emails also go, hidden (bcc), to the office so it sees exactly what the client got (Ari 2026-10-01: Marci).
+# Not the portal welcome / password emails (main.py) - those carry the client's private set-password link.
+def _office_bcc(to):
+    return [x.strip() for x in _env("ENG_BCC", "marci@annelabes.com").split(",") if x.strip() and x.strip().lower() != to.lower()]
+
+
+def _resend(to, subject, body, text, attachments=None, bcc=False):
     live = _env("ENG_LIVE") == "1"
     rcpt = [to] if live else [x.strip() for x in _env("ENG_TEST_TO", "ari@eqoppa.com").split(",") if x.strip()]
     if not live:
@@ -259,6 +265,8 @@ def _resend(to, subject, body, text, attachments=None):
            "reply_to": _env("ENG_REPLY_TO", "marci@annelabes.com"), "subject": subject, "html": body, "text": text}
     if attachments:
         msg["attachments"] = attachments
+    if bcc and live and _office_bcc(to):
+        msg["bcc"] = _office_bcc(to)
     req = urllib.request.Request("https://api.resend.com/emails", data=json.dumps(msg).encode(), method="POST",
                                  headers={"Authorization": "Bearer " + _env("RESEND_API_KEY"), "Content-Type": "application/json",
                                           "User-Agent": "annelabes-portal/1.0"})
@@ -333,7 +341,7 @@ def send_call(kind, p):
     if not to:
         return "skipped", "no email address"
     subject, body, text, attachments = build_call_email(kind, p)
-    return _resend(to, subject, body, text, attachments)
+    return _resend(to, subject, body, text, attachments, bcc=(kind == "call_booked_client"))
 
 
 # 📅 Client calls onto Marci's Gold Standard calendar (the real estate app on Render). Waits until
