@@ -6365,7 +6365,9 @@ def fernando_surplus_chat(job, log=print, progress=None):
     can_search = bool(job.get("searchable")) and (county in IDX2_URLS or county in IDX2_SURVEY or county in BANK_COUNTIES) \
         and county not in _FZ_NO_AUTO
     try:
-        people = _re_sb_get(f"sao_person?select=name,address,source,doc_date&county=eq.{__import__("urllib.parse").parse.quote(county)}&cert=eq.{__import__("urllib.parse").parse.quote(job["cert"])}&limit=60") or []
+        from urllib.parse import quote as _q
+        qc, qk = _q(county), _q(job["cert"])
+        people = _re_sb_get(f"sao_person?select=name,address,source,doc_date&county=eq.{qc}&cert=eq.{qk}&limit=60") or []
     except Exception:
         people = []
     ctx_text = (f"Surplus case: {case.get('year')} {county} County, certificate {job['cert']}.\n"
