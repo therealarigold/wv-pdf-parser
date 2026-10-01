@@ -8349,7 +8349,8 @@ def sao_loop(n=0):
                 SAO["state"] = "waiting - the nightly certificate check is running"; _t.sleep(60); continue
             job = _fz_rpc("sao_claim", {"p_lane": lane})
             if not job:
-                SAO["state"] = "waiting (shared pace ~30 letters / hour)"; _t.sleep(20 if local else 300); continue
+                # not our turn yet (or nothing waiting): ask again soon - the server used to wait 5 min here, which capped it at ~12/h
+                SAO["state"] = "waiting for its turn (pace from fz_config)"; _t.sleep(20); continue
             SAO["state"] = "working"
             SAO.setdefault("current", {})[n] = f"{job['county']} {job['cert']}"
             t0 = _t.time()
