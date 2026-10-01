@@ -137,7 +137,9 @@ def build_email(kind, e):
                 f"representation agreement online — it takes about two minutes on your phone or computer.</p>"
                 f"<p><b>Liens:</b> {liens}<br><b>Fee:</b> {n} × $500 = <b>{total}</b></p>"
                 + _button(e["link"], "Review and sign") +
-                "<p>After you sign, you'll get a secure link to pay. We start the title work as soon as the fee is paid.</p>")
+                ("<p>After you sign, please send your payment by check, or as arranged with our office. We start the title work as soon as it arrives.</p>"
+                 if e.get("pay_by") == "check" else
+                 "<p>After you sign, you'll get a secure link to pay. We start the title work as soon as the fee is paid.</p>"))
         text = f"Hi {first},\n\nPlease review and sign your agreement ({n} lien(s), {total}):\n{e['link']}\n\nMarci · Office of Anne Labes, Esq."
         return subject, _wrap(body), text, None
     if kind == "signed_copy_email":
