@@ -8212,11 +8212,7 @@ class SaoHttp:
             raise
         took = round(__import__("time").time() - t0, 2)
         SAO.setdefault("resp", []).append(took); SAO["resp"] = SAO["resp"][-200:]
-        # the site slowing right down is pushback too: 3 answers in a row slower than 25 s -> everyone pauses
-        SAO["slow_run"] = SAO.get("slow_run", 0) + 1 if took > 25 else 0
-        if SAO["slow_run"] >= 3:
-            SAO["slow_run"] = 0
-            raise SaoBlocked(f"site very slow ({took:.0f} s answers)")
+        # slow answers are NOT pushback (Ari 2026-10-02): only a timeout or a real block counts - see sao_loop
         if "html" in ctype:
             low = raw[:20000].decode("utf-8", "replace").lower()
             if any(w in low for w in ("captcha", "access denied", "request rejected", "too many requests", "unusual traffic")):
@@ -8359,14 +8355,23 @@ def sao_loop(n=0):
             try:
                 res = sao_read_cert(site, job)
             except SaoBlocked as e:
-                slow = "slow" in str(e) or "timed out" in str(e)
-                if slow and not SAO.get("slow_last_cert") and not SAO.get("careful"):
-                    # some certificates make the site hang (~50 s answers) while others answer in 1 s: skip this one
-                    # (it is tried again later); only a second slow certificate in a row counts as the site pushing back
-                    SAO["slow_last_cert"] = True
-                    SAO.setdefault("slow_certs", []).append(f"{job['county']} {job['cert']}")
-                    res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": "the site hangs on this certificate - tried again later"}
+                if "timed out" in str(e):
+                    # Ari 2026-10-02: a timeout pauses this reader 30 min and it restarts by itself; a second timeout
+                    # right after (the first read after the pause) pauses 2 h, then it restarts by itself. No switch-off.
+                    SAO["timeouts_in_row"] = SAO.get("timeouts_in_row", 0) + 1
+                    mins = 30 if SAO["timeouts_in_row"] == 1 else 120
+                    SAO["pause_until"] = _t.time() + mins * 60
+                    SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on {job['county']} {job['cert']} - pause {mins} min, then restarts")
+                    SAO["pushback"] = SAO["pushback"][-30:]
+                    print(f"[sao] timeout #{SAO['timeouts_in_row']} in a row - pause {mins} min, then restarts by itself", flush=True)
+                    if mins == 120 and not local:
+                        try:
+                            _fz_rpc("owner_alert", {"p_title": "State Auditor: server lane paused 2 hours",
+                                                    "p_body": "Two timeouts in a row from the Auditor's site. The server lane rests 2 hours and restarts by itself; the office PC keeps reading."})
+                        except Exception as ex: print(f"[sao] alert failed: {ex}", flush=True)
+                    res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site timed out - paused {mins} min"}
                 else:
+                    # a real block (403 / 429 / 503 / block page): everyone pauses, and the server lane stops for good + alert
                     SAO["pause_n"] = SAO.get("pause_n", 0) + 1
                     mins = min(30 * 2 ** (SAO["pause_n"] - 1), 480)
                     SAO["pause_until"] = _t.time() + mins * 60
@@ -8379,14 +8384,14 @@ def sao_loop(n=0):
                         try:
                             _fz_rpc("fz_config_set_srv", {"p_key": "sao_render", "p_value": "off"})
                             _fz_rpc("owner_alert", {"p_title": "⚠ State Auditor: server lane stopped",
-                                                    "p_body": f"The Auditor's site pushed back on the server lane ({e}). It is stopped; the office PC keeps reading."})
+                                                    "p_body": f"The Auditor's site blocked the server lane ({e}). It is stopped; the office PC keeps reading."})
                         except Exception as ex: print(f"[sao] could not stop the lane: {ex}", flush=True)
                     res = {"county": job["county"], "cert": job["cert"], "status": "queued", "error": f"site pushed back: {e}"}
-                    SAO["slow_last_cert"] = False
             except Exception as e:
                 res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": str(e)[:300]}
             if res.get("status") in ("done", "none"):
                 SAO["slow_last_cert"] = False
+                SAO["timeouts_in_row"] = 0
                 if SAO.get("careful"):
                     SAO["careful"] -= 1
                     if SAO["careful"] <= 0: SAO["pause_n"] = 0              # 20 good ones after a pause: back to normal
