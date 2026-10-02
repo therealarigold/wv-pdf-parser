@@ -5855,14 +5855,28 @@ _BANK_IMAGE_WAIT = 1500
 _BANK_MAX_READS = 8
 
 
-def bank_image(county, bookpage, note=None):
+_PERSON_BOOK = {"deed": "DEED", "debt": "DEBT", "will": "WILL"}
+
+
+def bank_image(county, bookpage, note=None, kind=None):
     """The viewer's page images of one paper (book/page), fetched by the office computer's signed-in window (Ari 2026-09-28:
     viewing is included in the monthly fee; copies are never bought). -> [(mime, base64)], first 3 pages."""
     import time as _t
     b, pg = _idx2_bp(bookpage)
     if not (b and pg): return []
     if county in PERSON_COUNTIES:
-        if note is not None: note.append(f"{county.title()} pictures are not fetched (a person opens that index) - index lines only")
+        # 🖼 the Chrome helper opens the county's image page (viewing is free there - Ari 2026-10-02) and keeps the pages under
+        # this term; first time: queue it (no waiting) - the certificate is re-read by itself when the pictures come in
+        term = f"{_PERSON_BOOK.get(kind or 'deed', 'DEED')}|{b}/{pg}"
+        rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
+        have = [(r.get("mime") or "image/jpeg", r["b64"]) for r in rows if r.get("b64")][:8]
+        if have: return have
+        cert = getattr(_AI_CTX, "cert", None) if getattr(_AI_CTX, "feature", "") == "fernando_read" else None
+        try:
+            _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando", "p_kind": "image", "p_for": f"{county}|{cert}" if cert else None})
+            if note is not None: note.append(f"{county.title()} picture {term.split('|')[1]} is queued for the office's Chrome helper - read when it comes in")
+        except Exception as e:
+            if note is not None: note.append(f"{county.title()} picture {b}/{pg} could not be queued: {str(e)[:80]}")
         return []
     term = f"{b}/{pg}"
     def got():
@@ -5896,7 +5910,7 @@ def bank_read(county, kind, bookpage, reads, note=None):
     if banked and banked.get("fields") and banked.get("doc_kind") == kind and (kind != "deed" or "tract_sources" in banked["fields"]):
         return banked["fields"]
     if reads["n"] >= _BANK_MAX_READS: return None
-    imgs = bank_image(county, bookpage, note)
+    imgs = bank_image(county, bookpage, note, kind=kind)
     if not imgs: return None
     reads["n"] += 1
     try:
