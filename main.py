@@ -5807,7 +5807,13 @@ _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses
 # live requests (idx_live_ask -> idx_live_status). County's written OK: title work only, a normal user's pace. Pictures: viewing
 # is included in the subscription (Ari 2026-09-28) - the window fetches the viewer's pages (kind 'image'); copies are never bought. Fernando: bank first, a live request only for a name the bank lacks (a few per ticket).
 # ─────────────────────────────────────────────────────────────────────────────
-BANK_COUNTIES = {"PUTNAM"}
+# 🤵 PERSON COUNTIES (Ari 2026-10-02): the index needs a person at the door (Monongalia robot slider, Kanawha sign-in); the county
+# allows searching at a normal pace once a person is in. The server never opens them: bank first, then the search is QUEUED
+# (idx_live_ask with p_for = "COUNTY|CERT") and Ari gets a phone notice; he opens the county in Chrome, passes the check himself
+# and clicks "Let Fernando search" (portal fz-helper.js). When a certificate's searches are answered, the database re-opens it.
+# No waiting here - Fernando goes on with his other work. Hardy / Wetzel join when the counties say yes.
+PERSON_COUNTIES = {"MONONGALIA", "KANAWHA"}
+BANK_COUNTIES = {"PUTNAM"} | PERSON_COUNTIES
 _BANK_LIVE_WAIT = 900
 
 
@@ -5817,6 +5823,16 @@ def bank_owner_rows(county, last, first="", live=True, note=None):
     rows = _fz_rpc("fz_bank_owner", {"p_county": county, "p_last": last, "p_first": first or None}) or []
     if rows or not live: return rows
     term = f"{last} {first}".strip()
+    if county in PERSON_COUNTIES:
+        cert = getattr(_AI_CTX, "cert", None) if getattr(_AI_CTX, "feature", "") == "fernando_read" else None
+        try:
+            _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando", "p_for": f"{county}|{cert}" if cert else None})
+            if note is not None:
+                note.append(f"{county.title()} search for {term} is queued for the office's Chrome helper (a person opens {county.title()}'s index; "
+                            f"this certificate is re-read by itself when the search comes in).")
+        except Exception as e:
+            if note is not None: note.append(f"{county.title()} search for {term} could not be queued: {str(e)[:80]}")
+        return rows
     try:
         rid = _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando"})
     except Exception as e:
@@ -5845,6 +5861,9 @@ def bank_image(county, bookpage, note=None):
     import time as _t
     b, pg = _idx2_bp(bookpage)
     if not (b and pg): return []
+    if county in PERSON_COUNTIES:
+        if note is not None: note.append(f"{county.title()} pictures are not fetched (a person opens that index) - index lines only")
+        return []
     term = f"{b}/{pg}"
     def got():
         rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
@@ -5923,7 +5942,7 @@ def bank_owner_report(county, last, first, book=None, page=None, desc=None, dist
         if not cur: break
         d = cur[0]
         chain.append({"date": d["date"], "type": d["doc"], "bookpage": d["bookpage"], "grantor": d.get("other") or "", "grantee": d["name"],
-                      "desc": d["desc"], "found_by": how + " (index line, Putnam images not opened)"})
+                      "desc": d["desc"], "found_by": how + f" (index line, {county.title()} images not opened)"})
         sl, sf = _idx2_name((d.get("other") or "").split(";")[0])
         if not sl or (sl, sf) in seen: break
         seen.add((sl, sf))
@@ -6059,8 +6078,13 @@ def _fzc_tool(sites, name, args, budget):
                                    "notes": notes}, ensure_ascii=False)
         if name in ("lookup_book_page", "read_document"):
             got = _fz_rpc("fz_bank_bookpage", {"p_county": site.county, "p_book": str(args.get("book") or ""), "p_page": str(args.get("page") or "")}) or []
+            if site.county in PERSON_COUNTIES:
+                return _re_json.dumps({"found": got, "note": f"{site.county.title()}'s index needs a person at the door, so the paper itself is not opened; "
+                                       "this is the index entry. Staff can open it on the county's site."}, ensure_ascii=False)
             return _re_json.dumps({"found": got, "note": f"{site.county.title()}'s document images are paid - the paper itself is not opened; "
                                    "this is the index entry. Staff can open it in their RECORDhub account if needed."}, ensure_ascii=False)
+        if site.county in PERSON_COUNTIES:
+            return f"{site.county.title()}'s old books and images are not available to me (a person must open that index) - staff can check them on the county's site."
         return f"{site.county.title()}'s old books and images are not available to me (paid / sign-in only) - staff can check them in RECORDhub."
     if name == "old_book_page":
         bt = (args.get("book_type") or "DEED BOOK").upper()
