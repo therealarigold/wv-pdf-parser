@@ -5797,7 +5797,7 @@ class _FzcCounty:
 
 
 # counties Fernando may not search automatically (site terms / captcha / not working yet)
-_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "WETZEL", "HARRISON"}   # HARRISON: 403 for everyone since 9/30 - wait for the clerk's rules (Ari)
+_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "HARRISON"}   # HARRISON: 403 for everyone since 9/30 - wait for the clerk's rules (Ari)
 _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
 
 
@@ -5812,7 +5812,7 @@ _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses
 # (idx_live_ask with p_for = "COUNTY|CERT") and Ari gets a phone notice; he opens the county in Chrome, passes the check himself
 # and clicks "Let Fernando search" (portal fz-helper.js). When a certificate's searches are answered, the database re-opens it.
 # No waiting here - Fernando goes on with his other work. Hardy / Wetzel join when the counties say yes.
-PERSON_COUNTIES = {"MONONGALIA", "KANAWHA"}
+PERSON_COUNTIES = {"MONONGALIA", "KANAWHA", "WETZEL"}   # WETZEL: county OK by phone 2026-10-02 (robot page; images free)
 BANK_COUNTIES = {"PUTNAM"} | PERSON_COUNTIES
 _BANK_LIVE_WAIT = 900
 
