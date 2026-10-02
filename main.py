@@ -4815,7 +4815,28 @@ def _idx2_search(pg, mode, fields, enter_in):
             pg.wait_for_function("() => !grd.InCallback()", timeout=45000)
         rows.extend(_idx2_rows(pg))
         if i >= 9: break                                     # 10 pages x 100 is plenty for one name
+    _idx2_bank_rows(pg, fields, rows)
     return rows
+
+
+def _idx2_row_array(r):
+    """A grid row (dict) in the bank's order: instrument, date, type, book/page, pages, role, name, role2, other party, description."""
+    return [r.get("instrument") or "", r.get("date") or "", r.get("doc") or "", r.get("bookpage") or "", r.get("pages") or "",
+            r.get("role") or "", r.get("name") or "", r.get("role2") or "", r.get("other") or "", r.get("desc") or ""]
+
+
+def _idx2_bank_rows(pg, fields, rows):
+    """🗂 Every search Fernando does on a county site goes into our bank too (Ari 2026-10-02) - the bank stays fresher
+    between the weekly sweeps, and the next question about that name is answered from our copy."""
+    county = getattr(pg, "_fz_county", "")
+    arr = [_idx2_row_array(r) for r in (rows or []) if r.get("instrument")]
+    if not county or not arr: return
+    key = ("live:" + " ".join(str(v) for v in (fields or {}).values() if v)).upper()[:90]
+    try:
+        for i in range(0, len(arr), 1500):
+            _fz_rpc("idx_ingest_srv", {"p_county": county, "p_search": key, "p_rows": arr[i:i + 1500], "p_page": 0, "p_pages": 1})
+    except Exception as e:
+        print(f"[bank] {county} live rows not kept: {str(e)[:120]}", flush=True)
 
 
 def _idx2_bp(s):
@@ -5796,6 +5817,153 @@ class _FzcCounty:
         except Exception: pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔄 WEEKLY "WHAT'S NEW" SWEEP (Ari 2026-10-02). The bank was collected once (Sept 26 - Oct 2). Each night (9 pm - 6 am Eastern)
+# up to 10 counties are asked for EVERYTHING recorded since their last sweep (Date Range mode, every document type), so every
+# county is refreshed about weekly. Normal pace (a person paging: ~8 s a page), one county at a time, stops on any block.
+# A window that hits the site's 100-page cap is split in two. Off switch: fz_config idx_sweep = 'off'.
+# ─────────────────────────────────────────────────────────────────────────────
+_SWEEP_SKIP = {"HANCOCK", "PRESTON", "HARRISON"}      # Ari: leave these alone for now
+_SWEEP_PACE = 8
+_SWEEP_PER_NIGHT = 10
+_SWEEP_BLOCK_RE = _re_re.compile(r"captcha|not a robot|access denied|forbidden|too many requests|unusual traffic", _re_re.I)
+
+
+def _sweep_counties():
+    return sorted(c for c in (set(IDX2_URLS) | set(IDX2_SURVEY))
+                  if c not in PERSON_COUNTIES and c not in BANK_COUNTIES and c not in _FZ_NO_AUTO and c not in _SWEEP_SKIP)
+
+
+def _sweep_rows(pg):
+    """The current grid page without clicking anything (the older layout's other party stays empty)."""
+    got = pg.evaluate(_IDX2_READ)
+    hdr = [_IDX2_HDR.get(h, h.lower()) for h in got["hdr"]]
+    out = []
+    for r in got["rows"]:
+        cells = r["cells"]
+        if len(cells) < len(hdr): continue
+        d = {hdr[i]: cells[i] for i in range(len(hdr))}
+        d["desc"] = _re_re.sub(r"^Description\s+", "", d.get("desc", ""))
+        out.append(_idx2_row_array(d))
+    return [a for a in out if a[0]]
+
+
+def _sweep_wait(pg, before):
+    seen_busy, quiet = False, 0
+    for _ in range(240):                                  # up to 2 min: a week of a big county answers slowly
+        pg.wait_for_timeout(500)
+        busy, now = pg.evaluate("""() => [grd.InCallback() || [...document.querySelectorAll('[class*="LoadingPanel"], [id*="LoadingPanel"]')].some(e => e.offsetParent && e.offsetWidth > 0),
+                                         [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(t => t.innerText).join('|').slice(0, 4000)]""")
+        if busy: seen_busy = True; quiet = 0; continue
+        if now != before or (seen_busy and now): return
+        quiet += 1
+        if quiet >= (20 if seen_busy else 40): return
+
+
+def idx_sweep_county(county, d_from, d_thru, log=print):
+    """Everything recorded in the county from d_from to d_thru (dates) into the bank. Returns the rows kept."""
+    import time as _t
+    from datetime import timedelta as _td
+    url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
+    p, browser = get_playwright_browser()
+    kept = {"n": 0}
+    try:
+        ctx = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+        pg = ctx.new_page()
+        _idx2_open(pg, county, url)
+        if pg.evaluate("() => cboKey.GetText()") != "Date Range":
+            if not pg.evaluate("() => { for (let i = 0; i < cboKey.GetItemCount(); i++) if (cboKey.GetItem(i).text === 'Date Range') return true; return false; }"):
+                raise RuntimeError("this site has no Date Range search")
+            pg.locator(_IDX2_P + "cboKey_I").click(); pg.wait_for_timeout(600)
+            pg.get_by_text("Date Range", exact=True).last.click(); pg.wait_for_timeout(2500)
+        types = pg.evaluate("""async () => { const rows = [...document.querySelectorAll('tr[id*="grdTypes"][id*="DXDataRow"]')];
+            for (let pass = 0; pass < 2; pass++) { for (let i = 0; i < rows.length; i++) if (!grdTypes.IsRowSelectedOnPage(i)) grdTypes.SelectRowOnPage(i);
+              await new Promise(r => setTimeout(r, 1200)); } return rows.length; }""")
+        if not types: raise RuntimeError("no document types to choose")
+        # the site applies typed dates only from the second search on: one plain search first (its default window), not kept
+        before0 = pg.evaluate("() => [...document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]')].map(t => t.innerText).join('|').slice(0, 4000)")
+        btn0 = pg.locator(_IDX2_SEARCH_BTN)
+        (btn0.first if btn0.count() else pg.get_by_text("Index Search", exact=True).first).click()
+        _sweep_wait(pg, before0)
+        _t.sleep(_SWEEP_PACE)
+
+        def window(a, b, depth=0):
+            pg.evaluate("""([a, b]) => { FromDate.SetDate(new Date(a)); try { FromDate.RaiseValueChangedEvent(); } catch (e) {}
+                                          ThruDate.SetDate(new Date(b)); try { ThruDate.RaiseValueChangedEvent(); } catch (e) {} }""",
+                        [a.isoformat() + "T12:00:00", b.isoformat() + "T12:00:00"])
+            pg.wait_for_timeout(800)
+            before = pg.evaluate("() => [...document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]')].map(t => t.innerText).join('|').slice(0, 4000)")
+            btn = pg.locator(_IDX2_SEARCH_BTN)
+            (btn.first if btn.count() else pg.get_by_text("Index Search", exact=True).first).click()
+            _sweep_wait(pg, before)
+            body = pg.evaluate("() => document.title + ' ' + document.body.innerText.slice(0, 1500)")
+            if _SWEEP_BLOCK_RE.search(body or "") or "login.aspx" in pg.url.lower(): raise RuntimeError("BLOCKED - stopped")
+            pages = pg.evaluate("() => grd.GetPageCount()") or 0
+            if pages >= 100 and (b - a).days >= 1 and depth < 6:            # the site shows at most 100 pages: split the window
+                mid = a + _td(days=(b - a).days // 2)
+                window(a, mid, depth + 1); _t.sleep(_SWEEP_PACE); window(mid + _td(days=1), b, depth + 1)
+                return
+            key = f"sweep:{a.isoformat()}..{b.isoformat()}"
+            for i in range(pages):
+                if i:
+                    _t.sleep(_SWEEP_PACE)
+                    pg.evaluate("(n) => grd.GotoPage(n)", i)
+                    pg.wait_for_timeout(800)
+                    pg.wait_for_function("() => !grd.InCallback()", timeout=60000)
+                rows = _sweep_rows(pg)
+                if rows:
+                    _fz_rpc("idx_ingest_srv", {"p_county": county, "p_search": key, "p_rows": rows, "p_page": i, "p_pages": pages})
+                    kept["n"] += len(rows)
+            log(f"[sweep] {county} {a}..{b}: {pages} pages, {kept['n']} rows so far")
+
+        window(d_from, d_thru)
+        return kept["n"]
+    finally:
+        try: browser.close()
+        except Exception: pass
+        try: p.stop()
+        except Exception: pass
+
+
+def idx_sweep_loop():
+    import time as _t
+    from datetime import date as _date
+    try:
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
+    except Exception:
+        _et = None
+    _t.sleep(900)
+    night, done = None, 0
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "idx_sweep"}) or "on") == "off":
+                _t.sleep(1800); continue
+            now = _re_dt.now(_et) if _et else _re_dt.utcnow()
+            if not (now.hour >= 21 or now.hour < 6):
+                _t.sleep(900); continue
+            key = (now - __import__("datetime").timedelta(hours=12)).date()
+            if key != night: night, done = key, 0
+            if done >= _SWEEP_PER_NIGHT or _mem_used() > _FZ_MEM_MAX:
+                _t.sleep(900); continue
+            job = _fz_rpc("idx_sweep_next", {"p_counties": _sweep_counties()})
+            if not job:
+                _t.sleep(1800); continue
+            c, a, b = job["county"], _date.fromisoformat(job["from"]), _date.fromisoformat(job["thru"])
+            try:
+                n = idx_sweep_county(c, a, b)
+                _fz_rpc("idx_sweep_done", {"p_county": c, "p_thru": b.isoformat(), "p_rows": n, "p_note": f"{a}..{b}: {n} rows"})
+                print(f"[sweep] {c} done: {n} rows ({a}..{b})", flush=True)
+            except Exception as e:
+                _fz_rpc("idx_sweep_done", {"p_county": c, "p_thru": None, "p_rows": 0, "p_note": "failed: " + str(e)[:250]})
+                print(f"[sweep] {c} failed: {str(e)[:200]}", flush=True)
+            done += 1
+            _t.sleep(90)
+        except Exception as e:
+            print(f"[sweep] loop: {str(e)[:200]}", flush=True)
+            _t.sleep(600)
+
+
 # counties Fernando may not search automatically (site terms / captcha / not working yet)
 _FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "HARRISON"}   # HARRISON: 403 for everyone since 9/30 - wait for the clerk's rules (Ari)
 _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
@@ -5821,6 +5989,24 @@ def bank_owner_rows(county, last, first="", live=True, note=None):
     """The owner's papers from our bank; when there are none, ask the office computer's county tab and wait (<= 3 min)."""
     import time as _t
     rows = _fz_rpc("fz_bank_owner", {"p_county": county, "p_last": last, "p_first": first or None}) or []
+    if rows and live and last:
+        # 🔄 fresh check (Ari 2026-10-02): records older than 30 days -> ask the county again; the certificate is
+        # re-read by itself when the answer comes in. Meanwhile he works from what the bank has.
+        try:
+            fr = _fz_rpc("idx_fresh", {"p_county": county, "p_last": last})
+            age = (_re_dt.utcnow() - _re_dt.fromisoformat(str(fr).replace("Z", "").split("+")[0])).days if fr else 999
+        except Exception:
+            age = 0
+        if age > 30:
+            cert = getattr(_AI_CTX, "cert", None) if getattr(_AI_CTX, "feature", "") == "fernando_read" else None
+            try:
+                _fz_rpc("idx_live_ask", {"p_county": county, "p_term": f"{last} {first}".strip(), "p_by": "fernando",
+                                         "p_for": f"{county}|{cert}" if cert else None})
+                if note is not None: note.append(f"{county.title()} records for {last} are {age} days old - a fresh search was asked; "
+                                                 f"the report is re-read when it comes in.")
+            except Exception:
+                pass
+        return rows
     if rows or not live: return rows
     term = f"{last} {first}".strip()
     if county in PERSON_COUNTIES:
@@ -8633,6 +8819,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=putnam_loop, daemon=True).start()             # 🏛 Putnam with Fernando's own login (slow)
         _og_threading.Thread(target=client_fz_loop, daemon=True).start()          # 💬 clients ask Fernando about their own file
         _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
+        _og_threading.Thread(target=idx_sweep_loop, daemon=True).start()          # 🔄 weekly "what's new" sweep of every county (nights)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
