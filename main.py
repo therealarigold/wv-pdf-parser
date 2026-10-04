@@ -3908,7 +3908,14 @@ async def run_wvsao_refresh(scope='daily_recent'):
     # an earlier year was never re-checked and a flip on it could never be seen -
     # which is exactly what the online rounds sell. One day a week the daily run
     # upgrades itself to the full sweep, so nothing new has to be scheduled.
-    if scope == 'daily_recent' and _re_dt.now().weekday() == WEEKLY_FULL_WEEKDAY:
+    # 📅 (Ari 2026-10-04) the State Auditor works Monday-Friday: the 1 am runs on Sunday and Monday (= Saturday's and Sunday's
+    # changes) find nothing, so they are skipped and those hours go to the letters. A manual catch-up (--check-now) still runs.
+    _ny = _re_dt.utcnow() - __import__("datetime").timedelta(hours=5)
+    if scope == 'daily_recent' and _ny.weekday() in (6, 0) and not SAO.get("force_night"):
+        print('[refresh] skipped - Sunday / Monday night: the State Auditor does not work weekends', flush=True)
+        log['notes'] = 'skipped: weekend (the State Auditor works Mon-Fri)'
+        return log
+    if scope == 'daily_recent' and _ny.weekday() == WEEKLY_FULL_WEEKDAY:
         scope = 'weekly_full'
         log['scrape_scope'] = scope
         log['notes'] = (log.get('notes') or '') + 'daily run upgraded to full sweep (weekly); '
@@ -4338,7 +4345,7 @@ def diagnose_wvsao_sync(county, year):
 
 # Sync wrapper
 # Which weekday the daily run does the full sweep instead. 0=Mon ... 6=Sun.
-WEEKLY_FULL_WEEKDAY = 6
+WEEKLY_FULL_WEEKDAY = 5   # Saturday 1 am (covers through Friday) - Sun/Mon runs are skipped (Ari 2026-10-04)
 # How far back the full sweep reaches. Online rounds resell leftovers from older
 # tax years, so this is the real limit on which flips can ever be detected.
 EARLIEST_TAX_YEAR = 2021

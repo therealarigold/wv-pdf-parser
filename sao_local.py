@@ -46,9 +46,11 @@ def nightly_certificate_check():
     while True:
         t = ny_now()
         if now_run or (t.hour >= 1 and t.hour < 6 and last_day != t.date()):
+            forced = now_run                           # a manual catch-up runs on any day (weekend rule only for the 1 am run)
             now_run, last_day = False, t.date()
             print(f"[night check] starting the certificate check {t:%Y-%m-%d %H:%M} New York", flush=True)
             main.SAO["night_check"] = True           # the letters wait so the check gets every turn (~4 h instead of ~8)
+            main.SAO["force_night"] = forced
             try: main.run_wvsao_refresh_sync(scope="daily_recent")
             except Exception as e: print(f"[night check] failed: {e}", flush=True)
             finally: main.SAO["night_check"] = False
