@@ -8069,6 +8069,9 @@ _SURP_REPORT = {"name": "report_surplus_heirs", "description": "Your finished he
         "required": ["summary", "people"]}}
 
 
+_SURP_IDLE_SECONDS = 600
+
+
 def _surp_step(job, text, **kw):
     r = _fz_rpc("surplus_fz_update", dict({"p_id": job["id"], "p_status": "working", "p_step": text, "p_report": None,
                                            "p_skip_used": None, "p_question": None}, **kw)) or {}
@@ -8121,11 +8124,14 @@ def surplus_fz_one():
             f"STATE AUDITOR LETTERS (documents: {_re_json.dumps(sao.get('docs'), ensure_ascii=False)[:500]}; notice to redeem: "
             f"{_re_json.dumps(sao.get('ntr'), ensure_ascii=False)[:1500]}):\n{_re_json.dumps(people, ensure_ascii=False)[:6000]}\n\n"
             f"COUNTY INDEX SEARCH:\n{_re_json.dumps(small, ensure_ascii=False)[:20000]}\n\n"
-            + (f"YOUR EARLIER REPORT ON THIS CASE - continue from it, do NOT redo what it already found; only do what is still needed (its still_needed list, what the office approved, a skip trace):\n{_re_json.dumps(prior, ensure_ascii=False)[:12000]}\n\n" if prior else "")
+            + (f"WHAT THE OFFICE TOLD YOU ON THIS CASE BEFORE:\n{_re_json.dumps(job.get('earlier_notes'), ensure_ascii=False)[:3000]}\n\n" if job.get("earlier_notes") else "")
+            + (f"THE CASE CHAT (staff and you):\n{_re_json.dumps(job.get('chat'), ensure_ascii=False)[:8000]}\n\n" if job.get("chat") else "")
+            + (f"YOUR EARLIER REPORT ON THIS CASE - continue from it, do NOT redo what it already found; only do what is still needed (its still_needed list, "
+               f"the office note above, what the office approved, a skip trace). Your new report REPLACES this one on screen, so its summary must tell the "
+               f"WHOLE story (the earlier findings plus what is new) and keep every person (update them when you learn more):\n{_re_json.dumps(prior, ensure_ascii=False)[:12000]}\n\n" if prior else "")
             + "Find the people entitled to the surplus and how to reach them, then call report_surplus_heirs."}]
         _surp_step(job, "3. Web: obituaries, death notices and probate mentions")
-        sites = _FzcSites(county)
-        skip = {"used": int(job.get("skip_used") or 0), "limit": int(job.get("skip_limit") or 10), "site": None, "done": {}}
+        skip ={"used": int(job.get("skip_used") or 0), "limit": int(job.get("skip_limit") or 10), "site": None, "done": {}}
         def tool_fn(sites_, name, inp, budget):
             if name == "ask_for_more_searches":
                 # Ari: ask ONLY when the allowance is used up - within it, just search
@@ -8160,12 +8166,45 @@ def surplus_fz_one():
             except Exception as e:
                 print(f"[surplus] SmartSkip error: {str(e)[:300]}", flush=True)
                 return f"SmartSkip failed this time: {str(e)[:150]}"
+        # ⏱ Ari 10/5: Roane hung 80+ min on one county page and blocked every case behind it. A limit PER STEP, not per case
+        # (a long case is fine while it keeps moving): the work runs in its own thread (Playwright stays in the thread that
+        # opened it); every thinking turn / page / search marks activity, and 10 min with no activity = stuck ->
+        # surplus_fz_update 'stuck': first time the case restarts by itself, second time the owners get a phone notice and the
+        # line moves on to the next case.
+        import time as _tm
+        alive = {"at": _tm.time(), "what": "starting"}
+        def mark(t=""):
+            alive["at"] = _tm.time()
+            if t: alive["what"] = t
+        def tool_fn_watched(sites_, name, inp, budget):
+            mark(f"{name} {str(inp)[:80]}")
+            try: return tool_fn(sites_, name, inp, budget)
+            finally: mark()
+        def run_agent():
+            _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_surplus", county, cert
+            sites = _FzcSites(county)
+            try:
+                return _fz_agent(_SURP_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH, _SKIP_TOOL, _SKIP_ASK], sites,
+                                 "fernando_surplus", final_tool=_SURP_REPORT, tool_fn=tool_fn_watched, progress=mark,
+                                 max_steps=24, tag=f"surplus {county} {cert}", model=_FZH_MODEL, max_searches=10)
+            finally:
+                sites.close()
+        import concurrent.futures as _cf
+        ex = _cf.ThreadPoolExecutor(max_workers=1)
         try:
-            out = _fz_agent(_SURP_SYSTEM + _fz_lessons_text(county), msgs, _FZC_TOOLS + [_FZ_WEB_SEARCH, _SKIP_TOOL, _SKIP_ASK], sites,
-                            "fernando_surplus", final_tool=_SURP_REPORT, tool_fn=tool_fn,
-                            max_steps=24, tag=f"surplus {county} {cert}", model=_FZH_MODEL, max_searches=10)
+            fut = ex.submit(run_agent)
+            while True:
+                try:
+                    out = fut.result(timeout=30); break
+                except _cf.TimeoutError:
+                    if _tm.time() - alive["at"] > _SURP_IDLE_SECONDS:
+                        # Ari: don't give up - restart the case once by itself; stuck again = tell the owners, next case (DB decides)
+                        print(f"[surplus] {county} {cert}: stuck {_SURP_IDLE_SECONDS // 60} min on {alive['what'][:100]}", flush=True)
+                        _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "stuck", "p_step": alive["what"][:150],
+                                                      "p_report": None, "p_skip_used": skip["used"], "p_question": None})
+                        return True
         finally:
-            sites.close()
+            ex.shutdown(wait=False)
         if skip.get("ask"):                                       # past the allowance and he needs more: ask the owners, keep his report
             ask = skip["ask"]
             _fz_rpc("surplus_fz_update", {"p_id": job["id"], "p_status": "needs_approval", "p_step": f"Asked for {ask.get('more')} more SmartSkip searches",
