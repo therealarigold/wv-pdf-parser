@@ -5834,7 +5834,7 @@ class _FzcCounty:
 # county is refreshed about weekly. Normal pace (a person paging: ~8 s a page), one county at a time, stops on any block.
 # A window that hits the site's 100-page cap is split in two. Off switch: fz_config idx_sweep = 'off'.
 # ─────────────────────────────────────────────────────────────────────────────
-_SWEEP_SKIP = {"HANCOCK", "PRESTON", "HARRISON"}      # Ari: leave these alone for now
+_SWEEP_SKIP = {"HARRISON"}      # Ari: leave alone for now (website question). Hancock + Preston swept from 10/5 (Ari)
 _SWEEP_PACE = 8
 _SWEEP_PER_NIGHT = 10
 _SWEEP_BLOCK_RE = _re_re.compile(r"captcha|not a robot|access denied|forbidden|too many requests|unusual traffic", _re_re.I)
