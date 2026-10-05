@@ -5784,6 +5784,8 @@ _FZC_TOOLS = [
     {"name": "read_document", "description": "Open the scanned images of the document recorded at a book/page so you can read it yourself "
         "(parties, addresses, amounts, the 'being the same property' clause, release wording). Costly - only when the answer is on the page.",
      "input_schema": {"type": "object", "properties": {"book": {"type": "string"}, "page": {"type": "string"},
+                      "book_type": {"type": "string", "description": "which book, when the county keeps several with the same numbers: "
+                                    "DEED, DEBT (deed of trust), WILL, RELEASE, LIEN (judgment) or MISC (affidavits, agreements, assignments)"},
                       "pages": {"type": "integer", "description": "how many pages to read, 1-4 (default 2)"}}, "required": ["book", "page"]}},
 ]
 
@@ -6267,6 +6269,65 @@ def _fzc_transcribe_keep(county, kind, imgs, **key):
         return None
 
 
+# 🖼 Ari 10/5 ("we used to have no problem with images"): in the person counties (Wetzel, Kanawha, Monongalia) the
+# surplus work and the case chats only got the index line - the paper itself was never asked for. Now they ask the
+# office's Chrome helper (viewing is free there) like the title search does, wait for the pictures and read them.
+_FZ_PERSON_PIC_WAIT = 720
+
+
+def _fz_person_kind(book_type, index_rows):
+    """Which county book the helper opens: the book type the agent gave, else the index line's document type
+    (only when the book/page holds ONE paper - the same numbers can be in several books; then None = ask)."""
+    if book_type: return _fz_kind_word(book_type)
+    kinds = {_fz_kind_word(f"{r.get('doc') or ''} {r.get('desc') or ''}") for r in (index_rows or []) if isinstance(r, dict)}
+    return kinds.pop() if len(kinds) == 1 else (None if kinds else "DEED")
+
+
+def _fz_kind_word(text):
+    t = str(text or "").upper()
+    if "WILL" in t: return "WILL"
+    if "RELEASE" in t: return "RELEASE"
+    if "TRUST" in t or "DEBT" in t or "MORTGAGE" in t: return "DEBT"
+    if "LIEN" in t or "JUDG" in t: return "LIEN"
+    if "MISC" in t or "AFFIDAVIT" in t or "AGREEMENT" in t or "ASSIGNMENT" in t: return "MISC"
+    return "DEED"
+
+
+def _fzc_person_picture(county, book, page, kind, budget, index_rows):
+    b, pg = str(book or "").strip(), str(page or "").strip()
+    if not (b and pg): return "Give a book and a page."
+    if not kind:
+        return _re_json.dumps({"found": index_rows, "note": f"Book {b} page {pg} holds papers in more than one {county.title()} book - "
+                               "call read_document again with book_type (DEED, DEBT, WILL, RELEASE, LIEN or MISC)."}, ensure_ascii=False)
+    term = f"{kind}|{b}/{pg}"
+    banked = _bank_get(county, "document", image_id=term)
+    if banked and (banked.get("text") or banked.get("fields")): return _bank_as_text(banked)
+    if budget.get("reads", 0) >= 5: return "Document reading limit for this question reached (5)."
+    def have():
+        rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
+        return [((r.get("mime") or "image/jpeg").lower(), r["b64"]) for r in rows if r.get("b64")][:4]
+    imgs = have()
+    if not imgs:
+        try:
+            _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando", "p_kind": "image"})
+        except Exception as e:
+            return f"{county.title()} picture {b}/{pg} could not be asked for: {str(e)[:80]}"
+        import time as _t
+        t0 = _t.time()
+        while not imgs and _t.time() - t0 < _FZ_PERSON_PIC_WAIT:
+            _t.sleep(20)
+            imgs = have()
+        if not imgs:
+            return _re_json.dumps({"found": index_rows, "note": f"The picture of {kind.lower()} book {b} page {pg} is asked for on the office's "
+                                   f"{county.title()} window but did not come in within {_FZ_PERSON_PIC_WAIT // 60} minutes (the window may be signed "
+                                   "out or at a robot check). It is kept when it arrives - ask again later."}, ensure_ascii=False)
+    budget["reads"] = budget.get("reads", 0) + 1
+    _fzc_transcribe_keep(county, "document", imgs, image_id=term, bookpage=f"{b} @ {pg}")
+    return [{"type": "text", "text": f"{county.title()} {kind.lower()} book {b} page {pg} - {len(imgs)} page(s) (opened by the office's Chrome helper):"}] + \
+           [{"type": "image", "source": {"type": "base64", "media_type": m if m in ("image/jpeg", "image/png", "image/gif", "image/webp") else "image/jpeg",
+                                          "data": x}} for m, x in imgs]
+
+
 # 🔎 Ari 10/5: a last name alone (PAYNE in Roane = 1,481 rows, SMITH in Kanawha) takes the county site 20+ minutes -
 # a PERSON is searched live only with a first name / initial; a last name alone is answered from our bank. Companies
 # (several words or LLC / INC / BANK ...) are fine as they are.
@@ -6303,13 +6364,16 @@ def _fzc_tool(sites, name, args, budget):
                                    "notes": notes}, ensure_ascii=False)
         if name in ("lookup_book_page", "read_document"):
             got = _fz_rpc("fz_bank_bookpage", {"p_county": site.county, "p_book": str(args.get("book") or ""), "p_page": str(args.get("page") or "")}) or []
+            if site.county in PERSON_COUNTIES and name == "read_document":
+                return _fzc_person_picture(site.county, args.get("book"), args.get("page"), _fz_person_kind(args.get("book_type"), got), budget, got)
             if site.county in PERSON_COUNTIES:
-                return _re_json.dumps({"found": got, "note": f"{site.county.title()}'s index needs a person at the door, so the paper itself is not opened; "
-                                       "this is the index entry. Staff can open it on the county's site."}, ensure_ascii=False)
+                return _re_json.dumps({"found": got, "note": "This is the index entry - use read_document to see the paper itself."}, ensure_ascii=False)
             return _re_json.dumps({"found": got, "note": f"{site.county.title()}'s document images are paid - the paper itself is not opened; "
                                    "this is the index entry. Staff can open it in their RECORDhub account if needed."}, ensure_ascii=False)
+        if site.county in PERSON_COUNTIES and name == "old_book_page":
+            return _fzc_person_picture(site.county, args.get("book"), args.get("page"), _fz_person_kind(args.get("book_type"), None), budget, None)
         if site.county in PERSON_COUNTIES:
-            return f"{site.county.title()}'s old books and images are not available to me (a person must open that index) - staff can check them on the county's site."
+            return f"{site.county.title()}'s old handwritten index books are not available to me - staff can check them on the county's site."
         return f"{site.county.title()}'s old books and images are not available to me (paid / sign-in only) - staff can check them in RECORDhub."
     if name == "old_book_page":
         bt = (args.get("book_type") or "DEED BOOK").upper()
