@@ -8069,7 +8069,7 @@ _SURP_REPORT = {"name": "report_surplus_heirs", "description": "Your finished he
         "required": ["summary", "people"]}}
 
 
-_SURP_IDLE_SECONDS = 600
+_SURP_IDLE_SECONDS = 1800    # 30 min: Roane's site took ~20 min for one name search (Ari 10/5) - slow is fine, frozen is not
 
 
 def _surp_step(job, text, **kw):
@@ -8168,7 +8168,7 @@ def surplus_fz_one():
                 return f"SmartSkip failed this time: {str(e)[:150]}"
         # ⏱ Ari 10/5: Roane hung 80+ min on one county page and blocked every case behind it. A limit PER STEP, not per case
         # (a long case is fine while it keeps moving): the work runs in its own thread (Playwright stays in the thread that
-        # opened it); every thinking turn / page / search marks activity, and 10 min with no activity = stuck ->
+        # opened it); every thinking turn / page / search marks activity, and 30 min with no activity = stuck ->
         # surplus_fz_update 'stuck': first time the case restarts by itself, second time the owners get a phone notice and the
         # line moves on to the next case.
         import time as _tm
