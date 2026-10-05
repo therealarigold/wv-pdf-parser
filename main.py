@@ -5761,6 +5761,8 @@ headings or tables; plain text with simple "-" bullets if needed. Sign nothing."
 _FZC_TOOLS = [
     {"name": "search_person", "description": "Search the county's computer index for every recorded paper under a person or company name "
         "(deeds, deeds of trust, releases, judgments, liens, wills, estate papers, marriages, O&G leases). For a company put the whole name in last_name. "
+        "A PERSON always needs first_name (a first name or at least the initial, e.g. PAYNE + A) - a last name alone (PAYNE, SMITH) returns "
+        "thousands of rows and takes the county site 20+ minutes, so it is only searched in our bank. "
         "county: another WV county to search instead (e.g. where a survivor died) - leave empty for this certificate's county.",
      "input_schema": {"type": "object", "properties": {"last_name": {"type": "string"}, "first_name": {"type": "string"}, "county": {"type": "string"}}, "required": ["last_name"]}},
     {"name": "lookup_book_page", "description": "What is recorded at a book and page in the county's computer index (type, date, parties, description).",
@@ -6265,6 +6267,19 @@ def _fzc_transcribe_keep(county, kind, imgs, **key):
         return None
 
 
+# 🔎 Ari 10/5: a last name alone (PAYNE in Roane = 1,481 rows, SMITH in Kanawha) takes the county site 20+ minutes -
+# a PERSON is searched live only with a first name / initial; a last name alone is answered from our bank. Companies
+# (several words or LLC / INC / BANK ...) are fine as they are.
+_FZ_COMPANY_WORDS = _re_re.compile(r"\b(LLC|L\.L\.C|INC|CORP|CO|COMPANY|BANK|TRUST|ESTATE|ASSOC|ASSN|LP|LTD|PARTNERS|CHURCH|COUNTY|CITY|STATE|UNITED|OIL|GAS|ENERGY|MINERALS?|PRODUCTION|RESOURCES)\b")
+_FZ_LAST_ONLY_NOTE = ("Last name only: answered from OUR BANK, not the county site (a last name alone returns thousands of rows and takes the "
+                      "site 20+ minutes). For a live search give the first name or at least the initial.")
+
+
+def _fz_last_only(last, first):
+    last, first = (last or "").upper().strip(), (first or "").strip()
+    return not first and " " not in last and not _FZ_COMPANY_WORDS.search(last)
+
+
 def _fzc_tool(sites, name, args, budget):
     if name == "search_bank":
         c = _re_re.sub(r"\s*COUNTY\s*$", "", (args.get("county") or "").upper().strip())
@@ -6278,6 +6293,9 @@ def _fzc_tool(sites, name, args, budget):
             if budget.get("live", 0) >= 4:
                 rows = bank_owner_rows(site.county, last, first, live=False)
                 return _re_json.dumps({"found": len(rows), "rows": rows[:150], "note": "bank only (live-search limit of 4 per question reached)"})
+            if _fz_last_only(last, first):
+                rows = bank_owner_rows(site.county, last, first, live=False)
+                return _re_json.dumps({"found": len(rows), "rows": rows[:150], "note": _FZ_LAST_ONLY_NOTE}, ensure_ascii=False)
             budget["live"] = budget.get("live", 0) + 1
             notes = []
             rows = bank_owner_rows(site.county, last, first, live=True, note=notes)
@@ -6320,6 +6338,9 @@ def _fzc_tool(sites, name, args, budget):
     if name == "search_person":
         last, first = (args.get("last_name") or "").upper().strip(), (args.get("first_name") or "").upper().strip()
         if not last: return "Give a last name."
+        if _fz_last_only(last, first):
+            rows = _fz_rpc("fz_bank_owner", {"p_county": site.county, "p_last": last, "p_first": None}) or []
+            return _re_json.dumps({"found": len(rows), "rows": rows[:150], "note": _FZ_LAST_ONLY_NOTE}, ensure_ascii=False)
         rows = _idx2_search(site.page(), 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname" if first else "txtLname")
         out = [_fzc_row(r) for r in rows]
         names = sorted(set(r.get("name", "") for r in rows))
