@@ -5873,8 +5873,10 @@ def _sweep_wait(pg, before):
         if quiet >= (20 if seen_busy else 40): return
 
 
-def idx_sweep_county(county, d_from, d_thru, log=print):
-    """Everything recorded in the county from d_from to d_thru (dates) into the bank. Returns the rows kept."""
+def idx_sweep_county(county, d_from, d_thru, log=print, types_re=None, pace=None, key_prefix="sweep"):
+    """Everything recorded in the county from d_from to d_thru (dates) into the bank. Returns the rows kept.
+    types_re: only document types whose name matches (JS regex, case-insensitive); pace: seconds between pages."""
+    _pace = pace or _SWEEP_PACE
     import time as _t
     from datetime import timedelta as _td
     url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
@@ -5889,16 +5891,20 @@ def idx_sweep_county(county, d_from, d_thru, log=print):
                 raise RuntimeError("this site has no Date Range search")
             pg.locator(_IDX2_P + "cboKey_I").click(); pg.wait_for_timeout(600)
             pg.get_by_text("Date Range", exact=True).last.click(); pg.wait_for_timeout(2500)
-        types = pg.evaluate("""async () => { const rows = [...document.querySelectorAll('tr[id*="grdTypes"][id*="DXDataRow"]')];
-            for (let pass = 0; pass < 2; pass++) { for (let i = 0; i < rows.length; i++) if (!grdTypes.IsRowSelectedOnPage(i)) grdTypes.SelectRowOnPage(i);
-              await new Promise(r => setTimeout(r, 1200)); } return rows.length; }""")
+        types = pg.evaluate("""async (src) => { const rows = [...document.querySelectorAll('tr[id*="grdTypes"][id*="DXDataRow"]')];
+            const re = src ? new RegExp(src, 'i') : null; let n = 0;
+            for (let pass = 0; pass < 2; pass++) { for (let i = 0; i < rows.length; i++) { const want = !re || re.test(rows[i].innerText.trim());
+                if (want && !grdTypes.IsRowSelectedOnPage(i)) grdTypes.SelectRowOnPage(i);
+                if (!want && grdTypes.IsRowSelectedOnPage(i)) grdTypes.UnselectRowOnPage(i); }
+              await new Promise(r => setTimeout(r, 1200)); }
+            for (let i = 0; i < rows.length; i++) if (grdTypes.IsRowSelectedOnPage(i)) n++; return n; }""", types_re)
         if not types: raise RuntimeError("no document types to choose")
         # the site applies typed dates only from the second search on: one plain search first (its default window), not kept
         before0 = pg.evaluate("() => [...document.querySelectorAll('tr[id*=\"grd_DXDataRow\"]')].map(t => t.innerText).join('|').slice(0, 4000)")
         btn0 = pg.locator(_IDX2_SEARCH_BTN)
         (btn0.first if btn0.count() else pg.get_by_text("Index Search", exact=True).first).click()
         _sweep_wait(pg, before0)
-        _t.sleep(_SWEEP_PACE)
+        _t.sleep(_pace)
 
         def window(a, b, depth=0):
             pg.evaluate("""([a, b]) => { FromDate.SetDate(new Date(a)); try { FromDate.RaiseValueChangedEvent(); } catch (e) {}
@@ -5914,12 +5920,12 @@ def idx_sweep_county(county, d_from, d_thru, log=print):
             pages = pg.evaluate("() => grd.GetPageCount()") or 0
             if pages >= 100 and (b - a).days >= 1 and depth < 6:            # the site shows at most 100 pages: split the window
                 mid = a + _td(days=(b - a).days // 2)
-                window(a, mid, depth + 1); _t.sleep(_SWEEP_PACE); window(mid + _td(days=1), b, depth + 1)
+                window(a, mid, depth + 1); _t.sleep(_pace); window(mid + _td(days=1), b, depth + 1)
                 return
-            key = f"sweep:{a.isoformat()}..{b.isoformat()}"
+            key = f"{key_prefix}:{a.isoformat()}..{b.isoformat()}"
             for i in range(pages):
                 if i:
-                    _t.sleep(_SWEEP_PACE)
+                    _t.sleep(_pace)
                     pg.evaluate("(n) => grd.GotoPage(n)", i)
                     pg.wait_for_timeout(800)
                     pg.wait_for_function("() => !grd.InCallback()", timeout=60000)
@@ -6091,6 +6097,133 @@ def idx_history_loop():
             if "pushed back" in str(e):
                 return
             _t.sleep(300)
+
+
+# 🔍 ONE-TIME SURPLUS LOOK-BACK (Ari 2026-10-06): is anyone besides Hennepin buying surplus rights? Per county, at a
+# person's pace (22 s between searches and pages), daytime only: (1) Description "SURPLUS" (all document types),
+# (2) Hennepin by every spelling, (3) the last 12 months of assignment / agreement / contract / misc / affidavit / power
+# of attorney papers (the sites allow 12 months; mortgage and financing assignments left out). Everything goes into the
+# bank; the competitor collect + new-company alert run after each county. Steps done: fz_config 'surplus_once'.
+_SURPLUS_ONCE_NAMES = ("HENNEPIN", "HENNPIN", "HENNIPEN", "HENEPIN", "HENNEPEN")
+_SURPLUS_ONCE_TYPES = r"^(?!.*(TRUST|FINANC|SUBORDINAT|ASSUMPTION|APPOINTMENT|UCC|MORTGAGE)).*(ASSIGN|AGREE|CONTRACT|MISC|POWER OF ATT|AFFIDAVIT)"
+
+
+def _idx2_set_mode(pg, name):
+    return pg.evaluate("""async (name) => { for (let i = 0; i < cboKey.GetItemCount(); i++) if (cboKey.GetItem(i).text === name) {
+        cboKey.SetSelectedIndex(i); try { cboKey.RaiseSelectedIndexChanged(); } catch (e) {} try { cboKey.RaiseValueChangedEvent(); } catch (e) {} }
+        await new Promise(r => setTimeout(r, 1500)); return cboKey.GetText() === name; }""", name)
+
+
+def _idx2_desc_search(pg, county, term, pace=22):
+    """Description search for one word, every page at a person's pace, into the bank as desc:<TERM>. Rows kept, or None
+    when the site has no Description search or matched the word somewhere else (death records...)."""
+    import time as _t
+    if not _idx2_set_mode(pg, "Description"): return None
+    pg.evaluate("""(t) => { txtDescription.SetText(t); const i = [...document.querySelectorAll('input')].find(i => /txtDescription_I$/.test(i.id)); if (i) i.value = t; }""", term)
+    before = pg.evaluate("""() => [...document.querySelectorAll('tr[id*="grd_DXDataRow"]')].map(t => t.innerText).join('|').slice(0, 4000)""")
+    btn = pg.locator(_IDX2_SEARCH_BTN)
+    (btn.first if btn.count() else pg.get_by_text("Index Search", exact=True).first).click()
+    _sweep_wait(pg, before)
+    pages = pg.evaluate("() => grd.GetPageCount()") or 0
+    kept = 0
+    for i in range(min(pages, 100)):
+        if i:
+            _t.sleep(pace)
+            pg.evaluate("(n) => grd.GotoPage(n)", i)
+            pg.wait_for_timeout(800)
+            pg.wait_for_function("() => !grd.InCallback()", timeout=60000)
+        rows = _sweep_rows(pg)
+        if i == 0 and rows and not any(term in (r[9] or "").upper() for r in rows[:5]):
+            return None                                       # the word matched another field: not a description search here
+        if rows:
+            _fz_rpc("idx_ingest_srv", {"p_county": county, "p_search": "desc:" + term, "p_rows": rows, "p_page": i, "p_pages": pages})
+            kept += len(rows)
+    return kept
+
+
+def idx_surplus_once_loop():
+    import time as _t
+    from datetime import date as _date, timedelta as _td
+    try:
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
+    except Exception:
+        _et = None
+    _t.sleep(1200)
+    started = _re_dt.utcnow().isoformat() + "Z"
+
+    def daytime():
+        now = _re_dt.now(_et) if _et else _re_dt.utcnow()
+        return 6 <= now.hour < 21
+
+    def load():
+        return set(x for x in str(_fz_rpc("fz_config_get", {"p_key": "surplus_once"}) or "").split(",") if x)
+
+    def mark(done, county, step):
+        done.add(county + ":" + step)
+        _fz_rpc("fz_config_set_srv", {"p_key": "surplus_once", "p_value": ",".join(sorted(done))})
+
+    county = None
+    while True:
+        try:
+            done = load()
+            todo = [c for c in _sweep_counties() if c + ":all" not in done]
+            if not todo:
+                print("[surplus-once] finished", flush=True)
+                return
+            if not daytime() or _mem_used() > _FZ_MEM_MAX:
+                _t.sleep(900); continue
+            county = todo[0]
+            url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
+            if county + ":desc" not in done or county + ":names" not in done:
+                p, browser = get_playwright_browser()
+                try:
+                    pg = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True).new_page()
+                    _idx2_open(pg, county, url)
+                    if county + ":desc" not in done:
+                        n = _idx2_desc_search(pg, county, "SURPLUS")
+                        print(f"[surplus-once] {county} SURPLUS: {n if n is not None else 'no description search'}", flush=True)
+                        mark(done, county, "desc"); _t.sleep(22)
+                    if county + ":names" not in done:
+                        for nm in _SURPLUS_ONCE_NAMES:
+                            if not daytime(): raise RuntimeError("evening - continue tomorrow")
+                            if _SWEEP_BLOCK_RE.search(pg.evaluate("() => document.body.innerText.slice(0, 800)") or ""):
+                                raise RuntimeError("the site pushed back - stopped")
+                            rows = _idx2_search(pg, 0, {"txtLname": nm, "txtFname": "", "txtMname": ""}, "txtLname",
+                                                max_pages=100, page_wait_s=22, bank_key="name:" + nm)
+                            print(f"[surplus-once] {county} {nm}: {len(rows)} rows", flush=True)
+                            _t.sleep(22)
+                        mark(done, county, "names")
+                finally:
+                    try: browser.close()
+                    except Exception: pass
+                    try: p.stop()
+                    except Exception: pass
+            if county + ":assign" not in done:
+                if not daytime(): continue
+                today = _date.today()
+                n = idx_sweep_county(county, today - _td(days=364), today, types_re=_SURPLUS_ONCE_TYPES, pace=22, key_prefix="assign12")
+                print(f"[surplus-once] {county} 12 months of assignments: {n} rows", flush=True)
+                mark(done, county, "assign")
+            try:
+                _fz_rpc("surplus_competitor_collect", {"p_since": started})
+                _fz_rpc("surplus_competitor_new_companies", {})
+                _fz_rpc("surplus_competitor_match", {})
+            except Exception as e:
+                print(f"[surplus-once] collect: {str(e)[:150]}", flush=True)
+            mark(done, county, "all")
+            _t.sleep(30)
+        except Exception as e:
+            msg = str(e)
+            print(f"[surplus-once] {county}: {msg[:200]}", flush=True)
+            if county and any(w in msg for w in ("pushed back", "BLOCKED", "needs a login", "login was refused", "no Date Range")):
+                try:   # skip this county (keep what it gave), go on with the next
+                    done = load(); done.add(county + ":skipped")
+                    mark(done, county, "all")
+                except Exception:
+                    pass
+                _t.sleep(60); continue
+            _t.sleep(600 if "evening" in msg else 300)
 
 
 # counties Fernando may not search automatically (site terms / captcha / not working yet)
@@ -9071,6 +9204,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=idx_sweep_loop, daemon=True).start()          # 🔄 weekly "what's new" sweep of every county (nights)
         _og_threading.Thread(target=idx_competitor_once_loop, daemon=True).start()  # 🏁 one-time HENNEPIN search per county (days)
         _og_threading.Thread(target=idx_history_loop, daemon=True).start()        # 📚 a county's full history, normal pace (Berkeley 10/6)
+        _og_threading.Thread(target=idx_surplus_once_loop, daemon=True).start()   # 🔍 one-time surplus look-back per county (10/6)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
