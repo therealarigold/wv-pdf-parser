@@ -5975,8 +5975,68 @@ def idx_sweep_loop():
             _t.sleep(600)
 
 
+# 🏁 ONE-TIME competitor search (Ari 10/6): the bank only holds Hennepin's older assignments when we happened to search the
+# signer's surname, so every sweep county is asked once for the company's own name (and its misspelling) at normal pace,
+# daytime only (the sweep owns the nights). Counties done are kept in fz_config 'competitor_once'; afterwards the weekly
+# sweep keeps them current. Counties collected in Ari's Chrome tabs (Mercer, Preston, Kanawha, Harrison) did it there.
+_COMPETITOR_TERMS = ("HENNEPIN", "HENNPIN")
+_COMPETITOR_SKIP = {"MERCER", "PRESTON"}
+
+
+def idx_competitor_once_loop():
+    import time as _t
+    try:
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
+    except Exception:
+        _et = None
+    _t.sleep(600)
+    started = _re_dt.utcnow().isoformat() + "Z"
+    while True:
+        try:
+            done = set(x for x in str(_fz_rpc("fz_config_get", {"p_key": "competitor_once"}) or "").split(",") if x)
+            todo = [c for c in _sweep_counties() if c not in done and c not in _COMPETITOR_SKIP]
+            if not todo:
+                try:
+                    _fz_rpc("surplus_competitor_collect", {"p_since": started})
+                    _fz_rpc("surplus_competitor_match", {})
+                except Exception as e:
+                    print(f"[competitors] match: {str(e)[:150]}", flush=True)
+                print(f"[competitors] one-time search finished ({len(done)} counties)", flush=True)
+                return
+            now = _re_dt.now(_et) if _et else _re_dt.utcnow()
+            if now.hour >= 21 or now.hour < 6 or _mem_used() > _FZ_MEM_MAX:
+                _t.sleep(900); continue
+            county = todo[0]
+            url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
+            p, browser = get_playwright_browser()
+            try:
+                pg = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True).new_page()
+                _idx2_open(pg, county, url)
+                n = 0
+                for term in _COMPETITOR_TERMS:
+                    if _SWEEP_BLOCK_RE.search(pg.evaluate("() => document.body.innerText.slice(0, 800)") or ""):
+                        raise RuntimeError("the site pushed back - stopped")
+                    n += len(_idx2_search(pg, 0, {"txtLname": term, "txtFname": "", "txtMname": ""}, "txtLname"))   # banks its rows
+                    _t.sleep(22)
+                print(f"[competitors] {county}: {n} rows", flush=True)
+            finally:
+                try: browser.close()
+                except Exception: pass
+                try: p.stop()
+                except Exception: pass
+            done.add(county)
+            _fz_rpc("fz_config_set_srv", {"p_key": "competitor_once", "p_value": ",".join(sorted(done))})
+            _t.sleep(30)
+        except Exception as e:
+            print(f"[competitors] {str(e)[:200]}", flush=True)
+            if "pushed back" in str(e):
+                return
+            _t.sleep(300)
+
+
 # counties Fernando may not search automatically (site terms / captcha / not working yet)
-_FZ_NO_AUTO = {"PUTNAM", "TUCKER", "HARDY", "HARRISON"}   # HARRISON: 403 for everyone since 9/30 - wait for the clerk's rules (Ari)
+_FZ_NO_AUTO ={"PUTNAM", "TUCKER", "HARDY", "HARRISON"}   # HARRISON: 403 for everyone since 9/30 - wait for the clerk's rules (Ari)
 _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
 
 
@@ -8951,6 +9011,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=client_fz_loop, daemon=True).start()          # 💬 clients ask Fernando about their own file
         _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
         _og_threading.Thread(target=idx_sweep_loop, daemon=True).start()          # 🔄 weekly "what's new" sweep of every county (nights)
+        _og_threading.Thread(target=idx_competitor_once_loop, daemon=True).start()  # 🏁 one-time HENNEPIN search per county (days)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
