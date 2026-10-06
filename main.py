@@ -4780,8 +4780,9 @@ _IDX2_NEWER = {"MERCER": {0: "Name", 1: "Name", 2: "Book & Page"}}
 _IDX2_SEARCH_BTN = "#CallFormPanel_contentSplitter_CallToolPanel_rc_T0G2I2"
 
 
-def _idx2_search(pg, mode, fields, enter_in):
-    """mode: 0 Individual, 2 Book & Page. fields: {'txtLname': 'MOAG', ...}. Typed like a person would."""
+def _idx2_search(pg, mode, fields, enter_in, max_pages=10, page_wait_s=0, bank_key=None):
+    """mode: 0 Individual, 2 Book & Page. fields: {'txtLname': 'MOAG', ...}. Typed like a person would.
+    max_pages / page_wait_s / bank_key: the history loop reads every page at a person's pace and keeps it as name:<X>."""
     newer = _IDX2_NEWER.get(getattr(pg, "_fz_county", ""))
     if newer:
         if mode in (0, 1) and ("txtLname" in fields or "txtFname" in fields):
@@ -4817,12 +4818,13 @@ def _idx2_search(pg, mode, fields, enter_in):
     pages = pg.evaluate("() => grd.GetPageCount()") or 0
     for i in range(max(1, pages)):
         if i:
+            if page_wait_s: pg.wait_for_timeout(int(page_wait_s * 1000))
             pg.evaluate("(n) => grd.GotoPage(n)", i)
             pg.wait_for_timeout(800)
             pg.wait_for_function("() => !grd.InCallback()", timeout=45000)
         rows.extend(_idx2_rows(pg))
-        if i >= 9: break                                     # 10 pages x 100 is plenty for one name
-    _idx2_bank_rows(pg, fields, rows)
+        if i >= max_pages - 1: break                         # 10 pages x 100 is plenty for one name (live questions)
+    _idx2_bank_rows(pg, fields, rows, bank_key)
     return rows
 
 
@@ -4832,13 +4834,13 @@ def _idx2_row_array(r):
             r.get("role") or "", r.get("name") or "", r.get("role2") or "", r.get("other") or "", r.get("desc") or ""]
 
 
-def _idx2_bank_rows(pg, fields, rows):
+def _idx2_bank_rows(pg, fields, rows, key=None):
     """🗂 Every search Fernando does on a county site goes into our bank too (Ari 2026-10-02) - the bank stays fresher
     between the weekly sweeps, and the next question about that name is answered from our copy."""
     county = getattr(pg, "_fz_county", "")
     arr = [_idx2_row_array(r) for r in (rows or []) if r.get("instrument")]
     if not county or not arr: return
-    key = ("live:" + " ".join(str(v) for v in (fields or {}).values() if v)).upper()[:90]
+    key = key or ("live:" + " ".join(str(v) for v in (fields or {}).values() if v)).upper()[:90]
     try:
         for i in range(0, len(arr), 1500):
             _fz_rpc("idx_ingest_srv", {"p_county": county, "p_search": key, "p_rows": arr[i:i + 1500], "p_page": 0, "p_pages": 1})
@@ -6030,6 +6032,62 @@ def idx_competitor_once_loop():
             _t.sleep(30)
         except Exception as e:
             print(f"[competitors] {str(e)[:200]}", flush=True)
+            if "pushed back" in str(e):
+                return
+            _t.sleep(300)
+
+
+def idx_history_loop():
+    """📚 A county's full history into the bank from the server (Ari 2026-10-06: Berkeley - "collect mega data").
+    Every certificate-owner surname, every page, at a person's pace (22 s between searches and pages), daytime only,
+    one county at a time from fz_config 'history_counties' (comma list). Keeps its place in 'history_at_<COUNTY>' so a
+    restart picks up where it stopped. Stops for good if the site pushes back."""
+    import time as _t
+    try:
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
+    except Exception:
+        _et = None
+    _t.sleep(900)
+    while True:
+        try:
+            todo = [c for c in str(_fz_rpc("fz_config_get", {"p_key": "history_counties"}) or "").upper().split(",") if c.strip()]
+            if not todo:
+                _t.sleep(3600); continue
+            county = todo[0].strip()
+            names = _fz_rpc("idx_surnames_srv", {"p_county": county}) or []
+            last = str(_fz_rpc("fz_config_get", {"p_key": "history_at_" + county}) or "")
+            left = [n for n in names if n > last]
+            if not left:
+                todo.remove(todo[0])
+                _fz_rpc("fz_config_set_srv", {"p_key": "history_counties", "p_value": ",".join(todo)})
+                print(f"[history] {county} finished ({len(names)} names)", flush=True)
+                continue
+            now = _re_dt.now(_et) if _et else _re_dt.utcnow()
+            if now.hour >= 21 or now.hour < 6 or _mem_used() > _FZ_MEM_MAX:
+                _t.sleep(900); continue
+            url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
+            p, browser = get_playwright_browser()
+            try:
+                pg = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True).new_page()
+                _idx2_open(pg, county, url)
+                for nm in left[:30]:                         # a fresh browser every 30 names
+                    now = _re_dt.now(_et) if _et else _re_dt.utcnow()
+                    if now.hour >= 21 or now.hour < 6: break
+                    if _SWEEP_BLOCK_RE.search(pg.evaluate("() => document.body.innerText.slice(0, 800)") or "") or "login.aspx" in pg.url.lower():
+                        raise RuntimeError("the site pushed back - stopped")
+                    rows = _idx2_search(pg, 0, {"txtLname": nm, "txtFname": "", "txtMname": ""}, "txtLname",
+                                        max_pages=100, page_wait_s=22, bank_key="name:" + nm)
+                    _fz_rpc("fz_config_set_srv", {"p_key": "history_at_" + county, "p_value": nm})
+                    print(f"[history] {county} {nm}: {len(rows)} rows", flush=True)
+                    _t.sleep(22)
+            finally:
+                try: browser.close()
+                except Exception: pass
+                try: p.stop()
+                except Exception: pass
+        except Exception as e:
+            print(f"[history] {str(e)[:200]}", flush=True)
             if "pushed back" in str(e):
                 return
             _t.sleep(300)
@@ -9012,6 +9070,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
         _og_threading.Thread(target=idx_sweep_loop, daemon=True).start()          # 🔄 weekly "what's new" sweep of every county (nights)
         _og_threading.Thread(target=idx_competitor_once_loop, daemon=True).start()  # 🏁 one-time HENNEPIN search per county (days)
+        _og_threading.Thread(target=idx_history_loop, daemon=True).start()        # 📚 a county's full history, normal pace (Berkeley 10/6)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
