@@ -366,6 +366,29 @@ def send_gs_call(p):
         return "queued", f"unreachable: {ex.reason}"
 
 
+# 📧 NTR packets to the client (Ari 2026-10-06): one email per client for the certificates staff chose; each
+# certificate's NTR + letter + title-search notes joined into one PDF; the text was made by the database
+# (_ntr_packet_text, also shown as the preview before Send). Office bcc as for the agreements.
+def send_ntr_packet(oid, p):
+    import io
+    from pypdf import PdfReader, PdfWriter
+    to = (p.get("to") or "").strip()
+    if not to:
+        return "failed", "no email address"
+    files = _rpc("ntr_packet_files", {"p_outbox": oid}) or []
+    if not files:
+        return "failed", "no packets found for this email"
+    atts = []
+    for f in files:
+        w = PdfWriter()
+        for part in (f.get("ntr"), f.get("letter")):
+            for page in PdfReader(io.BytesIO(base64.b64decode(part))).pages:
+                w.add_page(page)
+        buf = io.BytesIO(); w.write(buf)
+        atts.append({"filename": f["name"], "content": base64.b64encode(buf.getvalue()).decode()})
+    return _resend(to, p.get("subject") or "Your tax lien packet", p.get("html") or "", p.get("text") or "", atts, bcc=True)
+
+
 def mailer_loop():
     have = lambda k: "yes" if _env(k) else "NO"
     print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ") — keys: resend " + have("RESEND_API_KEY")
@@ -390,6 +413,16 @@ def mailer_loop():
                         _GS_PAUSE[0] = time.time() + 300   # Gold Standard not answering: let the emails go on, retry in 5 min
                     else:
                         time.sleep(2); continue
+            if not job and _env("RESEND_API_KEY"):
+                n = _rpc("mail_outbox_next", {"p_kinds": ["ntr_packet"]})
+                if n:
+                    try:
+                        status, detail = send_ntr_packet(n["id"], n["payload"] or {})
+                    except Exception as ex:
+                        status, detail = "failed", str(ex)[:300]
+                    _rpc("ntr_packet_done", {"p_outbox": n["id"], "p_status": status, "p_detail": detail})
+                    print(f"[mailer] ntr_packet #{n['id']}: {status} {detail[:120]}", flush=True)
+                    time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
                 m = _rpc("mail_outbox_next", {"p_kinds": ["call_booked_staff", "call_booked_client", "call_callback_staff"]})
                 if m:
