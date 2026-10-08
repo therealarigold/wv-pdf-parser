@@ -6164,6 +6164,7 @@ def idx_surplus_once_loop():
         _fz_rpc("fz_config_set_srv", {"p_key": "surplus_once", "p_value": ",".join(sorted(done))})
 
     county = None
+    fails = {}                      # county -> failed tries in a row (Ari 10/8: skip a county by itself after 3)
     while True:
         try:
             done = load()
@@ -6212,11 +6213,15 @@ def idx_surplus_once_loop():
             except Exception as e:
                 print(f"[surplus-once] collect: {str(e)[:150]}", flush=True)
             mark(done, county, "all")
+            fails.pop(county, None)
             _t.sleep(30)
         except Exception as e:
             msg = str(e)
             print(f"[surplus-once] {county}: {msg[:200]}", flush=True)
-            if county and any(w in msg for w in ("pushed back", "BLOCKED", "needs a login", "login was refused", "no Date Range")):
+            if county and "evening" not in msg:
+                fails[county] = fails.get(county, 0) + 1
+            if county and (fails.get(county, 0) >= 3 or any(w in msg for w in ("pushed back", "BLOCKED", "needs a login", "login was refused", "no Date Range"))):
+                print(f"[surplus-once] {county}: skipped after {fails.get(county, 0)} failed tries - {msg[:120]}", flush=True)
                 try:   # skip this county (keep what it gave), go on with the next
                     done = load(); done.add(county + ":skipped")
                     mark(done, county, "all")
