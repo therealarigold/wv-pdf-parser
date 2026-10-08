@@ -6247,16 +6247,20 @@ def _landapp_open(browser, who):
         return None
     ctx = browser.new_context(viewport={"width": 1280, "height": 900})
     pg = ctx.new_page()
-    pg.goto("https://land.wvsao.gov/portal/BUYER/Default", wait_until="networkidle", timeout=60000)
+    resp = pg.goto("https://land.wvsao.gov/portal/BUYER/Default", wait_until="domcontentloaded", timeout=90000)
+    print(f"[landapp] {who}: land app answered {resp.status if resp else '?'} - {pg.title()[:60]}", flush=True)
+    pg.wait_for_timeout(3000)
     if pg.locator("input[name$='landLogin$UserName']").count():
         pg.locator("input[name$='landLogin$UserName']").fill(user)
         pg.locator("input[name$='landLogin$Password']").fill(pw)
         pg.locator("input[name$='landLogin$LoginButton']").click()
-        pg.wait_for_load_state("networkidle", timeout=60000)
+        pg.wait_for_load_state("domcontentloaded", timeout=90000)
+        pg.wait_for_timeout(4000)
         if pg.locator("input[name$='landLogin$Password']").count():
             raise RuntimeError(f"land app sign-in refused for {who} - check LANDAPP_{who}_USER / _PASS")
         if "/portal/BUYER" not in pg.url:
-            pg.goto("https://land.wvsao.gov/portal/BUYER/Default", wait_until="networkidle", timeout=60000)
+            pg.goto("https://land.wvsao.gov/portal/BUYER/Default", wait_until="domcontentloaded", timeout=90000)
+            pg.wait_for_timeout(3000)
     key = _fz_rpc("landapp_server_helper_key", {}) or ""
     pg.evaluate("""(k) => { window.__FZH_KEY = k; window.__NTRH = null;
         const s = document.createElement('script'); s.src = 'https://portal.annelabes.com/ntr-helper.js?v=' + Date.now(); document.body.appendChild(s); }""", key)
