@@ -7920,7 +7920,9 @@ def _client_mail_body(job):
             f"<p><a href='{link}' style='display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;"
             f"text-decoration:none;font-weight:bold'>Choose your password</a></p>"
             f"<p style='font-size:13px;color:#6b7280'>{valid}<br>Then sign in at <a href='https://portal.annelabes.com'>portal.annelabes.com</a>.</p>"
-            f"<p>Thank you,<br>Marci<br>Anne Labes, Esq.</p></div>")
+            + (f"<p style='font-size:13px;color:#6b7280'>Didn't ask for this? <a href='https://portal.annelabes.com/set-password.html?report={job['report_token']}'>"
+               f"Report it here</a> - we will cancel the link and contact you. Your password stays the same.</p>" if job.get("report_token") else "")
+            + f"<p>Thank you,<br>Marci<br>Anne Labes, Esq.</p></div>")
     return subj, body
 
 
