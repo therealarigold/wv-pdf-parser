@@ -6288,7 +6288,9 @@ def _landapp_browser():
     browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
                                                      "--disable-extensions", "--disable-background-timer-throttling",
                                                      "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"],
-                                proxy={"server": f"{u.scheme}://{u.hostname}:{u.port}", "username": u.username or "", "password": u.password or ""})
+                                proxy={"server": f"{u.scheme}://{u.hostname}:{u.port}", "username": u.username or "", "password": u.password or "",
+                                       # only the State Auditor goes through the droplet; the helper file + Fernando's list go direct
+                                       "bypass": "portal.annelabes.com,*.supabase.co,cdnjs.cloudflare.com,cdn.jsdelivr.net"})
     return p, browser
 
 
