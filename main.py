@@ -6231,6 +6231,90 @@ def idx_surplus_once_loop():
             _t.sleep(600 if "evening" in msg else 300)
 
 
+# 🤵 FERNANDO'S LAND APP WORK ON THE SERVER (Ari 2026-10-08 - no more waiting for Ari's Chrome). The server signs in to
+# land.wvsao.gov (plain email + password page, no robot check) with the accounts Ari put in the Render settings himself
+# (LANDAPP_ANNE_USER / _PASS, LANDAPP_ABBA_USER / _PASS - never in code) and runs the SAME ntr-helper.js the Chrome
+# bookmark runs, in its own browser window per account: same steps, same checks, never "Finalize and Submit NTR",
+# self-updating. A watchdog signs in again if the land app signs out. On/off: fz_config 'landapp_server' (on/off).
+_LANDAPP_ACCOUNTS = (("ANNE", "Anne's account"), ("ABBA", "Abba Energy"))
+
+
+def _landapp_open(browser, who):
+    """A signed-in land app page with the NTR helper running, or None when this account has no login on the server."""
+    user = os.environ.get(f"LANDAPP_{who}_USER", "").strip()
+    pw = os.environ.get(f"LANDAPP_{who}_PASS", "").strip()
+    if not (user and pw):
+        return None
+    ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    pg = ctx.new_page()
+    pg.goto("https://land.wvsao.gov/portal/BUYER/Default", wait_until="networkidle", timeout=60000)
+    if pg.locator("input[name$='landLogin$UserName']").count():
+        pg.locator("input[name$='landLogin$UserName']").fill(user)
+        pg.locator("input[name$='landLogin$Password']").fill(pw)
+        pg.locator("input[name$='landLogin$LoginButton']").click()
+        pg.wait_for_load_state("networkidle", timeout=60000)
+        if pg.locator("input[name$='landLogin$Password']").count():
+            raise RuntimeError(f"land app sign-in refused for {who} - check LANDAPP_{who}_USER / _PASS")
+        if "/portal/BUYER" not in pg.url:
+            pg.goto("https://land.wvsao.gov/portal/BUYER/Default", wait_until="networkidle", timeout=60000)
+    key = _fz_rpc("landapp_server_helper_key", {}) or ""
+    pg.evaluate("""(k) => { window.__FZH_KEY = k; window.__NTRH = null;
+        const s = document.createElement('script'); s.src = 'https://portal.annelabes.com/ntr-helper.js?v=' + Date.now(); document.body.appendChild(s); }""", key)
+    pg.wait_for_timeout(8000)
+    return pg
+
+
+def _landapp_ok(pg):
+    try:
+        return bool(pg.evaluate("() => !!(window.__NTRH && window.__NTRH.running) && !document.querySelector('input[type=password]')"))
+    except Exception:
+        return False
+
+
+def landapp_server_loop():
+    import time as _t
+    _t.sleep(600)
+    p = browser = None
+    pages = {}
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "landapp_server"}) or "off") != "on" or _mem_used() > _FZ_MEM_MAX:
+                if browser:
+                    try: browser.close()
+                    except Exception: pass
+                    try: p.stop()
+                    except Exception: pass
+                    p = browser = None; pages = {}
+                _t.sleep(300); continue
+            if not browser:
+                p, browser = get_playwright_browser()
+            for who, label in _LANDAPP_ACCOUNTS:
+                pg = pages.get(who)
+                if pg is not None and _landapp_ok(pg):
+                    continue
+                if pg is not None:
+                    try: pg.context.close()
+                    except Exception: pass
+                    print(f"[landapp] {label}: helper stopped or signed out - signing in again", flush=True)
+                pg = _landapp_open(browser, who)
+                if pg is None:
+                    pages.pop(who, None); continue
+                pages[who] = pg
+                print(f"[landapp] {label}: signed in, Fernando's NTR helper {'running' if _landapp_ok(pg) else 'NOT running'}", flush=True)
+            _t.sleep(180)
+        except Exception as e:
+            print(f"[landapp] {str(e)[:200]}", flush=True)
+            if "sign-in refused" in str(e):
+                _t.sleep(3600)
+            try:
+                if browser: browser.close()
+                if p: p.stop()
+            except Exception:
+                pass
+            p = browser = None; pages = {}
+            _t.sleep(300)
+
+
 # counties Fernando may not search automatically (site terms / captcha / not working yet)
 _FZ_NO_AUTO ={"PUTNAM", "TUCKER", "HARDY", "HARRISON"}   # HARRISON: 403 for everyone since 9/30 - wait for the clerk's rules (Ari)
 _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses": 6}
@@ -9210,6 +9294,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=idx_competitor_once_loop, daemon=True).start()  # 🏁 one-time HENNEPIN search per county (days)
         _og_threading.Thread(target=idx_history_loop, daemon=True).start()        # 📚 a county's full history, normal pace (Berkeley 10/6)
         _og_threading.Thread(target=idx_surplus_once_loop, daemon=True).start()   # 🔍 one-time surplus look-back per county (10/6)
+        _og_threading.Thread(target=landapp_server_loop, daemon=True).start()     # 🤵 land app NTRs on the server (10/8, fz_config landapp_server)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
