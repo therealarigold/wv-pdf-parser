@@ -6275,6 +6275,23 @@ def _landapp_ok(pg):
         return False
 
 
+def _landapp_browser():
+    """Our server's own address is blocked by the State Auditor's firewall: the land app goes through Ari's droplet
+    (WVSAO_PROXY - its filter allows only www.wvsao.gov and land.wvsao.gov; Ari OK'd the land app on 10/8)."""
+    from playwright.sync_api import sync_playwright
+    from urllib.parse import urlparse
+    px = os.environ.get("WVSAO_PROXY", "").strip()
+    if not px:
+        raise RuntimeError("no WVSAO_PROXY on the server - the land app can't be reached from here")
+    u = urlparse(px)
+    p = sync_playwright().start()
+    browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                                                     "--disable-extensions", "--disable-background-timer-throttling",
+                                                     "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"],
+                                proxy={"server": f"{u.scheme}://{u.hostname}:{u.port}", "username": u.username or "", "password": u.password or ""})
+    return p, browser
+
+
 def landapp_server_loop():
     import time as _t
     _t.sleep(600)
@@ -6291,7 +6308,7 @@ def landapp_server_loop():
                     p = browser = None; pages = {}
                 _t.sleep(300); continue
             if not browser:
-                p, browser = get_playwright_browser()
+                p, browser = _landapp_browser()
             for who, label in _LANDAPP_ACCOUNTS:
                 pg = pages.get(who)
                 if pg is not None and _landapp_ok(pg):
