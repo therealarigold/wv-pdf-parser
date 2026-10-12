@@ -6395,6 +6395,80 @@ def agent_ticket_loop():
         _t.sleep(5 if worked else 30)
 
 
+# 📮 Address suggestions for the "Fernando needs a decision" box (Ari 10/12: "he can suggest address for us"). For each
+# person an NTR stopped on for want of an address: an organization -> Fernando searches the web (company = its
+# registered agent, written "C/O AGENT, street, CITY, ST ZIP" - Ari's rule; government = its official mailing address);
+# the owner -> the tax record's mailing address (Ari's rule). Private people are not searched on the web - staff use
+# SmartSkip. A suggestion is only shown: nothing is used until a person presses "Use this".
+_FZ_ORG_RE = _re_re.compile(r"\b(LLC|L\.L\.C|INC|CORP|CORPORATION|COMPANY|LP|L\.P|LTD|LIMITED|BANK|TRUST|DEPT|DEPARTMENT|STATE|COUNTY|CITY|TOWN|"
+                            r"BOARD|COMMISSION|BUREAU|AUTHORITY|AGENCY|DIVISION|ASSOCIATION|UNIVERSITY|HOSPITAL|CHURCH|SERVICES?|"
+                            r"FINANCIAL|CREDIT|FEDERAL|UNITED STATES|INTERNAL REVENUE|COMMODITIES|ENERGY|COAL|GAS|OIL|HOLDINGS|PARTNERS)\b", _re_re.I)
+_FZ_ADDR_TOOL = {"name": "suggest_address", "description": "Give the one mailing address to serve, or none.",
+                 "input_schema": {"type": "object", "properties": {
+                     "address": {"type": "string", "description": "one line: [C/O AGENT, ]street, CITY, ST 12345 - empty when not reasonably sure"},
+                     "source": {"type": "string", "description": "the web page it came from (URL)"},
+                     "why": {"type": "string", "description": "one short sentence for the office: what this address is"}},
+                     "required": ["address", "source", "why"]}}
+_FZ_ADDR_SYSTEM = (
+    "You find the mailing address to serve a West Virginia tax lien Notice to Redeem on an organization. The office's rules: "
+    "a company (LLC, Inc, LP, Ltd...) is served at its registered agent (the 'Notice of Process' agent on the West Virginia "
+    "Secretary of State record; if it is not registered in WV, its home state's registered agent) - write it as "
+    "'C/O <AGENT NAME>, <street>, <CITY>, <ST> <ZIP>'. A government office or agency is served at its official mailing address "
+    "from its own website (if the agency was renamed, use the current one and say so). Use web search. Do not open the WV "
+    "Secretary of State business search site itself (it blocks scripts) - search results that quote it are fine. One US "
+    "address on one line with a 5-digit ZIP. If you are not reasonably sure, leave address empty and say why. Always give the source page.")
+
+
+def _fz_suggest_one(d, m):
+    name, addr = (m.get("name") or "").strip(), (m.get("address") or "").strip()
+    if _re_re.match(r"(?i)^occupant", name):
+        return {"why": "No property address on the title search - please type the property's 911 address."}
+    if not _FZ_ORG_RE.search(name):
+        owner = " ".join([d.get("assessed_owner") or "", d.get("owner") or ""]).upper()
+        words = [w for w in _re_re.findall(r"[A-Z]{3,}", name.upper()) if w not in ("ESTATE", "HEIRS", "UNKNOWN")]
+        aa = (d.get("assessed_address") or "").strip()
+        if words and words[-1] in owner and _re_re.search(r"\d{5}", aa):
+            return {"address": aa, "source": "County tax record (the assessed owner's mailing address)",
+                    "why": "The owner - the tax record's mailing address (Ari's rule for an owner with no address)."}
+        return {"why": "A private person - Fernando doesn't look people up on the web. Please find it (SmartSkip) and type it here."}
+    if _ai_paused(): return None
+    _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "fernando_ntr_address", d.get("county"), d.get("cert")
+    try:
+        out = _fz_agent(_FZ_ADDR_SYSTEM, [{"role": "user", "content":
+                        "Organization to serve: " + name + "\nAddress on our title search: " + (addr or "none") +
+                        "\nThe property is in " + str(d.get("county") or "") + ", West Virginia (tax lien certificate " + str(d.get("cert") or "") + ")."}],
+                        [_FZ_WEB_SEARCH], None, "fernando_ntr_address", final_tool=_FZ_ADDR_TOOL, max_steps=6, max_searches=4,
+                        model="claude-opus-5", tag="addr " + name[:40])
+    finally:
+        _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
+    out = out if isinstance(out, dict) else {}
+    a = (out.get("address") or "").strip()
+    if a and not _re_re.search(r"\b[A-Z]{2},?\s+\d{5}", a.upper()): a = ""
+    if a:
+        return {"address": a, "source": (out.get("source") or "").strip()[:300], "why": (out.get("why") or "").strip()[:300]}
+    why = (out.get("why") or "").strip()[:200]
+    return {"why": "Fernando couldn't find a sure address on the web" + ((": " + why) if why else "") + " - please type it."}
+
+
+def fz_address_suggest_loop():
+    import time as _t
+    _t.sleep(120)
+    while True:
+        try:
+            done = 0
+            for d in (_fz_rpc("fz_decision_missing", {}) or []):
+                for m in (d.get("missing") or []):
+                    if "suggested" in m or "given" in m or done >= 5: continue
+                    s = _fz_suggest_one(d, m)
+                    if s is None: continue
+                    _fz_rpc("fz_decision_suggest", {"p_id": d["id"], "p_name": m.get("name") or "", "p_suggest": s})
+                    print("[addr] " + str(d.get("cert")) + " " + str(m.get("name"))[:40] + " -> " + (s.get("address") or "no address"), flush=True)
+                    done += 1
+        except Exception as e:
+            print("[addr] " + str(e)[:300], flush=True)
+        _t.sleep(120)
+
+
 def landapp_server_loop():
     import time as _t
     _t.sleep(600)
@@ -9431,6 +9505,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=idx_surplus_once_loop, daemon=True).start()   # 🔍 one-time surplus look-back per county (10/6)
         _og_threading.Thread(target=landapp_server_loop, daemon=True).start()     # 🤵 land app NTRs on the server (10/8, fz_config landapp_server)
         _og_threading.Thread(target=agent_ticket_loop, daemon=True).start()       # 🎫 staff requests via Diego, 24/7 (10/8, fz_config agent_server; suggest only)
+        _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
             _og_threading.Thread(target=mailer_loop, daemon=True).start()
