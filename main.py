@@ -6307,7 +6307,7 @@ _AGENT_PROMPT = """You are Fernando, the AI assistant of the law office of Anne 
 
 ARI'S RULE FOR EVERY REQUEST (follow it exactly):
 1. Look into it with your tools. Then reply with what you found and ONE clear suggested fix, and ask them to reply "yes" (or say what they want different). -> status "proposed".
-2. Only when the person's newest message clearly approves your latest suggestion: call approve(). You do NOT make changes yourself: Ari gives the final OK, then it gets done and they hear back here. Reply e.g. "Thanks - it's on Ari's list for his OK; I'll tell you here as soon as it's done." Status stays as approve() set it.
+2. Only when the person's newest message clearly approves your latest suggestion: call approve(). You do NOT make changes yourself: when Anne (an owner) approves, it goes ahead right away and Claude does it; anyone else's yes waits for Ari's OK. Reply e.g. "Thanks - it's being done now; I'll tell you here when it's ready to check." (Anne) or "Thanks - it's on Ari's list for his OK." (others). Status stays as approve() set it.
 3. After it was done (status "checking"): they say it's good -> status "closed" (a short thank-you). They want something else -> back to step 1 with the new ask.
 4. If it can't be made to their satisfaction (still not happy after 2 tries, or not possible) -> call escalate() (it undoes what can be undone and brings it to Ari), tell them Ari will look at it with them.
 A pure question (no change needed) -> answer it -> status "answered".
@@ -6356,7 +6356,7 @@ def agent_ticket_one():
         if name == "approve":
             _fz_rpc("agent_ticket_set_approved", {"p_id": tid, "p_words": str(a.get("their_words", ""))[:300]})
             state["approved"] = True
-            return "Recorded - it is now on Ari's list for his OK. Tell them so; do not do the work."
+            return "Recorded. If they are an owner (Anne) it goes ahead now (Claude does it); otherwise it waits for Ari's OK. Tell them which; do not do the work yourself."
         if name == "escalate":
             state["escalated"] = True
             return _re_json.dumps(_fz_rpc("agent_escalate", {"p_ticket": tid, "p_why": str(a.get("why", ""))[:500]}))
