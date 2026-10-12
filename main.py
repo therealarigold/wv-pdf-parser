@@ -7017,7 +7017,16 @@ def _fz_agent(system, msgs, tools, sites, feature, final_tool=None, max_steps=14
         if not uses:
             if final_tool:                                      # he answered in words: ask for the form
                 msgs.append({"role": "user", "content": f"Now fill in {final_tool['name']}."}); continue
-            return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip() or "Sorry — I lost my train of thought. Please ask again."
+            said = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+            if not said and not budget.get("nudged") and step < max_steps - 1:
+                # he ended with no words (Heather's Hancock chat, 10/12): ask once to answer with what he has found
+                budget["nudged"] = True
+                if not blocks: msgs.pop()
+                ask = {"type": "text", "text": "Please answer now in words, with what you have found so far."}
+                if msgs and msgs[-1].get("role") == "user" and isinstance(msgs[-1].get("content"), list): msgs[-1]["content"].append(ask)
+                else: msgs.append({"role": "user", "content": [ask]})
+                continue
+            return said or "Sorry — I lost my train of thought. Please ask again."
         results = []
         for u in uses:
             if progress: progress(_fz_step_words(u["name"], u.get("input") or {}, sites.home))
