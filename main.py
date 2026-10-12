@@ -6423,6 +6423,10 @@ def _fz_suggest_one(d, m):
     name, addr = (m.get("name") or "").strip(), (m.get("address") or "").strip()
     if _re_re.match(r"(?i)^occupant", name):
         return {"why": "No property address on the title search - please type the property's 911 address."}
+    kn = m.get("known") or {}
+    if kn.get("address"):       # the same name already has a full address on another of our title searches
+        return {"address": kn["address"].strip(), "source": "Our title search for " + str(kn.get("where") or "another certificate"),
+                "why": "The same name has this address on another of our title searches."}
     if not _FZ_ORG_RE.search(name):
         owner = " ".join([d.get("assessed_owner") or "", d.get("owner") or ""]).upper()
         words = [w for w in _re_re.findall(r"[A-Z]{3,}", name.upper()) if w not in ("ESTATE", "HEIRS", "UNKNOWN")]
