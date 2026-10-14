@@ -3125,93 +3125,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not pdf_bytes_pr:
                     return self.respond({'success':False,'error':'No PDF found in upload'})
 
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-                    tmp.write(pdf_bytes_pr)
-                    tmp_path = tmp.name
                 try:
-                    proc = subprocess.run(
-                        ['pdftotext', '-layout', tmp_path, '-'],
-                        capture_output=True, text=True, timeout=60
-                    )
-                    if proc.returncode != 0:
-                        return self.respond({'success':False,'error':'pdftotext failed: ' + proc.stderr[:300]})
-                    text_pr = proc.stdout
-                finally:
-                    try:
-                        import os as _osp; _osp.unlink(tmp_path)
-                    except: pass
-
-                # Parse the layout-preserved text
-                lines_pr = text_pr.split('\n')
-                records_pr = []
-                current_pr = None
-                for line_pr in lines_pr:
-                    if not line_pr.strip():
-                        if current_pr:
-                            records_pr.append(current_pr); current_pr = None
-                        continue
-                    if 'PRE-REGISTRATION' in line_pr: continue
-                    if re.match(r'^\s*\d+\s+of\s+\d+\s*$', line_pr): continue
-                    if re.match(r'^\s*NAME\s+AGENT\s+ADDRESS', line_pr): continue
-                    fc = re.search(r'\S', line_pr)
-                    if not fc: continue
-                    if fc.start() < 5:
-                        if current_pr: records_pr.append(current_pr); current_pr = None
-                        parts_pr = [p.strip() for p in re.split(r'\s{2,}', line_pr) if p.strip()]
-                        if len(parts_pr) < 3: continue
-                        current_pr = {
-                            'name': parts_pr[0],
-                            'agent': ' '.join(parts_pr[1:-1]),
-                            'addr_lines': [parts_pr[-1]],
-                        }
-                    elif current_pr:
-                        current_pr['addr_lines'].append(line_pr.strip())
-                if current_pr: records_pr.append(current_pr)
-
-                # Parse addresses into street/city/state/zip
-                parsed_pr = []
-                for r_pr in records_pr:
-                    all_lines_pr = [l for l in r_pr['addr_lines'] if l.strip()]
-                    city_line_pr = ''
-                    street_lines_pr = []
-                    for j_pr, l_pr in enumerate(all_lines_pr):
-                        if re.search(r',\s+[A-Z]{2}[,]?\s+\d{5}(?:-\d{4})?\s*$', l_pr) or re.search(r',\s+[A-Z][A-Z\s]+\s+\d{5}', l_pr):
-                            city_line_pr = l_pr
-                            street_lines_pr = all_lines_pr[:j_pr]
-                            break
-                    if not city_line_pr and all_lines_pr:
-                        city_line_pr = all_lines_pr[-1]
-                        street_lines_pr = all_lines_pr[:-1]
-                    street_pr = ', '.join(street_lines_pr).strip()
-                    city_pr, state_pr, zip_pr = '', '', ''
-                    m_pr = re.match(r'^(.+?),?\s+([A-Z]{2})[,]?\s+(\d{5}(?:-\d{4})?)\s*$', city_line_pr)
-                    if m_pr:
-                        city_pr = m_pr.group(1).rstrip(',').strip()
-                        state_pr = m_pr.group(2)
-                        zip_pr = m_pr.group(3)
-                    else:
-                        m_pr2 = re.match(r'^(.+?),?\s+(?:[A-Z]{2},?\s+)?([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$', city_line_pr)
-                        if m_pr2:
-                            city_pr = m_pr2.group(1).rstrip(',').strip()
-                            state_pr = m_pr2.group(2)
-                            zip_pr = m_pr2.group(3)
-                        else:
-                            city_pr = city_line_pr
-                    name_pr = r_pr['name'].strip()
-                    if name_pr and len(name_pr) >= 2 and (street_pr or city_pr):
-                        # Fix: if no street but we have a "city" line that doesn't actually have state+zip,
-                        # use that line as the street instead
-                        if not street_pr and city_pr and not state_pr and not zip_pr:
-                            street_pr = city_pr
-                            city_pr = ''
-                        parsed_pr.append({
-                            'name': name_pr,
-                            'agent': r_pr['agent'].strip(),
-                            'street': street_pr,
-                            'city': city_pr,
-                            'state': state_pr,
-                            'zip': zip_pr,
-                        })
+                    parsed_pr = prereg_parse_pdf(pdf_bytes_pr)
+                except ValueError as e:
+                    return self.respond({'success':False,'error':str(e)})
                 return self.respond({'success': True, 'count': len(parsed_pr), 'records': parsed_pr})
                 
             if path == "/cama":
@@ -9055,6 +8972,86 @@ SAO_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, l
 SAO = {"state": "idle", "done": 0, "none": 0, "failed": 0, "last": None}
 
 
+def prereg_parse_pdf(pdf_bytes_pr):
+    """📋 The State Auditor's Pre-Registration PDF -> [{name, agent, street, city, state, zip}].
+    Read by word POSITION (pdfplumber), not pdftotext -layout: the address column is taller than the name column, and
+    some pdftotext versions shift the addresses down against the names (seen 2026-10-14 on the office PC).
+    Used by the /prereg-parse upload and by the nightly automatic download (prereg_daily)."""
+    import pdfplumber
+    records_pr = []
+    current_pr = None
+    with pdfplumber.open(io.BytesIO(pdf_bytes_pr)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(keep_blank_chars=True, x_tolerance=2, y_tolerance=2)
+            hdr = {w["text"].strip(): w for w in words if w["text"].strip() in ("NAME", "AGENT", "ADDRESS")}
+            if "AGENT" not in hdr or "ADDRESS" not in hdr:
+                continue
+            x_agent, x_addr, y_hdr = hdr["AGENT"]["x0"] - 4, hdr["ADDRESS"]["x0"] - 4, hdr["ADDRESS"]["bottom"]
+            rows = {}
+            for w in words:
+                if w["top"] <= y_hdr or re.match(r'^\s*\d+\s+of\s+\d+\s*$', w["text"]): continue
+                rows.setdefault(round(w["top"]), []).append(w)
+            for top in sorted(rows):
+                cells = {"name": [], "agent": [], "addr": []}
+                for w in sorted(rows[top], key=lambda w: w["x0"]):
+                    col = "name" if w["x0"] < x_agent else "agent" if w["x0"] < x_addr else "addr"
+                    cells[col].append(w["text"].strip())
+                name, agent, addr = (" ".join(cells[k]).strip() for k in ("name", "agent", "addr"))
+                if name:                                   # a new row starts on the line with a name
+                    if current_pr: records_pr.append(current_pr)
+                    current_pr = {"name": name, "agent": agent, "addr_lines": [addr] if addr else []}
+                elif current_pr and (addr or agent):      # more lines of the same row (address continues below)
+                    if addr: current_pr["addr_lines"].append(addr)
+                    if agent: current_pr["agent"] = (current_pr["agent"] + " " + agent).strip()
+    if current_pr: records_pr.append(current_pr)
+
+    # Parse addresses into street/city/state/zip
+    parsed_pr = []
+    for r_pr in records_pr:
+        all_lines_pr = [l for l in r_pr['addr_lines'] if l.strip()]
+        city_line_pr = ''
+        street_lines_pr = []
+        for j_pr, l_pr in enumerate(all_lines_pr):
+            if re.search(r',\s+[A-Z]{2}[,]?\s+\d{5}(?:-\d{4})?\s*$', l_pr) or re.search(r',\s+[A-Z][A-Z\s]+\s+\d{5}', l_pr):
+                city_line_pr = l_pr
+                street_lines_pr = all_lines_pr[:j_pr]
+                break
+        if not city_line_pr and all_lines_pr:
+            city_line_pr = all_lines_pr[-1]
+            street_lines_pr = all_lines_pr[:-1]
+        street_pr = ', '.join(street_lines_pr).strip()
+        city_pr, state_pr, zip_pr = '', '', ''
+        m_pr = re.match(r'^(.+?),?\s+([A-Z]{2})[,]?\s+(\d{5}(?:-\d{4})?)\s*$', city_line_pr)
+        if m_pr:
+            city_pr = m_pr.group(1).rstrip(',').strip()
+            state_pr = m_pr.group(2)
+            zip_pr = m_pr.group(3)
+        else:
+            m_pr2 = re.match(r'^(.+?),?\s+(?:[A-Z]{2},?\s+)?([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$', city_line_pr)
+            if m_pr2:
+                city_pr = m_pr2.group(1).rstrip(',').strip()
+                state_pr = m_pr2.group(2)
+                zip_pr = m_pr2.group(3)
+            else:
+                city_pr = city_line_pr
+        name_pr = r_pr['name'].strip()
+        if name_pr and len(name_pr) >= 2 and (street_pr or city_pr):
+            # Fix: if no street but we have a "city" line that doesn't actually have state+zip,
+            # use that line as the street instead
+            if not street_pr and city_pr and not state_pr and not zip_pr:
+                street_pr = city_pr
+                city_pr = ''
+            parsed_pr.append({
+                'name': name_pr,
+                'agent': r_pr['agent'].strip(),
+                'street': street_pr,
+                'city': city_pr,
+                'state': state_pr,
+                'zip': zip_pr,
+            })
+    return parsed_pr
+
+
 def _sao_pdf_text(data):
     import io, pypdf
     t = "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(data)).pages)
@@ -9164,6 +9161,19 @@ class SaoHttp:
         labels = [x.strip() for x in (part[1] if len(part) > 1 else "").split("\n") if x.strip() and x.strip() != "View" and "new tab" not in x.lower()]
         return list(zip(labels[:len(f.views)], f.views))
 
+    def prereg_pdf(self):
+        """📋 County Reports > 'Pre-Registration Report' > View Report = the whole pre-registered buyer list as one PDF
+        (tested 2026-10-14: the button answers with SB552PreRegistrationList.pdf). One page + 2 posts, once a day."""
+        import urllib.parse
+        f = self._page(SAO_URL)
+        dd = next(n for n in f.selects if n.endswith("ddlCountyReports"))
+        f = self._post({dd: "8", "__EVENTTARGET": dd, "__EVENTARGUMENT": ""})
+        btn = _re_re.search(r'name="([^"]*btnPreRegReport)"', self.html).group(1)
+        data = dict(f.fields); data.update({dd: "8", btn: "View Report", "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
+        raw, ctype = self._go(urllib.parse.urljoin(self.url, f.action or self.url), data)
+        if not raw.startswith(b"%PDF"): raise ValueError("the report did not come back as a PDF (" + ctype + ")")
+        return raw
+
     def fetch(self, btn):
         """One document: the View button posts the page, the PDF is then served at Document.aspx."""
         self._post({btn: "View", "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
@@ -9219,6 +9229,32 @@ def sao_read_cert(site, job):
     return out
 
 
+def prereg_daily(site, lane, rid):
+    """📋 Tonight's State Auditor Pre-Registration Report (Ari 2026-10-14: it grows as people pre-register; he used to
+    download + upload it by hand every day). Every name goes into wvsao_preregistered (never deleted), empty buyer
+    addresses are filled from it. A pushback pauses the letter readers like any other Auditor page."""
+    import time as _t
+    try:
+        rows = prereg_parse_pdf(site.prereg_pdf())
+        if len(rows) < 100:
+            raise ValueError(f"only {len(rows)} names read - the report may have changed its layout")
+        res = _fz_rpc("prereg_ingest", {"p_rows": rows, "p_source": "auto " + _re_dt.utcnow().strftime("%Y-%m-%d") + " (" + lane + ")"})
+        _fz_rpc("prereg_done", {"p_id": rid, "p_ok": True, "p_result": res})
+        SAO["prereg"] = f"{_re_dt.utcnow().isoformat()[:16]}Z {len(rows)} names, {(res or {}).get('new')} new, {(res or {}).get('buyers_filled')} buyers filled"
+        print(f"[prereg] {SAO['prereg']}", flush=True)
+    except SaoBlocked as e:
+        SAO["pause_until"] = _t.time() + 1800
+        SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on the pre-registration report - pause 30 min")
+        SAO["prereg"] = f"failed: {e}"
+        try: _fz_rpc("prereg_done", {"p_id": rid, "p_ok": False, "p_error": str(e)})
+        except Exception: pass
+    except Exception as e:
+        SAO["prereg"] = f"failed: {str(e)[:200]}"
+        print(f"[prereg] failed: {e}", flush=True)
+        try: _fz_rpc("prereg_done", {"p_id": rid, "p_ok": False, "p_error": str(e)})
+        except Exception: pass
+
+
 def sao_loop(n=0):
     """🧾 Reads the State Auditor documents of every sold certificate (sao_cert queue). SAO_THREADS readers at once
     (plain HTTP, no browser). If the site pushes back (403 / 429 / 503 / block page) every reader pauses 30 minutes
@@ -9253,6 +9289,16 @@ def sao_loop(n=0):
                 site._proxied, done_here = not local, 0
             if SAO.get("night_check"):              # the office PC's nightly certificate check has every Auditor turn (Ari)
                 SAO["state"] = "waiting - the nightly certificate check is running"; _t.sleep(60); continue
+            if n == 0 and _t.time() >= SAO.get("prereg_next", 0):
+                # 📋 once a night: the Auditor's Pre-Registration Report -> our buyer list (one Auditor turn from the shared pace)
+                SAO["prereg_next"] = _t.time() + 1800
+                if __import__("shutil").which("pdftotext"):
+                    try:
+                        rid = _fz_rpc("prereg_claim", {"p_lane": lane})
+                    except Exception as e:
+                        rid = None; print(f"[prereg] claim: {e}", flush=True)
+                    if rid:
+                        prereg_daily(site, lane, rid); continue
             job = _fz_rpc("sao_claim", {"p_lane": lane})
             if not job:
                 # not our turn yet (or nothing waiting): ask again soon - the server used to wait 5 min here, which capped it at ~12/h
