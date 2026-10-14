@@ -9477,6 +9477,90 @@ def _og_load_year(year, log):
     return {"wells": n, "state_gas": [int(v) for v in state_gas]}
 
 
+# ── 🛢️ O&G Intel step 2: sheriff tax values (Ari 10/14) ─────────────────────────────────────────────────
+# One O&G certificate's tax ticket at a time from the county sheriff site (softwaresystems.com): account number,
+# owner, property, tax class and the assessed value (gross/net) + half-year tax. Plain page reads at a slow pace
+# (12-20 s apart); a site that does not answer parks that county for 6 hours (og_tax_save 'unreachable').
+import http.cookiejar as _ogt_cj
+import html as _ogt_html
+
+def _og_tax_text(raw):
+    t = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    t = re.sub(r"(?s)<!--.*?-->", " ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = _ogt_html.unescape(t).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", t).strip()
+
+def _og_tax_parse(raw, year, ticket):
+    t = _og_tax_text(raw)
+    if not re.search(r"Real Property Ticket - %s-0*%s\b" % (year, int(ticket)), t) and "Ticket Number:" not in t:
+        return None
+    def grab(rx):
+        m = re.search(rx, t)
+        return m.group(1).strip() if m else None
+    num = lambda v: float(v.replace(",", "")) if v not in (None, "") else None
+    out = {
+        "account": grab(r"Account Number:\s*(\d+)"),
+        "owner": grab(r"Owner Name:\s*(.*?)\s*In Care of:"),
+        "property": grab(r"Property:\s*(.*?)\s*Map:"),
+        "tax_class": grab(r"Tax Class:\s*(\d)"),
+    }
+    m = re.search(r"Total\s+([\d,]+)\s+([\d,]+)\s+([\d,]*\.\d\d)", t)
+    if m:
+        out["gross"], out["net"], out["half_tax"] = num(m.group(1)), num(m.group(2)), num(m.group(3))
+    else:
+        m = re.search(r"Land\s+([\d,]+)\s+([\d,]+)", t)
+        if m: out["gross"], out["net"] = num(m.group(1)), num(m.group(2))
+    return out
+
+def _og_tax_fetch(county, year, ticket):
+    """-> (status, data). status: done / missing / unreachable / error"""
+    base = get_sheriff_url(county)
+    if not base:
+        return "missing", {"error": "this county's sheriff site is a different system (not read yet)"}
+    jar = _ogt_cj.CookieJar()
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    op.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
+    try:
+        op.open(base + "/index.html", timeout=25).read()
+    except Exception as e:
+        return "unreachable", {"error": str(e)[:200]}
+    try:
+        body = urllib.parse.urlencode({"TPTYR": str(year), "TPTICK": str(ticket).zfill(10), "TPSX": "", "SBYTICKET": "Search by Ticket"}).encode()
+        raw = op.open(base + "/INDEX.html", data=body, timeout=30).read().decode("latin-1", "replace")
+    except Exception as e:
+        return "error", {"error": str(e)[:200]}
+    d = _og_tax_parse(raw, year, ticket)
+    if d is None or not d.get("account"):
+        return "missing", {"error": "no ticket page for this year/ticket"}
+    return "done", d
+
+def og_tax_loop():
+    import time as _t, random as _r
+    _t.sleep(300)
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "og_tax"}) or "off") != "on":
+                _t.sleep(900); continue
+            rows = _fz_rpc("og_tax_claim", {"p_n": 5}) or []
+            if not rows:
+                _t.sleep(1800); continue
+            down = set()
+            for r in rows:
+                c, y, tk = r["county"], r["tax_year"], r["ticket"]
+                if c in down:
+                    continue
+                st, d = _og_tax_fetch(c, y, tk)
+                _fz_rpc("og_tax_save", {"p_county": c, "p_year": y, "p_ticket": tk, "p_status": st, "p_data": d})
+                if st == "unreachable":
+                    down.add(c)
+                print(f"[ogtax] {c} {y} #{tk}: {st} {d.get('gross', '')} {d.get('error', '')}"[:200], flush=True)
+                _t.sleep(12 + _r.random() * 8)
+        except Exception as e:
+            print("[ogtax] " + str(e)[:300], flush=True)
+            _t.sleep(300)
+
+
 def run_og_refresh():
     """Load wells + production. Returns a summary; progress in OG_STATUS."""
     if not _og_lock.acquire(blocking=False):
@@ -9555,6 +9639,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=idx_surplus_once_loop, daemon=True).start()   # 🔍 one-time surplus look-back per county (10/6)
         _og_threading.Thread(target=landapp_server_loop, daemon=True).start()     # 🤵 land app NTRs on the server (10/8, fz_config landapp_server)
         _og_threading.Thread(target=agent_ticket_loop, daemon=True).start()       # 🎫 staff requests via Diego, 24/7 (10/8, fz_config agent_server; suggest only)
+        _og_threading.Thread(target=og_tax_loop, daemon=True).start()             # 🛢️ O&G tax values from the sheriff sites, slow (10/14, fz_config og_tax)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
