@@ -6497,7 +6497,7 @@ _FZ_WEB_SEARCH = {"type": "web_search_20260209", "name": "web_search", "max_uses
 # (idx_live_ask with p_for = "COUNTY|CERT") and Ari gets a phone notice; he opens the county in Chrome, passes the check himself
 # and clicks "Let Fernando search" (portal fz-helper.js). When a certificate's searches are answered, the database re-opens it.
 # No waiting here - Fernando goes on with his other work. Hardy / Wetzel join when the counties say yes.
-PERSON_COUNTIES = {"MONONGALIA", "KANAWHA", "WETZEL"}   # WETZEL: county OK by phone 2026-10-02 (robot page; images free)
+PERSON_COUNTIES = {"MONONGALIA", "WETZEL"}   # KANAWHA back to Fernando's own sign-in 10/14 (bulk collection in Ari's Chrome finished); WETZEL: county OK by phone 2026-10-02 (robot page; images free)
 BANK_COUNTIES = {"PUTNAM"} | PERSON_COUNTIES
 _BANK_LIVE_WAIT = 900
 
