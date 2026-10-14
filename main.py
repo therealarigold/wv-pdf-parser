@@ -9657,6 +9657,178 @@ def og_tax_loop():
             _t.sleep(300)
 
 
+# ── 🏠 Property facts from mapwv.gov for every certificate on the county lists (Ari 10/14) ────────────────────────
+# 1) statewide parcel layer (services.wvgis.wvu.edu WV_Parcels/MapServer/0) -> the parcel ID (district name -> code from
+#    layer 1); 2) mapwv.gov Assessment Detail page -> address, land use, buildings, values, acres, flood, sales, owner
+#    history. Public pages, one certificate every ~6 s. Owner changed = today's owner is not the list's owner.
+import html as _pf_html
+_PF_LAYER = "https://services.wvgis.wvu.edu/arcgis/rest/services/Planning_Cadastre/WV_Parcels/MapServer"
+_PF_DIST = {}
+
+
+def _pf_get_json(url, params):
+    q = urllib.parse.urlencode(dict(params, f="json"))
+    req = urllib.request.Request(url + "?" + q, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        return json.loads(r.read().decode("utf-8", "replace") or "{}")
+
+
+def _pf_norm(s):
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+def _pf_districts(county):
+    """'WOOD' -> {'CLAY': '01', 'PARKERSBURGCORP': '05', ...} (names without 'DISTRICT')."""
+    if county in _PF_DIST: return _PF_DIST[county]
+    d = _pf_get_json(_PF_LAYER + "/1/query", {"where": "UPPER(CNAME)='" + county.replace("'", "''") + "'", "outFields": "DNAME,DNumber,CNumber", "returnGeometry": "false"})
+    out = {}
+    for f in d.get("features") or []:
+        a = f.get("attributes") or {}
+        name = re.sub(r"\s+DISTRICT$", "", (a.get("DNAME") or "").upper().strip())
+        out[_pf_norm(name)] = (str(a.get("CNumber") or "").zfill(2), str(a.get("DNumber") or "").zfill(2))
+    _PF_DIST[county] = out
+    return out
+
+
+def _pf_parcel(county, district, mp, pc, sub):
+    """-> attributes of the parcel on the statewide layer, or None"""
+    dists = _pf_districts(county)
+    code = dists.get(_pf_norm(re.sub(r"\s+DISTRICT$", "", (district or "").upper().strip())))
+    cid = next(iter(dists.values()))[0] if dists else None
+    if not cid: return None
+    fields = "CountyID,Dist,Map,Parcel,Suffix,CleanParcelID,GISPID,FullOwnerName,FullPhysicalAddress,CALC_ACRE"
+    base = f"CountyID='{cid}' AND Map='{mp}' AND Parcel='{pc}'"
+    tries = []
+    if code: tries.append(base + f" AND Dist='{code[1]}' AND Suffix='{sub or '0000'}'")
+    if code: tries.append(base + f" AND Dist='{code[1]}'")
+    tries.append(base)
+    for w in tries:
+        feats = [f.get("attributes") or {} for f in (_pf_get_json(_PF_LAYER + "/0/query", {"where": w, "outFields": fields, "returnGeometry": "false"}).get("features") or [])]
+        if len(feats) == 1: return feats[0]
+        if len(feats) > 1 and w == tries[-1]: return None        # same map/parcel in several districts and no district match
+    return None
+
+
+def _pf_tokens(raw):
+    t = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    t = re.sub(r"<[^>]+>", "|", t)
+    t = _pf_html.unescape(t).replace("\xa0", " ")
+    return [re.sub(r"\s+", " ", x).strip() for x in t.split("|") if x.strip()]
+
+
+def _pf_money(v):
+    v = (v or "").replace("$", "").replace(",", "").strip()
+    try: return float(v)
+    except Exception: return None
+
+
+def _pf_after(T, label, n=1):
+    try: i = T.index(label)
+    except ValueError: return None
+    return T[i + n] if i + n < len(T) else None
+
+
+def _pf_assessment(pid20):
+    req = urllib.request.Request("https://mapwv.gov/Assessment/Detail/?PID=" + pid20, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    with urllib.request.urlopen(req, timeout=40) as r:
+        T = _pf_tokens(r.read().decode("utf-8", "replace"))
+    if "Invalid Parcel Identifier" in T: return None
+    d = {"owner_now": _pf_after(T, "Owner(s)"), "mailing": _pf_after(T, "Mailing Address"),
+         "address": _pf_after(T, "Physical Address"), "e911": _pf_after(T, "E-911 Address"),
+         "dwelling": _pf_money(_pf_after(T, "Dwelling Value")), "land": _pf_money(_pf_after(T, "Land Appraisal")),
+         "building": _pf_money(_pf_after(T, "Building Appraisal")), "total": _pf_money(_pf_after(T, "Total Appraisal")),
+         "prop_class": _pf_after(T, "Property Class"), "land_use": _pf_after(T, "Land Use")}
+    try: d["sqft"] = float((_pf_after(T, "Sum of Structure Areas") or "").replace(",", ""))
+    except Exception: pass
+    try: d["buildings"] = int(_pf_after(T, "# of Buildings (Cards)") or "")
+    except Exception: pass
+    if "Legal Description" in T and "Tax Class" in T:                 # header row then values: class, book/page, deeded ac, calc ac, legal
+        i = T.index("Legal Description", T.index("Tax Class"))
+        vals = T[i + 1:i + 6]
+        if vals: d["tax_class"] = vals[0]
+        try: d["acres"] = float(vals[3] if len(vals) > 3 else vals[2])
+        except Exception: pass
+    if "Risk" in T:
+        r = T[T.index("Risk") + 2:T.index("Risk") + 3]
+        if r: d["flood"] = r[0]
+    if "Validity Code" in T:                                          # sales: date, price, type, source, validity, book, page
+        i = T.index("Validity Code") + 3
+        sales = []
+        while i + 1 < len(T) and re.match(r"^\d{1,2}/\d{1,2}/\d{4}$", T[i]):
+            sales.append((T[i], _pf_money(T[i + 1]))); i += 7
+        if sales:
+            last = max(sales, key=lambda s: (s[0][-4:], s[0]))
+            d["last_sale_date"], d["last_sale_price"] = last
+    hist = []
+    if "Parcel History" in T:
+        i = T.index("Parcel History")
+        j = T.index("Total", i) + 1 if "Total" in T[i:] else i
+        while j + 8 < len(T) and re.match(r"^\d{4}$", T[j]):
+            hist.append({"y": int(T[j]), "owner": T[j + 2], "land": _pf_money(T[j + 6]), "building": _pf_money(T[j + 7]), "total": _pf_money(T[j + 8])})
+            j += 9
+    d["history"] = hist[:15]
+    for k in ("e911", "address"):
+        if (d.get(k) or "").strip("- ") == "": d[k] = None
+    return d
+
+
+def _pf_owner_changed(list_owner, d):
+    lo, now = _pf_norm(list_owner), _pf_norm(d.get("owner_now"))
+    if not lo or not now: return None, None
+    sur = re.sub(r"[^A-Z]", "", (list_owner or "").upper().split(" ")[0])[:8]
+    if sur and sur in now: return False, None
+    since = None                                                     # the newest run of years without the list's owner
+    for h in sorted(d.get("history") or [], key=lambda h: -h["y"]):
+        if sur and sur in _pf_norm(h["owner"]): break
+        since = h["y"]
+    note = "Now owned by " + (d.get("owner_now") or "?") + (f" (owner on the county roll since {since})" if since else "")
+    if d.get("last_sale_date"): note += f"; last sale {d['last_sale_date']}" + (f" for ${d['last_sale_price']:,.0f}" if d.get("last_sale_price") else "")
+    return True, note
+
+
+def _pf_one(row):
+    county = row["county"]
+    a = _pf_parcel(county, row.get("district"), row.get("map"), row.get("parcel"), row.get("sub"))
+    if not a:
+        return "not_found", {"error": "parcel not on the state parcel map (minerals often are not)"}
+    pid20 = a.get("CleanParcelID") or ""
+    d = _pf_assessment(pid20) if pid20 else None
+    if not d:
+        d = {}
+    d["pid"] = a.get("GISPID")
+    d.setdefault("address", a.get("FullPhysicalAddress"))
+    if not d.get("acres") and a.get("CALC_ACRE"): d["acres"] = round(float(a["CALC_ACRE"]), 3)
+    if not d.get("owner_now"): d["owner_now"] = a.get("FullOwnerName")
+    ch, note = _pf_owner_changed(row.get("list_owner"), d)
+    d["owner_changed"], d["owner_note"] = ch, note
+    return "done", d
+
+
+def parcel_fact_loop():
+    import time as _t, random as _r
+    _t.sleep(360)
+    last_seed = 0
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "parcel_facts"}) or "off") != "on":
+                _t.sleep(900); continue
+            if _t.time() - last_seed > 3600:
+                _fz_rpc("parcel_fact_seed", {}); last_seed = _t.time()
+            rows = _fz_rpc("parcel_fact_claim", {"p_n": 5}) or []
+            if not rows:
+                _t.sleep(1800); continue
+            for row in rows:
+                try:
+                    st, d = _pf_one(row)
+                except Exception as e:
+                    st, d = "error", {"error": str(e)[:200]}
+                _fz_rpc("parcel_fact_save", {"p_county": row["county"], "p_cert": row["cert"], "p_status": st, "p_data": d})
+                _t.sleep(5 + _r.random() * 3)
+        except Exception as e:
+            print("[parcel] " + str(e)[:300], flush=True)
+            _t.sleep(300)
+
+
 def run_og_refresh():
     """Load wells + production. Returns a summary; progress in OG_STATUS."""
     if not _og_lock.acquire(blocking=False):
@@ -9738,6 +9910,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=og_tax_loop, daemon=True).start()             # 🛢️ O&G tax values from the sheriff sites, slow (10/14, fz_config og_tax)
         _og_threading.Thread(target=county_test_loop, daemon=True).start()        # 🧪 full county test when fz_config county_test = 'run' (10/14)
         _og_threading.Thread(target=county_access_loop, daemon=True).start()      # 🚦 red/yellow/green county switches from the main page (10/14)
+        _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
