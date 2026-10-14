@@ -8991,16 +8991,21 @@ def prereg_parse_pdf(pdf_bytes_pr):
             for w in words:
                 if w["top"] <= y_hdr or re.match(r'^\s*\d+\s+of\s+\d+\s*$', w["text"]): continue
                 rows.setdefault(round(w["top"]), []).append(w)
+            last_top = None
             for top in sorted(rows):
+                # lines of one row are ~12 pt apart, rows ~16+ pt apart: a long NAME that wraps onto a 2nd line is the same row
+                same_row = last_top is not None and top - last_top < 14
+                last_top = top
                 cells = {"name": [], "agent": [], "addr": []}
                 for w in sorted(rows[top], key=lambda w: w["x0"]):
                     col = "name" if w["x0"] < x_agent else "agent" if w["x0"] < x_addr else "addr"
                     cells[col].append(w["text"].strip())
                 name, agent, addr = (" ".join(cells[k]).strip() for k in ("name", "agent", "addr"))
-                if name:                                   # a new row starts on the line with a name
+                if name and not (same_row and current_pr):     # a new row starts on a name line after a row gap
                     if current_pr: records_pr.append(current_pr)
                     current_pr = {"name": name, "agent": agent, "addr_lines": [addr] if addr else []}
-                elif current_pr and (addr or agent):      # more lines of the same row (address continues below)
+                elif current_pr:                               # more lines of the same row (wrapped name / agent / address)
+                    if name: current_pr["name"] = (current_pr["name"] + " " + name).strip()
                     if addr: current_pr["addr_lines"].append(addr)
                     if agent: current_pr["agent"] = (current_pr["agent"] + " " + agent).strip()
     if current_pr: records_pr.append(current_pr)
