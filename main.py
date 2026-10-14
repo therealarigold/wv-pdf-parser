@@ -9829,6 +9829,68 @@ def parcel_fact_loop():
             _t.sleep(300)
 
 
+# ── 📄 Notice of Redemption zip (Anne 10/14): every PDF the land app helper saved (ntr_fill_job mode 'images', result
+# pdf_b64) in one zip + a list (county, cert, redeemed on, notice date, paid to redeem, refunded to purchaser), uploaded
+# to the private 'exports' bucket; a 7-day download link goes to fz_config notice_zip_url. Start: fz_config notice_zip='make'.
+def _nz_make():
+    import zipfile, base64, csv, pypdf
+    buf, rows, last = io.BytesIO(), [], 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        while True:
+            q = f"{_RE_SUPABASE_URL}/rest/v1/ntr_fill_job?mode=eq.images&status=eq.done&id=gt.{last}&order=id&limit=10&select=id,county,cert,b64:result->>pdf_b64,red:result->>redeemed_on,nd:result->>notice_date"
+            with _re_ur.urlopen(_re_ur.Request(q, headers=_RE_HEADERS), timeout=120) as r:
+                batch = _re_json.loads(r.read() or b"[]")
+            if not batch: break
+            for j in batch:
+                last = j["id"]
+                if not j.get("b64"): continue
+                pdf = base64.b64decode(j["b64"])
+                county = re.sub(r"\s*COUNTY\s*$", "", (j.get("county") or "").upper()).title()
+                name = f"{county} {j['cert']} Notice of Redemption.pdf"
+                z.writestr(name, pdf)
+                paid = refund = ""
+                try:
+                    t = "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(pdf)).pages)
+                    paid = (re.search(r"Amount Paid to Redeem\s*\$?([\d,]+\.\d\d)", t) or [None, ""])[1]
+                    refund = (re.search(r"Total Amount to be Refunded to Purchaser\s*\$?([\d,]+\.\d\d)", t) or [None, ""])[1]
+                except Exception:
+                    pass
+                rows.append([county, j["cert"], j.get("red") or "", j.get("nd") or "", paid, refund, name])
+        rows.sort(key=lambda r: (r[0], r[1]))
+        s = io.StringIO(); w = csv.writer(s)
+        w.writerow(["County", "Certificate", "Redeemed on", "Notice date", "Amount paid to redeem", "Refunded to purchaser", "File"])
+        w.writerows(rows)
+        z.writestr("Notice of Redemption list.csv", s.getvalue())
+    name = "notice-of-redemption-gold-enterprises-2025.zip"
+    hdr = {k: v for k, v in _RE_HEADERS.items() if k.lower() != "content-type"}
+    up = _re_ur.Request(f"{_RE_SUPABASE_URL}/storage/v1/object/exports/{name}", data=buf.getvalue(), method="POST",
+                        headers=dict(hdr, **{"Content-Type": "application/zip", "x-upsert": "true"}))
+    _re_ur.urlopen(up, timeout=300).read()
+    sg = _re_ur.Request(f"{_RE_SUPABASE_URL}/storage/v1/object/sign/exports/{name}", data=_re_json.dumps({"expiresIn": 604800}).encode(),
+                        method="POST", headers=dict(hdr, **{"Content-Type": "application/json"}))
+    with _re_ur.urlopen(sg, timeout=60) as r:
+        signed = _re_json.loads(r.read() or b"{}").get("signedURL") or ""
+    return f"{_RE_SUPABASE_URL}/storage/v1{signed}", len(rows), len(buf.getvalue())
+
+
+def notice_zip_loop():
+    import time as _t
+    _t.sleep(200)
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "notice_zip"}) or "") == "make":
+                _fz_rpc("fz_config_set", {"p_key": "notice_zip", "p_value": "making"})
+                url, n, size = _nz_make()
+                _fz_rpc("fz_config_set", {"p_key": "notice_zip_url", "p_value": url})
+                _fz_rpc("fz_config_set", {"p_key": "notice_zip", "p_value": f"done {n} pdfs {size // 1024} KB " + _re_dt.utcnow().isoformat()[:16]})
+                print(f"[notice-zip] {n} PDFs, {size // 1024} KB", flush=True)
+        except Exception as e:
+            print("[notice-zip] " + str(e)[:300], flush=True)
+            try: _fz_rpc("fz_config_set", {"p_key": "notice_zip", "p_value": "failed: " + str(e)[:200]})
+            except Exception: pass
+        _t.sleep(60)
+
+
 def run_og_refresh():
     """Load wells + production. Returns a summary; progress in OG_STATUS."""
     if not _og_lock.acquire(blocking=False):
@@ -9911,6 +9973,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=county_test_loop, daemon=True).start()        # 🧪 full county test when fz_config county_test = 'run' (10/14)
         _og_threading.Thread(target=county_access_loop, daemon=True).start()      # 🚦 red/yellow/green county switches from the main page (10/14)
         _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
+        _og_threading.Thread(target=notice_zip_loop, daemon=True).start()         # 📄 Notice of Redemption zip on request (Anne 10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
