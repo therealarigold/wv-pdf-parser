@@ -4710,8 +4710,21 @@ def _idx2_search(pg, mode, fields, enter_in, max_pages=10, page_wait_s=0, bank_k
         # the real dropdown (switching from script leaves the new boxes hidden)
         pg.locator(_IDX2_P + "cboKey_I").click()
         pg.wait_for_timeout(600)
-        pg.get_by_text(label, exact=True).last.click()
+        # the item INSIDE the dropdown list (Kenzie's Mercer 10/14: "the last 'Name' on the page" was a results column
+        # header once a grid was showing, so the mode never changed and the name box stayed hidden)
+        item = pg.locator("[id^='" + _IDX2_P + "cboKey_DDD_L_LBI'][id$='T0']").filter(has_text=re.compile("^" + re.escape(label) + "$"))
+        try:
+            item.first.wait_for(state="visible", timeout=8000)
+            item.first.click()
+        except Exception:
+            pg.get_by_text(label, exact=True).last.click()
         pg.wait_for_timeout(1500)
+        if pg.evaluate("() => cboKey.GetText()") != label:          # still not switched: pick it with the keyboard
+            box = pg.locator(_IDX2_P + "cboKey_I")
+            box.click(); box.press("Control+a"); box.type(label, delay=30); box.press("Enter")
+            pg.wait_for_timeout(1500)
+        if pg.evaluate("() => cboKey.GetText()") != label:
+            raise RuntimeError(f"could not switch the county search to '{label}'")
     for k, v in fields.items():
         box = pg.locator(_IDX2_P + k + "_I")
         box.click(); box.press("Control+a"); box.press("Delete")
