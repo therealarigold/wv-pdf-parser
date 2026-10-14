@@ -5471,6 +5471,16 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
         if years: out["years"] = years[0] + "-" + years[-1]
         with_img = [r for r in rows if r.get("image_id")]
         out["rows_with_image"] = len(with_img)
+        # switch to Book & Page and back to the name search - the step that failed in Mercer/Calhoun (10/14)
+        bp = next((r.get("bookpage") for r in rows if _re_re.match(r"^\s*\d+\s*/\s*\d+\s*$", r.get("bookpage") or "")), None)
+        if bp:
+            try:
+                b, pgn = [x.strip() for x in bp.split("/")]
+                brows = _idx2_search(pg, 2, {"txtBook": b, "txtPage": pgn}, "txtPage")
+                rows2 = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
+                out["book_page"] = (f"works ({len(brows)} rows for {bp})" if brows else f"no rows for {bp}") + (" - back to names OK" if rows2 else " - back to names gave NO rows")
+            except Exception as e:
+                out["book_page"] = "FAILED: " + str(e)[:160]
         if with_img:
             ip = ctx.new_page()
             ip.goto(_idx2_base(url) + "/Image.aspx?control=" + with_img[0]["image_id"], wait_until="networkidle", timeout=60000)
@@ -5495,12 +5505,36 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
     return out
 
 
+def county_test_loop():
+    """🧪 Full county test on request (Ari 10/14: "run a full test on fernando's title search logins"): fz_config
+    county_test = 'run' (or 'run:MERCER,WOOD'). Waits until Fernando is not mid-search. Skips the one-sign-in counties
+    (Kanawha in Ari's Chrome, Putnam) and the person counties - signing in again there would log someone out."""
+    import time as _t
+    _t.sleep(240)
+    while True:
+        try:
+            v = (_fz_rpc("fz_config_get", {"p_key": "county_test"}) or "").strip()
+            if v.startswith("run") and IDX2_COUNTY_TEST.get("state") != "running":
+                if FERNANDO.get("working"):                          # a title search is mid-way: wait for it
+                    _t.sleep(60); continue
+                only = [c.strip().upper() for c in v[4:].split(",") if c.strip()] if ":" in v else None
+                _fz_rpc("fz_config_set", {"p_key": "county_test", "p_value": "running"})
+                run_idx2_county_test(only)
+                res = dict(IDX2_COUNTY_TEST)
+                _fz_rpc("fz_config_set", {"p_key": "county_test_result", "p_value": json.dumps(res)[:200000]})
+                _fz_rpc("fz_config_set", {"p_key": "county_test", "p_value": "done " + _re_dt.utcnow().isoformat()[:16]})
+        except Exception as e:
+            print("[ctest] " + str(e)[:300], flush=True)
+        _t.sleep(120)
+
+
 def run_idx2_county_test(counties=None):
     IDX2_COUNTY_TEST.update({"state": "running", "results": {}, "started": _re_dt.utcnow().isoformat() + "Z"})
     try:
         for county, url in IDX2_SURVEY.items():
             if counties and county not in counties: continue
             if county in ("PUTNAM", "TUCKER", "WETZEL"): continue   # not the IDX product / closed
+            if county in PERSON_COUNTIES and not counties: continue   # one sign-in at a time / robot page: helper in Ari's Chrome
             IDX2_COUNTY_TEST["current"] = county
             p, browser = get_playwright_browser()                # a fresh browser per county (the server's one-process browser does not survive reuse)
             try:
@@ -9658,6 +9692,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=landapp_server_loop, daemon=True).start()     # 🤵 land app NTRs on the server (10/8, fz_config landapp_server)
         _og_threading.Thread(target=agent_ticket_loop, daemon=True).start()       # 🎫 staff requests via Diego, 24/7 (10/8, fz_config agent_server; suggest only)
         _og_threading.Thread(target=og_tax_loop, daemon=True).start()             # 🛢️ O&G tax values from the sheriff sites, slow (10/14, fz_config og_tax)
+        _og_threading.Thread(target=county_test_loop, daemon=True).start()        # 🧪 full county test when fz_config county_test = 'run' (10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
