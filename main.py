@@ -5472,10 +5472,10 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
         with_img = [r for r in rows if r.get("image_id")]
         out["rows_with_image"] = len(with_img)
         # switch to Book & Page and back to the name search - the step that failed in Mercer/Calhoun (10/14)
-        bp = next((r.get("bookpage") for r in rows if _re_re.match(r"^\s*\d+\s*/\s*\d+\s*$", r.get("bookpage") or "")), None)
-        if bp:
+        bp = next((_idx2_bp(r.get("bookpage")) for r in rows if _idx2_bp(r.get("bookpage"))[0]), (None, None))   # "1105@700"
+        if bp[0]:
             try:
-                b, pgn = [x.strip() for x in bp.split("/")]
+                b, pgn = bp; bp = f"{b}/{pgn}"
                 brows = _idx2_search(pg, 2, {"txtBook": b, "txtPage": pgn}, "txtPage")
                 rows2 = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
                 out["book_page"] = (f"works ({len(brows)} rows for {bp})" if brows else f"no rows for {bp}") + (" - back to names OK" if rows2 else " - back to names gave NO rows")
