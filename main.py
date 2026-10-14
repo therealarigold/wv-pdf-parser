@@ -6502,6 +6502,50 @@ BANK_COUNTIES = {"PUTNAM"} | PERSON_COUNTIES
 _BANK_LIVE_WAIT = 900
 
 
+# 🚦 County access switches (Ari 10/14): owners set each county red / yellow / green on the main page (fernando_county.access).
+# Read every minute and applied IN PLACE to the sets the rest of the code already checks:
+#   yellow -> PERSON_COUNTIES (through Ari's Chrome), red -> _FZ_NO_AUTO (Fernando does not try), green -> neither.
+# PUTNAM stays bank-only (RECORDhub, one window). Also reports which counties have a known site and a saved login
+# (fz_config county_caps: yes/no only - never the login itself).
+def _county_caps():
+    out = {}
+    for c in sorted(set(IDX2_SURVEY) | set(IDX2_URLS) | {"PUTNAM"}):
+        url = IDX2_URLS.get(c) or IDX2_SURVEY.get(c) or ""
+        host = (urllib.parse.urlparse(url).netloc or url)[:60] if url else ""
+        login = bool(os.environ.get(f"IDX_{c}_USER") and os.environ.get(f"IDX_{c}_PASS"))
+        if c == "PUTNAM":
+            host, login = "RECORDhub", bool(os.environ.get("PUTNAM_USER") and os.environ.get("PUTNAM_PASS"))
+        out[c] = {"site": host, "login": login}
+    return out
+
+
+def _county_access_apply(acc):
+    yellow = {c for c, a in acc.items() if a == "yellow" and c != "PUTNAM"}
+    red = {c for c, a in acc.items() if a == "red"}
+    PERSON_COUNTIES.clear(); PERSON_COUNTIES.update(yellow)
+    _FZ_NO_AUTO.clear(); _FZ_NO_AUTO.update(red | {"PUTNAM"})
+    BANK_COUNTIES.clear(); BANK_COUNTIES.update({"PUTNAM"} | PERSON_COUNTIES)
+
+
+def county_access_loop():
+    import time as _t
+    last_caps = 0
+    while True:
+        try:
+            acc = _fz_rpc("county_access_all", {}) or {}
+            if isinstance(acc, dict) and acc:
+                before = (sorted(PERSON_COUNTIES), sorted(_FZ_NO_AUTO))
+                _county_access_apply(acc)
+                if (sorted(PERSON_COUNTIES), sorted(_FZ_NO_AUTO)) != before:
+                    print(f"[access] yellow={sorted(PERSON_COUNTIES)} red={sorted(_FZ_NO_AUTO - {'PUTNAM'})}", flush=True)
+            if _t.time() - last_caps > 3600:
+                _fz_rpc("fz_config_set", {"p_key": "county_caps", "p_value": json.dumps(_county_caps())})
+                last_caps = _t.time()
+        except Exception as e:
+            print("[access] " + str(e)[:300], flush=True)
+        _t.sleep(60)
+
+
 def bank_owner_rows(county, last, first="", live=True, note=None):
     """The owner's papers from our bank; when there are none, ask the office computer's county tab and wait (<= 3 min)."""
     import time as _t
@@ -9693,6 +9737,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=agent_ticket_loop, daemon=True).start()       # 🎫 staff requests via Diego, 24/7 (10/8, fz_config agent_server; suggest only)
         _og_threading.Thread(target=og_tax_loop, daemon=True).start()             # 🛢️ O&G tax values from the sheriff sites, slow (10/14, fz_config og_tax)
         _og_threading.Thread(target=county_test_loop, daemon=True).start()        # 🧪 full county test when fz_config county_test = 'run' (10/14)
+        _og_threading.Thread(target=county_access_loop, daemon=True).start()      # 🚦 red/yellow/green county switches from the main page (10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
             from engagement_mailer import mailer_loop
