@@ -4397,6 +4397,17 @@ def _idx2_pick(ip, combo, text):
         if (hit < 0) return null; cb.SetSelectedIndex(hit); return cb.GetItem(hit).text; }""", [combo, text])
 
 
+def _idx2_pick_book(ip, book_type, combo="cboBook"):
+    """The county's own name for a book type (Ari 10/15: some counties call it 'DEEDS' or 'DEED RECORD', not 'DEED BOOK')."""
+    t = (book_type or "").upper().strip()
+    if _idx2_pick(ip, combo, t): return True
+    core = _re_re.sub(r"\s*\b(BOOKS?|RECORDS?)\b\s*", " ", t).strip()          # 'DEED OF TRUST BOOK' -> 'DEED OF TRUST'
+    for cand in (core, core.rstrip("S") + "S", core.split(" OF ")[0] if " OF " in core else None,
+                 {"DEED": "DEEDS", "WILL": "WILLS", "TRUST DEED": "DEED OF TRUST", "DEED OF TRUST": "TRUST DEED"}.get(core)):
+        if cand and len(cand) >= 3 and _idx2_pick(ip, combo, cand): return True
+    return False
+
+
 def _idx2_items(ip, combo, limit=400):
     return ip.evaluate("([c, n]) => { const cb = window[c]; if (!cb) return []; const o = []; for (let k = 0; k < Math.min(cb.GetItemCount(), n); k++) o.push(cb.GetItem(k).text); return o; }", [combo, limit])
 
@@ -4412,7 +4423,8 @@ def _idx2_book_images(ctx, base_url, book_type, book, page, want=2):
     try:
         ip.goto(_idx2_base(base_url) + "/Image.aspx", wait_until="networkidle", timeout=60000)
         ip.wait_for_function("() => typeof cboBook !== 'undefined' && typeof txtBook !== 'undefined'", timeout=30000)
-        if not _idx2_pick(ip, "cboBook", book_type): raise ValueError(f"no '{book_type}' in this county's image search")
+        if not _idx2_pick_book(ip, book_type):
+            raise ValueError(f"no '{book_type}' in this county's image search - its books are: " + ", ".join(_idx2_items(ip, "cboBook", 60)))
         mb = _re_re.match(r"\s*([A-Za-z]*)\s*(\d+)\s*([A-Za-z]*)", str(book)); mp = _re_re.match(r"\s*(\d+)\s*([A-Za-z]*)", str(page))
         if not (mb and mp): raise ValueError("book and page must be numbers")
         ip.evaluate("""([b, bs, p, ps]) => { txtBook.SetText(b); txtBookSuffix.SetText(bs); txtPage.SetText(p); txtPageSuffix.SetText(ps);
@@ -5481,6 +5493,29 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
                 out["book_page"] = (f"works ({len(brows)} rows for {bp})" if brows else f"no rows for {bp}") + (" - back to names OK" if rows2 else " - back to names gave NO rows")
             except Exception as e:
                 out["book_page"] = "FAILED: " + str(e)[:160]
+        # 📜 image search (a book page by book / page - old books too) and 🗄 the Vault (old handwritten index books) (Ari 10/15)
+        if bp[0]:
+            try:
+                imgs = _idx2_book_images(ctx, url, "DEED BOOK", bp[0], bp[1], want=1)
+                out["image_search"] = f"works (deed book {bp[0]}/{bp[1]})" if imgs else f"no picture for deed book {bp[0]}/{bp[1]}"
+            except Exception as e:
+                out["image_search"] = "FAILED: " + str(e)[:200]
+        try:
+            books, _n = _idx2_vault(ctx, url)
+            if not books:
+                out["vault"] = "no vault books on this site"
+            else:
+                vols, _n = _idx2_vault(ctx, url, books[0])
+                if not vols or not isinstance(vols, list):
+                    out["vault"] = f"{len(books)} books, but no volumes in '{books[0]}'"
+                else:
+                    pages, _n = _idx2_vault(ctx, url, books[0], vols[0])
+                    pg1 = next((x for x in (pages or []) if x and x != "…" and x not in ("0", "00")), None)
+                    img, _n = _idx2_vault(ctx, url, books[0], vols[0], pg1) if pg1 else (None, "")
+                    out["vault"] = (f"works ({len(books)} books; {books[0]} vol {vols[0]} page {pg1} opens)" if img and not isinstance(img, list)
+                                    else f"{len(books)} books, page did not open ({books[0]} {vols[0]} {pg1})")
+        except Exception as e:
+            out["vault"] = "FAILED: " + str(e)[:160]
         if with_img:
             ip = ctx.new_page()
             ip.goto(_idx2_base(url) + "/Image.aspx?control=" + with_img[0]["image_id"], wait_until="networkidle", timeout=60000)
