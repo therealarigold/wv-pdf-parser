@@ -5484,7 +5484,10 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
         with_img = [r for r in rows if r.get("image_id")]
         out["rows_with_image"] = len(with_img)
         # switch to Book & Page and back to the name search - the step that failed in Mercer/Calhoun (10/14)
-        bp = next((_idx2_bp(r.get("bookpage")) for r in rows if _idx2_bp(r.get("bookpage"))[0]), (None, None))   # "1105@700"
+        # a real DEED with clean numbers (the index has junk like "'13 @ 388" / "0 @ 0" - Ari 10/15: test what Fernando would open)
+        clean = lambda r: (lambda b: b if (b[0] and b[1] and b[0].isdigit() and b[1].isdigit() and 2 <= len(b[0]) <= 5 and int(b[1]) > 0) else (None, None))(_idx2_bp(r.get("bookpage")))
+        bp = next((clean(r) for r in rows if _re_re.search(r"DEED", r.get("doc") or "", _re_re.I) and not _re_re.search(r"TRUST|RELEASE", r.get("doc") or "", _re_re.I) and clean(r)[0]),
+                  next((clean(r) for r in rows if clean(r)[0]), (None, None)))
         if bp[0]:
             try:
                 b, pgn = bp; bp = f"{b}/{pgn}"
