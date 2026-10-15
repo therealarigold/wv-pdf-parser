@@ -9692,6 +9692,8 @@ def _pf_districts(county):
 
 def _pf_parcel(county, district, mp, pc, sub):
     """-> attributes of the parcel on the statewide layer, or None"""
+    pad = lambda v: (str(v or "").strip().upper() or "0").zfill(4)[-4:] if len(str(v or "").strip()) <= 4 else str(v).strip().upper()
+    mp, pc, sub = pad(mp), pad(pc), pad(sub or "0")          # Cabell lists "2" / "148" / "0"; the state map has 0002 / 0148 / 0000
     dists = _pf_districts(county)
     code = dists.get(_pf_norm(re.sub(r"\s+DISTRICT$", "", (district or "").upper().strip())))
     cid = next(iter(dists.values()))[0] if dists else None
@@ -9699,7 +9701,7 @@ def _pf_parcel(county, district, mp, pc, sub):
     fields = "CountyID,Dist,Map,Parcel,Suffix,CleanParcelID,GISPID,FullOwnerName,FullPhysicalAddress,CALC_ACRE"
     base = f"CountyID='{cid}' AND Map='{mp}' AND Parcel='{pc}'"
     tries = []
-    if code: tries.append(base + f" AND Dist='{code[1]}' AND Suffix='{sub or '0000'}'")
+    if code: tries.append(base + f" AND Dist='{code[1]}' AND Suffix='{sub}'")
     if code: tries.append(base + f" AND Dist='{code[1]}'")
     tries.append(base)
     for w in tries:
