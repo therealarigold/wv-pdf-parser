@@ -414,11 +414,12 @@ def mailer_loop():
             kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
             job = _rpc("engagement_outbox_next", {"p_kinds": kinds})
             if not job and _env("PORTAL_INTEGRATION_SECRET") and time.time() >= _GS_PAUSE[0]:
-                g = _rpc("mail_outbox_next", {"p_kinds": ["gs_call", "gs_diego"]})
+                g = _rpc("mail_outbox_next", {"p_kinds": ["gs_call", "gs_diego", "gs_photo"]})
                 if g:
                     try:
                         # gs_diego (Ari 10/8): Diego tells a staff member something in the Gold Standard chat
-                        status, detail = send_gs_call(g["payload"] or {}, "/integrations/portal-diego" if g.get("kind") == "gs_diego" else "/integrations/portal-call")
+                        # gs_photo (Ari 10/15): a certificate sent to Gold Standard as a photo job
+                        status, detail = send_gs_call(g["payload"] or {}, {"gs_diego": "/integrations/portal-diego", "gs_photo": "/integrations/photo-job"}.get(g.get("kind"), "/integrations/portal-call"))
                     except Exception as ex:
                         status, detail = "failed", str(ex)[:300]
                     _rpc("mail_outbox_done", {"p_id": g["id"], "p_status": status, "p_detail": detail})
