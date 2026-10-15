@@ -5501,6 +5501,9 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
             try:
                 imgs = _idx2_book_images(ctx, url, "DEED BOOK", bp[0], bp[1], want=1)
                 out["image_search"] = f"works (deed book {bp[0]}/{bp[1]})" if imgs else f"no picture for deed book {bp[0]}/{bp[1]}"
+                if not imgs:   # image search is for the OLD scanned books (newer deeds open from the index) - try an old one
+                    old_imgs = _idx2_book_images(ctx, url, "DEED BOOK", "1", "1", want=1)
+                    out["image_search"] += " - old books: " + ("deed book 1/1 opens" if old_imgs else "deed book 1/1 did not open either")
             except Exception as e:
                 out["image_search"] = "FAILED: " + str(e)[:200]
         try:
