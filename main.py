@@ -10215,15 +10215,19 @@ def lease_read_loop():
             v = (_fz_rpc("fz_config_get", {"p_key": "lease_read"}) or "off").strip()
             counties = [c.strip().upper() for c in v[3:].split(",") if c.strip()] if v.startswith("on:") else []
             counties = [c for c in counties if (c in IDX2_URLS or c in IDX2_SURVEY) and c not in PERSON_COUNTIES]
-            if not counties:
-                _t.sleep(120); continue
+            # counties switched on + (always) leases of new certificates in green counties (option 1, 10/16)
             jobs = _fz_rpc("og_lease_read_claim", {"p_counties": counties, "p_n": 5}) or []
             if not jobs:
-                _t.sleep(300); continue
+                _t.sleep(300 if counties else 600); continue
             by = {}
             for j in jobs: by.setdefault(j["county"], []).append(j)
             for county, lst in by.items():
-                url = IDX2_URLS.get(county) or IDX2_SURVEY[county]
+                url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
+                if not url or county in PERSON_COUNTIES:
+                    for j in lst:
+                        _fz_rpc("og_lease_read_save", {"p_county": county, "p_instrument": j["instrument"], "p_status": "skipped",
+                                                       "p_error": "no index site the server can open for this county"})
+                    continue
                 p, browser = get_playwright_browser()
                 try:
                     ctx = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
