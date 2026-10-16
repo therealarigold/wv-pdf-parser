@@ -4418,15 +4418,31 @@ def _idx2_pick(ip, combo, text):
         if (hit < 0) return null; cb.SetSelectedIndex(hit); return cb.GetItem(hit).text; }""", [combo, text])
 
 
+def _idx2_book_lists(ip, book_type, combo="cboBook"):
+    """Every list in the county's book menu that holds this book type, best first (Ari 10/16): the exact name, then the
+    county's own names - 'DEEDS', 'DEED RECORD' - and the split lists, e.g. Logan's 'DEED BOOK' (old) + 'DEED BOOK 08/01/1982'."""
+    t = (book_type or "").upper().strip()
+    core = _re_re.sub(r"\s*\b(BOOKS?|RECORDS?)\b\s*", " ", t).strip()          # 'DEED OF TRUST BOOK' -> 'DEED OF TRUST'
+    alias = {"DEED": ["DEEDS"], "WILL": ["WILLS"], "TRUST DEED": ["DEED OF TRUST"], "DEED OF TRUST": ["TRUST DEED"]}.get(core, [])
+    bad = [w for w in ("TRUST", "TAX", "TRANSFER", "DEATH", "MINERAL") if w not in t]
+    items = _idx2_items(ip, combo, 400)
+    def norm(x): return _re_re.sub(r"\s+", " ", x.upper()).strip()
+    def ok(x): return not any(w in norm(x) for w in bad)
+    exact = [x for x in items if norm(x) in [t, core] + alias]
+    starts = [x for x in items if x not in exact and ok(x) and any(norm(x).startswith(c) for c in [t, core] + alias)]
+    contains = [x for x in items if x not in exact + starts and ok(x) and len(core) >= 3 and core in norm(x)]
+    return exact + starts + contains
+
+
 def _idx2_pick_book(ip, book_type, combo="cboBook"):
     """The county's own name for a book type (Ari 10/15: some counties call it 'DEEDS' or 'DEED RECORD', not 'DEED BOOK')."""
-    t = (book_type or "").upper().strip()
-    if _idx2_pick(ip, combo, t): return True
-    core = _re_re.sub(r"\s*\b(BOOKS?|RECORDS?)\b\s*", " ", t).strip()          # 'DEED OF TRUST BOOK' -> 'DEED OF TRUST'
-    for cand in (core, core.rstrip("S") + "S", core.split(" OF ")[0] if " OF " in core else None,
-                 {"DEED": "DEEDS", "WILL": "WILLS", "TRUST DEED": "DEED OF TRUST", "DEED OF TRUST": "TRUST DEED"}.get(core)):
-        if cand and len(cand) >= 3 and _idx2_pick(ip, combo, cand): return True
-    return False
+    lists = _idx2_book_lists(ip, book_type, combo)
+    return bool(lists) and bool(_idx2_pick_exact(ip, combo, lists[0]))
+
+
+def _idx2_pick_exact(ip, combo, text):
+    return ip.evaluate("""([c, t]) => { const cb = window[c]; if (!cb) return null;
+        for (let k = 0; k < cb.GetItemCount(); k++) if (cb.GetItem(k).text === t) { cb.SetSelectedIndex(k); return t; } return null; }""", [combo, text])
 
 
 def _idx2_items(ip, combo, limit=400):
@@ -4444,16 +4460,26 @@ def _idx2_book_images(ctx, base_url, book_type, book, page, want=2):
     try:
         ip.goto(_idx2_base(base_url) + "/Image.aspx", wait_until="networkidle", timeout=60000)
         ip.wait_for_function("() => typeof cboBook !== 'undefined' && typeof txtBook !== 'undefined'", timeout=30000)
-        if not _idx2_pick_book(ip, book_type):
+        lists = _idx2_book_lists(ip, book_type)
+        if not lists:
             raise ValueError(f"no '{book_type}' in this county's image search - its books are: " + ", ".join(_idx2_items(ip, "cboBook", 60)))
         mb = _re_re.match(r"\s*([A-Za-z]*)\s*(\d+)\s*([A-Za-z]*)", str(book)); mp = _re_re.match(r"\s*(\d+)\s*([A-Za-z]*)", str(page))
         if not (mb and mp): raise ValueError("book and page must be numbers")
-        ip.evaluate("""([b, bs, p, ps]) => { txtBook.SetText(b); txtBookSuffix.SetText(bs); txtPage.SetText(p); txtPageSuffix.SetText(ps);
-                        window.customCommand = 'Search';
-                        window.setTimeout("__doPostBack(document.getElementsByClassName('viewerPanel')[0].id, 'Search')", 0); }""",
-                    [mb.group(2), mb.group(3) or "", mp.group(1), mp.group(2) or ""])
-        try: _idx2_wait_new_image(ip)
-        except Exception: return []
+        found = False
+        for name in lists[:4]:
+            _idx2_pick_exact(ip, "cboBook", name)
+            before = ip.evaluate(_IDX2_BIG_IMG)
+            ip.evaluate("""([b, bs, p, ps]) => { txtBook.SetText(b); txtBookSuffix.SetText(bs); txtPage.SetText(p); txtPageSuffix.SetText(ps);
+                            window.customCommand = 'Search';
+                            window.setTimeout("__doPostBack(document.getElementsByClassName('viewerPanel')[0].id, 'Search')", 0); }""",
+                        [mb.group(2), mb.group(3) or "", mp.group(1), mp.group(2) or ""])
+            try:
+                _idx2_wait_new_image(ip, before, 30000)
+                found = True
+                break
+            except Exception:
+                continue          # a small "not found" banner, or not in this list - try the county's next list
+        if not found: return []
         out = []
         for n in range(max(1, min(want, 6))):
             out.append(ip.evaluate(_IDX2_SHRINK))
@@ -4475,17 +4501,20 @@ def _idx2_vault(ctx, base_url, book_name=None, volume=None, page=None):
     ip = ctx.new_page()
     try:
         ip.goto(_idx2_base(base_url) + "/Vault.aspx", wait_until="networkidle", timeout=60000)
-        ip.wait_for_function("() => typeof cboBook !== 'undefined' && typeof CallVaultPanel !== 'undefined'", timeout=30000)
+        if "login.aspx" in (ip.url or "").lower(): raise ValueError("the Vault needs a login on this site")
+        ip.wait_for_function("() => typeof cboBook !== 'undefined' && typeof CallVaultPanel !== 'undefined'", timeout=45000)
         if not book_name: return _idx2_items(ip, "cboBook"), "index books"
         chosen = _idx2_pick(ip, "cboBook", book_name)
         if not chosen: return _idx2_items(ip, "cboBook"), f"no book like '{book_name}' - these are the books"
         ip.evaluate("() => CallVaultPanel.PerformCallback('BookName')")
-        ip.wait_for_function("() => cboBookNo.GetItemCount() > 0 && !CallVaultPanel.InCallback()", timeout=30000)
+        try: ip.wait_for_function("() => cboBookNo.GetItemCount() > 0 && !CallVaultPanel.InCallback()", timeout=60000)
+        except Exception: return [], f"'{chosen}' has no volumes (an empty book)"
         if not volume: return _idx2_items(ip, "cboBookNo"), f"volumes of {chosen} (usually by the first letters of the surname)"
         vol = _idx2_pick(ip, "cboBookNo", volume)
         if not vol: return _idx2_items(ip, "cboBookNo"), f"no volume '{volume}' - these are the volumes of {chosen}"
         ip.evaluate("() => CallVaultPanel.PerformCallback('Book')")
-        ip.wait_for_function("() => cboPageNo.GetItemCount() > 0 && !CallVaultPanel.InCallback()", timeout=30000)
+        try: ip.wait_for_function("() => cboPageNo.GetItemCount() > 0 && !CallVaultPanel.InCallback()", timeout=60000)
+        except Exception: return [], f"no pages in {chosen} {vol}"
         if page in (None, ""):
             pages = _idx2_items(ip, "cboPageNo", 2000)
             return pages[:40] + (["…"] if len(pages) > 80 else []) + pages[-40:], f"{len(pages)} pages in {chosen} {vol} (page 0 / the first pages are usually the book's own name guide)"
@@ -5522,9 +5551,11 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
             try:
                 imgs = _idx2_book_images(ctx, url, "DEED BOOK", bp[0], bp[1], want=1)
                 out["image_search"] = f"works (deed book {bp[0]}/{bp[1]})" if imgs else f"no picture for deed book {bp[0]}/{bp[1]}"
-                if not imgs:   # image search is for the OLD scanned books (newer deeds open from the index) - try an old one
-                    old_imgs = _idx2_book_images(ctx, url, "DEED BOOK", "1", "1", want=1)
-                    out["image_search"] += " - old books: " + ("deed book 1/1 opens" if old_imgs else "deed book 1/1 did not open either")
+                if not imgs:   # image search is for the OLD scanned books (newer deeds open from the index) - try old ones
+                    hit = None
+                    for ob in ("1", "10", "50", "100", "200"):
+                        if _idx2_book_images(ctx, url, "DEED BOOK", ob, "1", want=1): hit = ob; break
+                    out["image_search"] += " - old books: " + (f"deed book {hit}/1 opens" if hit else "books 1, 10, 50, 100, 200 did not open either")
             except Exception as e:
                 out["image_search"] = "FAILED: " + str(e)[:200]
         try:
@@ -5532,15 +5563,21 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
             if not books:
                 out["vault"] = "no vault books on this site"
             else:
-                vols, _n = _idx2_vault(ctx, url, books[0])
-                if not vols or not isinstance(vols, list):
-                    out["vault"] = f"{len(books)} books, but no volumes in '{books[0]}'"
-                else:
-                    pages, _n = _idx2_vault(ctx, url, books[0], vols[0])
+                deedy = [x for x in books if _re_re.search(r"DEED|GRANTOR|GRANTEE", x, _re_re.I) and not _re_re.search(r"TRUST", x, _re_re.I)]
+                tried, done = [], False
+                for bk in (deedy + [x for x in books if x not in deedy])[:3]:
+                    vols, _n = _idx2_vault(ctx, url, bk)
+                    if not vols or not isinstance(vols, list):
+                        tried.append(f"'{bk}' empty"); continue
+                    pages, _n = _idx2_vault(ctx, url, bk, vols[0])
                     pg1 = next((x for x in (pages or []) if x and x != "…" and x not in ("0", "00")), None)
-                    img, _n = _idx2_vault(ctx, url, books[0], vols[0], pg1) if pg1 else (None, "")
-                    out["vault"] = (f"works ({len(books)} books; {books[0]} vol {vols[0]} page {pg1} opens)" if img and not isinstance(img, list)
-                                    else f"{len(books)} books, page did not open ({books[0]} {vols[0]} {pg1})")
+                    img, _n = _idx2_vault(ctx, url, bk, vols[0], pg1) if pg1 else (None, "")
+                    if img and not isinstance(img, list):
+                        out["vault"] = f"works ({len(books)} books; {bk} vol {vols[0]} page {pg1} opens)"; done = True; break
+                    tried.append(f"'{bk}' {vols[0]} page did not open")
+                if not done:
+                    out["vault"] = (f"{len(books)} books, all empty" if all("empty" in t for t in tried) and len(books) <= 3
+                                    else f"{len(books)} books - " + "; ".join(tried))
         except Exception as e:
             out["vault"] = "FAILED: " + str(e)[:160]
         if with_img:
