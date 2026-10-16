@@ -9940,6 +9940,62 @@ def parcel_fact_loop():
             _t.sleep(300)
 
 
+# ── 🗺️ Parcel outlines for the O&G Intel map (Ari 10/16) ──────────────────────────────────────────────────────────
+# Every found parcel (parcel_fact.pid) -> its outline from the statewide parcel layer (lat/lng, simplified ~5 m) and the
+# centre; parcel_geo_save finds the wells inside it. Public map service, one parcel every ~3 s. fz_config parcel_geo = on.
+def _pg_centre(rings):
+    """area-weighted centre of the biggest ring -> (lat, lng)"""
+    best, best_a = None, -1.0
+    for r in rings:
+        if len(r) < 3: continue
+        a = cx = cy = 0.0
+        for i in range(len(r) - 1):
+            x0, y0 = r[i][0], r[i][1]
+            x1, y1 = r[i + 1][0], r[i + 1][1]
+            f = x0 * y1 - x1 * y0
+            a += f; cx += (x0 + x1) * f; cy += (y0 + y1) * f
+        if abs(a) > best_a:
+            best_a = abs(a)
+            best = (cy / (3 * a), cx / (3 * a)) if a else (sum(p[1] for p in r) / len(r), sum(p[0] for p in r) / len(r))
+    return best
+
+
+def _pg_one(row):
+    d = _pf_get_json(_PF_LAYER + "/0/query", {"where": "GISPID='" + str(row["pid"]).replace("'", "''") + "'", "outFields": "GISPID",
+                                              "returnGeometry": "true", "outSR": "4326", "maxAllowableOffset": "0.00005", "geometryPrecision": "6"})
+    feats = d.get("features") or []
+    rings = [r for f in feats for r in ((f.get("geometry") or {}).get("rings") or [])]
+    if not rings:
+        return "none", None, None, None
+    c = _pg_centre(rings)
+    if not c:
+        return "none", None, None, None
+    return "done", round(c[0], 6), round(c[1], 6), rings
+
+
+def parcel_geo_loop():
+    import time as _t, random as _r
+    _t.sleep(420)
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "parcel_geo"}) or "off") != "on":
+                _t.sleep(900); continue
+            rows = _fz_rpc("parcel_geo_claim", {"p_n": 10}) or []
+            if not rows:
+                _t.sleep(1800); continue
+            for row in rows:
+                try:
+                    st, lat, lng, rings = _pg_one(row)
+                except Exception as e:
+                    print("[parcel-geo] " + row.get("county", "") + " " + row.get("cert", "") + ": " + str(e)[:150], flush=True)
+                    st, lat, lng, rings = "none", None, None, None
+                _fz_rpc("parcel_geo_save", {"p_county": row["county"], "p_cert": row["cert"], "p_status": st,
+                                            "p_lat": lat, "p_lng": lng, "p_geom": rings})
+                _t.sleep(2 + _r.random() * 2)
+        except Exception as e:
+            print("[parcel-geo] " + str(e)[:300], flush=True)
+            _t.sleep(300)
+
 # ── 📄 Notice of Redemption zip (Anne 10/14): every PDF the land app helper saved (ntr_fill_job mode 'images', result
 # pdf_b64) in one zip + a list (county, cert, redeemed on, notice date, paid to redeem, refunded to purchaser), uploaded
 # to the private 'exports' bucket; a 7-day download link goes to fz_config notice_zip_url. Start: fz_config notice_zip='make'.
@@ -10084,6 +10140,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=county_test_loop, daemon=True).start()        # 🧪 full county test when fz_config county_test = 'run' (10/14)
         _og_threading.Thread(target=county_access_loop, daemon=True).start()      # 🚦 red/yellow/green county switches from the main page (10/14)
         _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
+        _og_threading.Thread(target=parcel_geo_loop, daemon=True).start()         # 🗺️ parcel outlines + wells inside for the O&G map (10/16)
         _og_threading.Thread(target=notice_zip_loop, daemon=True).start()         # 📄 Notice of Redemption zip on request (Anne 10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
