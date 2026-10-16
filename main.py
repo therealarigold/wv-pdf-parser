@@ -5490,10 +5490,10 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
                   next((clean(r) for r in rows if clean(r)[0]), (None, None)))
         if bp[0]:
             try:
-                b, pgn = bp; bp = f"{b}/{pgn}"
+                b, pgn = bp; bps = f"{b}/{pgn}"          # keep bp as (book, page) - the image search below needs both numbers
                 brows = _idx2_search(pg, 2, {"txtBook": b, "txtPage": pgn}, "txtPage")
                 rows2 = _idx2_search(pg, 0, {"txtLname": last, "txtFname": first, "txtMname": ""}, "txtFname")
-                out["book_page"] = (f"works ({len(brows)} rows for {bp})" if brows else f"no rows for {bp}") + (" - back to names OK" if rows2 else " - back to names gave NO rows")
+                out["book_page"] = (f"works ({len(brows)} rows for {bps})" if brows else f"no rows for {bps}") + (" - back to names OK" if rows2 else " - back to names gave NO rows")
             except Exception as e:
                 out["book_page"] = "FAILED: " + str(e)[:160]
         # 📜 image search (a book page by book / page - old books too) and 🗄 the Vault (old handwritten index books) (Ari 10/15)
