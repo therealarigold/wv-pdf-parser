@@ -10165,20 +10165,63 @@ def _lr_detail(pg, bookpage, doc=None):
     return det, rows[0].get("image_id")
 
 
-def _lr_tax_spot(county, district, tax_ids):
-    """'Map 12 Parcel 34' / '03-12-34' on a lease -> (lat, lng, radius_m) from the state parcel map, or None."""
-    for t in tax_ids or []:
-        u = str(t).upper()
-        m = _re_re.search(r"MAP\s*([0-9A-Z]+)\D{0,12}?PAR(?:CEL)?\.?\s*([0-9A-Z.]+)", u)
-        mp, pc = (m.group(1), m.group(2)) if m else (None, None)
-        if not mp:
-            m = _re_re.search(r"\b(\d{1,2})\s*-\s*(\d{1,4}[A-Z]?)\s*-\s*(\d{1,4}(?:\.\d+)?)\b", u)
-            if m: mp, pc = m.group(2), m.group(3)
-        if not mp: continue
+_LR_NUM = r"[0-9]{1,4}[A-Z]?"
+_LR_PAR = r"[0-9]{1,4}(?:\.[0-9]{1,4})?"
+
+
+def _lr_tax_pairs(tax_ids, text=""):
+    """The tax map / parcel pairs on a lease, best first -> [(district number or None, map, parcel)] (Ari 10/16 fix):
+    'Map 263 Parcel 13' / 'MAP: 229, PARCEL: 28, 28.1' / 'Map 162 and 182 Parcel 1,1.1' / 'Tax Map 12,13 Parcel 8' /
+    'Map 12 / Parcel 18;18.1' (index box) / '09-246-30.0' / '14-163-p/o 90' / '07-18-88.4' / '16-41' / '16/2' / '3-6.3'.
+    The short 'map-parcel' forms only from the AI's tax ids (in free text they could be dates or book-page)."""
+    out = []
+    srcs = [(str(t).upper(), True) for t in (tax_ids or []) if t] + ([(str(text).upper(), False)] if text else [])
+    for u, from_ai in srcs:
+        u = _re_re.sub(r"\bP/O\b|\bPT\.? OF\b|\bPART OF\b", " ", u)
+        for m in _re_re.finditer(r"MAP\s*(?:NO\.?|#)?\s*:?\s*(" + _LR_NUM + r")((?:\s*(?:,|AND|&)\s*" + _LR_NUM + r")*)[^0-9]{0,14}?"
+                                 r"PAR(?:CEL)?S?\.?\s*(?:NO\.?|#)?\s*:?\s*(" + _LR_PAR + r")", u):
+            out.append((None, m.group(1), m.group(3)))
+        if not from_ai: continue
+        m = _re_re.search(r"\b(\d{1,2})\s*-\s*(" + _LR_NUM + r")\s*-\s*(" + _LR_PAR + r")\b", u)
+        if m:
+            out.append((m.group(1), m.group(2), m.group(3))); continue
+        m = _re_re.fullmatch(r"\s*(?:TAX\s*)?(?:MAP\s*)?(" + _LR_NUM + r")\s*[-/]\s*(" + _LR_PAR + r")\s*", u)
+        if m: out.append((None, m.group(1), m.group(2)))
+    res = []
+    for x in out:
+        if x not in res: res.append(x)
+    return res[:6]
+
+
+def _lr_dist(county, district, code=None, text=""):
+    """The district name the state parcel map uses ('TENMILEOUTSIDE', 'GREEN') from the district number of a tax id
+    ('14-163-90'), the lease's district ('Tenmile District, Harrison County, WV') or the index text ('District CHURCH',
+    'CAMERON DIST'); '' when unsure."""
+    ds = _pf_districts(county)
+    if code:
+        for k, v in ds.items():
+            if v[1] == str(code).zfill(2): return k
+    for u in [(district or "").upper(), (text or "").upper()]:
+        for m in _re_re.finditer(r"([A-Z]+(?:[ -][A-Z]+)?)\s+(?:DISTRICT|DIST)\b|\bDISTRICT\s+([A-Z]+(?:[ -][A-Z]+)?)", u):
+            words = (m.group(1) or m.group(2) or "").replace("-", " ").split()
+            if not words: continue
+            for cand in [" ".join(words), words[-1] if m.group(1) else words[0]]:
+                n = _pf_norm(cand)
+                if n in ds: return n
+                if n + "OUTSIDE" in ds: return n + "OUTSIDE"
+    n = _pf_norm(_re_re.split(r"[,(]", (district or "").upper())[0].replace("DISTRICT", ""))      # just "Liberty"
+    if n and n in ds: return n
+    if n and n + "OUTSIDE" in ds: return n + "OUTSIDE"
+    return ""
+
+
+def _lr_tax_spot(county, district, tax_ids, text=""):
+    """A tax map / parcel on a lease (its AI tax ids or the index text) -> (lat, lng, radius_m) from the state parcel map, or None."""
+    for code, mp, pc in _lr_tax_pairs(tax_ids, text):
         sub = "0"
         if "." in pc: pc, sub = pc.split(".", 1)
         try:
-            a = _pf_parcel(county, district, mp, pc, sub)
+            a = _pf_parcel(county, _lr_dist(county, district, code, text), mp, pc, sub)
         except Exception:
             a = None
         if not a or not a.get("GISPID"): continue
@@ -10187,6 +10230,22 @@ def _lr_tax_spot(county, district, tax_ids):
             acres = float(a.get("CALC_ACRE") or 1)
             return lat, lng, int(max(60, min(1500, (acres * 4047 / 3.1416) ** 0.5)))
     return None
+
+
+def _lr_respot(n=20):
+    """Leases read before the tax map fix (or with no spot yet): try their tax map / parcel again, once each."""
+    rows = _fz_rpc("og_lease_read_respot_claim", {"p_n": n}) or []
+    for j in rows:
+        read = j.get("read") or {}
+        try:
+            spot = _lr_tax_spot(j["county"], read.get("district"), read.get("tax_ids"), j.get("descr") or "")
+        except Exception:
+            spot = None
+        _fz_rpc("og_lease_read_save", {"p_county": j["county"], "p_instrument": j["instrument"], "p_status": "done",
+                                       "p_lat": spot[0] if spot else None, "p_lng": spot[1] if spot else None,
+                                       "p_radius": spot[2] if spot else None, "p_how": "tax_map" if spot else "no_tax"})
+    if rows: print(f"[lease-read] tax map re-check: {len(rows)} leases", flush=True)
+    return len(rows)
 
 
 def _lr_one(ctx, pg, county, url, job):
@@ -10209,7 +10268,7 @@ def _lr_one(ctx, pg, county, url, job):
                 out["read"] = read
                 out["descr"] = " ".join(x for x in [text, read.get("tract_description") or "", read.get("watercourse") or "",
                                                      (read.get("acres") or "") + (" AC" if read.get("acres") else "")] if x).strip()
-    spot = _lr_tax_spot(county, (read or {}).get("district"), (read or {}).get("tax_ids"))
+    spot = _lr_tax_spot(county, (read or {}).get("district"), (read or {}).get("tax_ids"), text)
     if spot:
         out["lat"], out["lng"], out["radius"], out["how"] = spot[0], spot[1], spot[2], "tax_map"
     return out
@@ -10236,7 +10295,7 @@ def _lr_process_in():
                         o["read"] = read
                         o["descr"] = " ".join(x for x in [o["descr"], read.get("tract_description") or "", read.get("watercourse") or "",
                                                          (read.get("acres") or "") + (" AC" if read.get("acres") else "")] if x).strip()
-            spot = _lr_tax_spot(county, (read or {}).get("district"), (read or {}).get("tax_ids"))
+            spot = _lr_tax_spot(county, (read or {}).get("district"), (read or {}).get("tax_ids"), j.get("descr") or "")
             if spot:
                 o["lat"], o["lng"], o["radius"], o["how"] = spot[0], spot[1], spot[2], "tax_map"
         except FzPaused:
@@ -10265,6 +10324,10 @@ def lease_read_loop(worker=0, workers=1):
                     while _lr_process_in(): _t.sleep(2)      # Chrome-lane leases first (no county site needed)
                 except Exception as e:
                     print("[lease-read] chrome lane: " + str(e)[:200], flush=True)
+                try:
+                    _lr_respot(20)                              # tax map re-check of earlier leases (state parcel map only)
+                except Exception as e:
+                    print("[lease-read] tax map re-check: " + str(e)[:200], flush=True)
             v = (_fz_rpc("fz_config_get", {"p_key": "lease_read"}) or "off").strip()
             if v.upper() == "ON:ALL":
                 counties = sorted(c for c in IDX2_SURVEY if c not in PERSON_COUNTIES and c not in _FZ_NO_AUTO)
