@@ -2514,7 +2514,7 @@ SHERIFF_URLS = {
     "MERCER":      "http://mercer.softwaresystems.com",
     "MINERAL":     "http://mineral.softwaresystems.com",
     "MINGO":       "http://mingo.softwaresystems.com",
-    "MONONGALIA":  "http://monongalia.softwaresystems.com",
+    "MONONGALIA":  "https://monongalia.softwaresystems.com",   # https only now (10/16)
     "MONROE":      "http://monroe.softwaresystems.com",
     "MORGAN":      "http://morgan.softwaresystems.com",
     "OHIO":        "http://ohio.softwaresystems.com",
@@ -2536,12 +2536,33 @@ SHERIFF_URLS = {
     "WIRT":        "http://wirt.softwaresystems.com",
     "WOOD":        "http://wood.softwaresystems.com",
     "WYOMING":     "http://wyoming.softwaresystems.com",
-    # NOT on softwaresystems.com - different platform, not supported yet
-    "BARBOUR":     None,  # barbourtax.compiled-technologies.com
-    "MARION":      None,  # marion.wvsheriff.com
-    "NICHOLAS":    None,  # nicholaswv.compiled-technologies.com
-    "PRESTON":     None,  # prestonwv.compiled-technologies.com/WEBTax/
-    "TYLER":       None,  # tylerwv.compiled-technologies.com/WEBTax/
+    "MARION":      "http://marion.softwaresystems.com",      # checked 10/16 - still softwaresystems
+    "NICHOLAS":    "http://nicholas.softwaresystems.com",
+    # NOT on softwaresystems.com - the "WEB Tax Inquiry" system (WEBTAX_URLS below)
+    "BARBOUR":     None,
+    "PRESTON":     None,
+    "TYLER":       None,
+    "PLEASANTS":   None,
+    "WETZEL":      None,
+    "POCAHONTAS":  None,
+    "RITCHIE":     None,
+    "GILMER":      None,
+    "RALEIGH":     None,
+    "WIRT":        None,
+}
+
+# "WEB Tax Inquiry" (compiled-technologies / CSSI) sheriff sites, found 10/16. Ticket detail = <base>Detail.aspx?taxtype=R&year=&ticket=
+WEBTAX_URLS = {
+    "BARBOUR":     "https://barbourtax.compiled-technologies.com/",
+    "PRESTON":     "https://prestonwv.compiled-technologies.com/WEBTax/",
+    "TYLER":       "https://tylerwv.compiled-technologies.com/WEBTax/",
+    "PLEASANTS":   "https://pleasantswv.compiled-technologies.com/WEBTax/",
+    "WETZEL":      "https://wetzeltax.compiled-technologies.com/",
+    "POCAHONTAS":  "https://pocahontastax.compiled-technologies.com/",
+    "RITCHIE":     "https://ritchietax.compiled-technologies.com/",
+    "GILMER":      "https://webtax.gilmercountywv.gov/",
+    "RALEIGH":     "http://rcto-dhbwdrhnmvc.dynamic-m.com/",
+    "WIRT":        "http://taxlookup.wirtcountysheriff.com/",
 }
 
 def get_sheriff_url(county):
@@ -5486,7 +5507,7 @@ def _idx2_county_test_one(browser, county, url, last="SMITH", first="JOHN"):
         # switch to Book & Page and back to the name search - the step that failed in Mercer/Calhoun (10/14)
         # a real DEED with clean numbers (the index has junk like "'13 @ 388" / "0 @ 0" - Ari 10/15: test what Fernando would open)
         clean = lambda r: (lambda b: b if (b[0] and b[1] and b[0].isdigit() and b[1].isdigit() and 2 <= len(b[0]) <= 5 and int(b[1]) > 0) else (None, None))(_idx2_bp(r.get("bookpage")))
-        bp = next((clean(r) for r in rows if _re_re.search(r"DEED", r.get("doc") or "", _re_re.I) and not _re_re.search(r"TRUST|RELEASE", r.get("doc") or "", _re_re.I) and clean(r)[0]),
+        bp = next((clean(r) for r in rows if _re_re.search(r"\bDEED\b", r.get("doc") or "", _re_re.I) and not _re_re.search(r"TRUST|RELEASE", r.get("doc") or "", _re_re.I) and clean(r)[0]),
                   next((clean(r) for r in rows if clean(r)[0]), (None, None)))
         if bp[0]:
             try:
@@ -9650,8 +9671,55 @@ def _og_tax_parse(raw, year, ticket):
         if m: out["gross"], out["net"] = num(m.group(1)), num(m.group(2))
     return out
 
+def _og_webtax_cells(row):
+    return [re.sub(r"\s+", " ", _ogt_html.unescape(re.sub(r"<[^>]+>", " ", c))).replace("\xa0", " ").strip()
+            for c in re.findall(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>", row)]
+
+def _og_webtax_parse(raw, year, ticket):
+    """WEB Tax Inquiry Detail.aspx -> same fields as _og_tax_parse (gross = land + building + minerals, net = assessed)."""
+    t = _og_tax_text(raw)
+    if not re.search(r"Ticket\s+0*%d\b" % int(ticket), t):
+        return None
+    def grab(rx):
+        m = re.search(rx, t)
+        return m.group(1).strip() if m else None
+    num = lambda v: float(v.replace(",", "")) if v and re.match(r"^-?[\d,]*\.?\d+$", v) else None
+    out = {"account": grab(r"Account\s+([\d-]+)\s+District"),
+           "owner": grab(r"Name 1\s+(.*?)\s+(?:Address 1|Name 2|In Care of|Real Estate)"),
+           "property": grab(r"Description\s+(.*?)\s+Class\s+Land Value")}
+    m = re.search(r'(?is)id="[^"]*grdValue".*?</table>', raw)
+    if m:
+        rows = [r for r in (_og_webtax_cells(x) for x in re.findall(r"(?is)<tr[^>]*RowStyle[^>]*>(.*?)</tr>", m.group(0))) if len(r) >= 6]
+        if rows:
+            out["tax_class"] = rows[0][0] or None
+            out["gross"] = sum((num(r[1]) or 0) + (num(r[2]) or 0) + (num(r[3]) or 0) for r in rows)
+            out["net"] = sum(num(r[5]) or 0 for r in rows)
+    m = re.search(r"\d\d/\d\d/\d{4}\s+BILLING\s+(-?[\d,]*\.\d\d)", t)
+    if m:
+        out["half_tax"] = num(m.group(1))
+    return out
+
+def _og_webtax_fetch(county, year, ticket):
+    base = WEBTAX_URLS[county]
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_ogt_cj.CookieJar()))
+    op.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
+    try:
+        op.open(base, timeout=25).read()
+    except Exception as e:
+        return "unreachable", {"error": str(e)[:200]}
+    try:
+        raw = op.open(base + "Detail.aspx?taxtype=R&year=%s&ticket=%d&ticketsuff=" % (year, int(ticket)), timeout=30).read().decode("utf-8", "replace")
+    except Exception as e:
+        return "error", {"error": str(e)[:200]}
+    d = _og_webtax_parse(raw, year, ticket)
+    if d is None or not d.get("account"):
+        return "missing", {"error": "no ticket page for this year/ticket"}
+    return "done", d
+
 def _og_tax_fetch(county, year, ticket):
     """-> (status, data). status: done / missing / unreachable / error"""
+    if county in WEBTAX_URLS:
+        return _og_webtax_fetch(county, year, ticket)
     base = get_sheriff_url(county)
     if not base:
         return "missing", {"error": "this county's sheriff site is a different system (not read yet)"}
