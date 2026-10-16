@@ -2778,6 +2778,7 @@ async def scrape_sheriff_v2(county, ticket, cert, auction_name, page):
 # member's Supabase token; the Render cron sends X-Worker-Key (WORKER_KEY env). WORKER_AUTH=enforce refuses the rest;
 # until then (log mode) requests without a valid login are only written to the log, so nothing breaks while we learn
 # who calls what. Square's webhook has its own signature check and is never gated.
+_CORS_OK = {"https://portal.annelabes.com", "https://singular-druid-0d7e78.netlify.app"}
 _AUTH_OPEN = {"/", "/health", "/square-webhook"}
 _AUTH_CACHE = {}
 
@@ -2805,17 +2806,58 @@ def _auth_ok(headers):
     return ok, who
 
 
+# 🔒 Speed limit per caller (Ari 10/16): a signed-in staff member or the worker key gets 240 requests a minute, anyone
+# else is refused anyway. Refusals and floods go to the portal's Security list (sec_event), one note per caller per 10 min.
+_RATE = {}
+_RATE_NOTED = {}
+_RATE_PER_MIN = int(os.environ.get("SERVER_RATE_PER_MIN", "240") or 240)
+
+
+def _sec_note(kind, who, ip, path, detail=None):
+    import time as _t
+    k = (kind, who)
+    if _RATE_NOTED.get(k, 0) > _t.time() - 600: return
+    _RATE_NOTED[k] = _t.time()
+    if len(_RATE_NOTED) > 2000: _RATE_NOTED.clear()
+    try: _fz_rpc("sec_event_add", {"p_kind": kind, "p_who": who, "p_ip": ip, "p_path": path, "p_detail": detail})
+    except Exception: pass
+
+
+def _client_ip(handler):
+    h = handler.headers
+    return (h.get("CF-Connecting-IP") or (h.get("X-Forwarded-For") or "").split(",")[0] or handler.client_address[0] or "").strip()[:60]
+
+
+def _refuse(handler, code, msg):
+    body = ('{"error":"' + msg + '"}').encode()
+    handler.send_response(code); handler.send_header('Content-Type', 'application/json'); handler._cors()
+    handler.send_header('Content-Length', len(body)); handler.end_headers(); handler.wfile.write(body)
+
+
 def _auth_gate(handler, path):
-    """True = go ahead. In enforce mode answers 401 itself and returns False."""
+    """True = go ahead. In enforce mode answers 401 / 429 itself and returns False."""
+    import time as _t
     if path in _AUTH_OPEN: return True
     ok, who = _auth_ok(handler.headers)
-    if ok: return True
+    ip = _client_ip(handler)
+    if ok:
+        minute = int(_t.time() // 60)
+        k = (who, minute)
+        _RATE[k] = _RATE.get(k, 0) + 1
+        if len(_RATE) > 5000:
+            for old in [x for x in _RATE if x[1] < minute]: _RATE.pop(old, None)
+        if who != "worker-key" and _RATE[k] > _RATE_PER_MIN:
+            print(f"[auth] TOO FAST {path} ({who})", flush=True)
+            _sec_note("rate_limit", "server:" + str(who), ip, path, {"per_min": _RATE_PER_MIN})
+            _refuse(handler, 429, "too many requests - please slow down")
+            return False
+        return True
     ref = (handler.headers.get("Referer") or handler.headers.get("Origin") or "-")[:80]
     if os.environ.get("WORKER_AUTH", "").strip().lower() == "enforce":
         print(f"[auth] REFUSED {path} ({who}) from {ref}", flush=True)
-        body = b'{"error":"sign in required"}'
-        handler.send_response(401); handler.send_header('Content-Type', 'application/json'); handler._cors()
-        handler.send_header('Content-Length', len(body)); handler.end_headers(); handler.wfile.write(body)
+        if path not in ("/robots.txt", "/favicon.ico"):
+            _sec_note("refused", "server:ip:" + ip, ip, path, {"why": who, "from": ref})
+        _refuse(handler, 401, "sign in required")
         return False
     print(f"[auth] would refuse {path} ({who}) from {ref}", flush=True)
     return True
@@ -2828,7 +2870,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200); self._cors(); self.end_headers()
 
     def _cors(self):
-        self.send_header('Access-Control-Allow-Origin','*')
+        # 🔒 only the portal's own pages may call from a browser (Ari 10/16; was *)
+        origin = (self.headers.get('Origin') or '').strip()
+        allowed = origin if origin in _CORS_OK else 'https://portal.annelabes.com'
+        self.send_header('Access-Control-Allow-Origin', allowed)
+        self.send_header('Vary', 'Origin')
         self.send_header('Access-Control-Allow-Methods','POST, GET, OPTIONS')
         self.send_header('Access-Control-Allow-Headers','Content-Type, Authorization, X-Worker-Key')
 
