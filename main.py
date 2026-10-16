@@ -9996,6 +9996,60 @@ def parcel_geo_loop():
             print("[parcel-geo] " + str(e)[:300], flush=True)
             _t.sleep(300)
 
+# ── 📍 USGS place names for locating mineral tracts (Ari 10/16) ─────────────────────────────────────────────────────
+# Every named creek / run / hollow / ridge / town in WV from the USGS Geographic Names file (public, ~1 MB) -> og_place
+# (og_place_usgs_put). Once: fz_config usgs_places = 'load' (set back to 'done ...'). Streams keep mouth + head.
+USGS_WV_NAMES = "https://prd-tnm.s3.amazonaws.com/StagedProducts/GeographicNames/DomesticNames/DomesticNames_WV_Text.zip"
+
+
+def _usgs_load():
+    import zipfile
+    raw = urllib.request.urlopen(urllib.request.Request(USGS_WV_NAMES, headers={"User-Agent": "Mozilla/5.0"}), timeout=120).read()
+    z = zipfile.ZipFile(io.BytesIO(raw))
+    name = next(n for n in z.namelist() if n.lower().endswith(".txt"))
+    lines = z.read(name).decode("utf-8-sig", "replace").splitlines()
+    hdr = lines[0].split("|")
+    ix = {k: hdr.index(k) for k in ("feature_id", "feature_name", "feature_class", "state_numeric", "county_name",
+                                    "prim_lat_dec", "prim_long_dec", "source_lat_dec", "source_long_dec")}
+    skip = {"Civil", "Census", "Military"}
+    rows, n = [], 0
+    for ln in lines[1:]:
+        f = ln.split("|")
+        if len(f) < len(hdr) or f[ix["state_numeric"]] != "54" or f[ix["feature_class"]] in skip: continue
+        try:
+            lat, lng = float(f[ix["prim_lat_dec"]] or 0), float(f[ix["prim_long_dec"]] or 0)
+        except ValueError:
+            continue
+        if not lat or not lng: continue
+        try:
+            lat2, lng2 = float(f[ix["source_lat_dec"]] or 0), float(f[ix["source_long_dec"]] or 0)
+        except ValueError:
+            lat2 = lng2 = 0.0
+        rows.append({"id": f[ix["feature_id"]], "name": f[ix["feature_name"]], "cls": f[ix["feature_class"]],
+                     "county": f[ix["county_name"]], "lat": lat, "lng": lng,
+                     "lat2": lat2 if lat2 else "", "lng2": lng2 if lng2 else ""})
+        if len(rows) >= 500:
+            n += int(_fz_rpc("og_place_usgs_put", {"p_rows": rows}) or 0); rows = []
+    if rows: n += int(_fz_rpc("og_place_usgs_put", {"p_rows": rows}) or 0)
+    return n
+
+
+def usgs_places_loop():
+    import time as _t
+    _t.sleep(240)
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "usgs_places"}) or "").strip() == "load":
+                _fz_rpc("fz_config_set", {"p_key": "usgs_places", "p_value": "loading"})
+                n = _usgs_load()
+                _fz_rpc("fz_config_set", {"p_key": "usgs_places", "p_value": "done " + _re_dt.utcnow().isoformat()[:16] + " " + str(n)})
+                print(f"[usgs] {n} places loaded", flush=True)
+        except Exception as e:
+            print("[usgs] " + str(e)[:300], flush=True)
+            try: _fz_rpc("fz_config_set", {"p_key": "usgs_places", "p_value": "load"})
+            except Exception: pass
+        _t.sleep(900)
+
 # ── 📄 Notice of Redemption zip (Anne 10/14): every PDF the land app helper saved (ntr_fill_job mode 'images', result
 # pdf_b64) in one zip + a list (county, cert, redeemed on, notice date, paid to redeem, refunded to purchaser), uploaded
 # to the private 'exports' bucket; a 7-day download link goes to fz_config notice_zip_url. Start: fz_config notice_zip='make'.
@@ -10141,6 +10195,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=county_access_loop, daemon=True).start()      # 🚦 red/yellow/green county switches from the main page (10/14)
         _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
         _og_threading.Thread(target=parcel_geo_loop, daemon=True).start()         # 🗺️ parcel outlines + wells inside for the O&G map (10/16)
+        _og_threading.Thread(target=usgs_places_loop, daemon=True).start()        # 📍 USGS place names for locating mineral tracts (10/16)
         _og_threading.Thread(target=notice_zip_loop, daemon=True).start()         # 📄 Notice of Redemption zip on request (Anne 10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
