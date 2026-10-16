@@ -10087,6 +10087,132 @@ def usgs_places_loop():
             except Exception: pass
         _t.sleep(900)
 
+# ── 📖 The slow lease reader (Ari 10/16) ─────────────────────────────────────────────────────────────────────────────
+# Leases signed by owners of our certificates (og_lease_read, seeded per county). Per lease, at a person's pace:
+#   1. the index detail boxes under the grid (free): full description, cross references, every name
+#   2. only when they say too little: the first 2 pages read by AI (the cheaper reader model)
+#   3. a tax map / parcel on the lease -> the state parcel map -> an exact spot
+# fz_config lease_read = 'on:MARSHALL,TYLER' (counties the server can reach); 'off' stops it.
+_IDX2_ASK["lease"] = ("a recorded oil and gas lease (or its memorandum / amendment / ratification)", {
+    "lessors": "array", "lessee": "string", "lease_date": "string", "acres": "string", "district": "string",
+    "watercourse": "string", "tract_description": "string", "adjoiners": "array", "prior_deed_reference": "string",
+    "tax_ids": "array", "wells_or_units": "array"})
+_LR_CHEAP = os.environ.get("LEASE_READ_MODEL", "claude-sonnet-5")
+
+
+def _lr_detail(pg, bookpage, doc=None):
+    """The index boxes for the paper at 'BOOK @ PAGE' + its image id (one Book & Page search + one click)."""
+    b, pgno = _idx2_bp(bookpage)
+    if not b: return None, None
+    rows = [r for r in _idx2_search(pg, 2, {"txtBook": b, "txtPage": pgno}, "txtPage") if _idx2_bp(r["bookpage"]) == (b, pgno)]
+    if doc: rows = [r for r in rows if r["doc"].upper() == doc.upper()] or rows
+    if not rows: return None, None
+    prev = pg.evaluate(_IDX2_DETAIL)
+    pg.locator("#" + rows[0]["_rid"]).locator("td").nth(3).click()
+    det = prev
+    for _ in range(24):
+        pg.wait_for_timeout(250)
+        if pg.evaluate("() => (window.grdNames && grdNames.InCallback()) || grd.InCallback()"): continue
+        det = pg.evaluate(_IDX2_DETAIL)
+        if det != prev and det.get("names"): break
+    det["names"] = [" ".join(x for x in n if x) for n in det.get("names") or []]
+    return det, rows[0].get("image_id")
+
+
+def _lr_tax_spot(county, district, tax_ids):
+    """'Map 12 Parcel 34' / '03-12-34' on a lease -> (lat, lng, radius_m) from the state parcel map, or None."""
+    for t in tax_ids or []:
+        u = str(t).upper()
+        m = _re_re.search(r"MAP\s*([0-9A-Z]+)\D{0,12}?PAR(?:CEL)?\.?\s*([0-9A-Z.]+)", u)
+        mp, pc = (m.group(1), m.group(2)) if m else (None, None)
+        if not mp:
+            m = _re_re.search(r"\b(\d{1,2})\s*-\s*(\d{1,4}[A-Z]?)\s*-\s*(\d{1,4}(?:\.\d+)?)\b", u)
+            if m: mp, pc = m.group(2), m.group(3)
+        if not mp: continue
+        sub = "0"
+        if "." in pc: pc, sub = pc.split(".", 1)
+        try:
+            a = _pf_parcel(county, district, mp, pc, sub)
+        except Exception:
+            a = None
+        if not a or not a.get("GISPID"): continue
+        st, lat, lng, rings = _pg_one({"pid": a["GISPID"]})
+        if st == "done":
+            acres = float(a.get("CALC_ACRE") or 1)
+            return lat, lng, int(max(60, min(1500, (acres * 4047 / 3.1416) ** 0.5)))
+    return None
+
+
+def _lr_one(ctx, pg, county, url, job):
+    det, image_id = _lr_detail(pg, job.get("book_page"), job.get("doc_type"))
+    if det is None:
+        return {"status": "failed", "error": "not found by book & page in the county index"}
+    text = " ".join([det.get("description") or "", det.get("legal") or ""]).strip()
+    out = {"status": "done", "detail": det, "descr": text}
+    says_little = (not text) or _idx2_says_little(text) or not _re_re.search(r"\b(RUN|CREEK|CR|FORK|BRANCH|LICK|HOLLOW|RIDGE|MAP|PARCEL)\b", text.upper())
+    read = None
+    if says_little and image_id:
+        imgs = _idx2_pages(ctx, url, image_id, 2)
+        if imgs:
+            _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "lease_read", county, job.get("instrument")
+            try:
+                read = _idx2_read_doc("lease", imgs, model=_LR_CHEAP)
+            finally:
+                _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
+            if read and not read.get("error"):
+                out["read"] = read
+                out["descr"] = " ".join(x for x in [text, read.get("tract_description") or "", read.get("watercourse") or "",
+                                                     (read.get("acres") or "") + (" AC" if read.get("acres") else "")] if x).strip()
+    spot = _lr_tax_spot(county, (read or {}).get("district"), (read or {}).get("tax_ids"))
+    if spot:
+        out["lat"], out["lng"], out["radius"], out["how"] = spot[0], spot[1], spot[2], "tax_map"
+    return out
+
+
+def lease_read_loop():
+    import time as _t, random as _r
+    _t.sleep(480)
+    while True:
+        try:
+            v = (_fz_rpc("fz_config_get", {"p_key": "lease_read"}) or "off").strip()
+            counties = [c.strip().upper() for c in v[3:].split(",") if c.strip()] if v.startswith("on:") else []
+            counties = [c for c in counties if (c in IDX2_URLS or c in IDX2_SURVEY) and c not in PERSON_COUNTIES]
+            if not counties:
+                _t.sleep(900); continue
+            jobs = _fz_rpc("og_lease_read_claim", {"p_counties": counties, "p_n": 5}) or []
+            if not jobs:
+                _t.sleep(1800); continue
+            by = {}
+            for j in jobs: by.setdefault(j["county"], []).append(j)
+            for county, lst in by.items():
+                url = IDX2_URLS.get(county) or IDX2_SURVEY[county]
+                p, browser = get_playwright_browser()
+                try:
+                    ctx = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+                    pg = ctx.new_page()
+                    _idx2_open(pg, county, url)
+                    for j in lst:
+                        try:
+                            o = _lr_one(ctx, pg, county, url, j)
+                        except FzPaused:
+                            o = {"status": "queued", "error": "AI paused (spending limit)"}
+                        except Exception as e:
+                            o = {"status": "failed", "error": str(e)[:250]}
+                        _fz_rpc("og_lease_read_save", {"p_county": county, "p_instrument": j["instrument"], "p_status": o.get("status"),
+                                                       "p_detail": o.get("detail"), "p_read": o.get("read"), "p_descr": o.get("descr"),
+                                                       "p_lat": o.get("lat"), "p_lng": o.get("lng"), "p_radius": o.get("radius"),
+                                                       "p_how": o.get("how"), "p_error": o.get("error")})
+                        print(f"[lease-read] {county} {j['instrument']}: {o.get('status')} {'AI' if o.get('read') else 'index'} {o.get('how') or ''} {(o.get('error') or '')[:80]}", flush=True)
+                        _t.sleep(15 + _r.random() * 15)          # a person's pace
+                finally:
+                    try: browser.close()
+                    except Exception: pass
+                    try: p.stop()
+                    except Exception: pass
+        except Exception as e:
+            print("[lease-read] " + str(e)[:300], flush=True)
+            _t.sleep(300)
+
 # ── 📄 Notice of Redemption zip (Anne 10/14): every PDF the land app helper saved (ntr_fill_job mode 'images', result
 # pdf_b64) in one zip + a list (county, cert, redeemed on, notice date, paid to redeem, refunded to purchaser), uploaded
 # to the private 'exports' bucket; a 7-day download link goes to fz_config notice_zip_url. Start: fz_config notice_zip='make'.
@@ -10233,6 +10359,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
         _og_threading.Thread(target=parcel_geo_loop, daemon=True).start()         # 🗺️ parcel outlines + wells inside for the O&G map (10/16)
         _og_threading.Thread(target=usgs_places_loop, daemon=True).start()        # 📍 USGS place names for locating mineral tracts (10/16)
+        _og_threading.Thread(target=lease_read_loop, daemon=True).start()         # 📖 the slow lease reader (10/16)
         _og_threading.Thread(target=notice_zip_loop, daemon=True).start()         # 📄 Notice of Redemption zip on request (Anne 10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
