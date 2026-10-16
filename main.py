@@ -10266,6 +10266,28 @@ def lease_read_loop(worker=0, workers=1):
             print("[lease-read] " + str(e)[:300], flush=True)
             _t.sleep(300)
 
+# 🔒 The daily State Auditor refresh runs INSIDE the server (security fix, Ari 10/16): it used to be a Render cron calling
+# /refresh-wvsao with no login, which kept the server's lock (WORKER_AUTH=enforce) from being switched on. Once a day at
+# 07:00 UTC (after a restart it catches up the same day); the day done is kept in fz_config daily_refresh_last.
+def daily_refresh_loop():
+    import time as _t
+    _t.sleep(300)
+    while True:
+        try:
+            now = _re_dt.utcnow()
+            today = now.strftime("%Y-%m-%d")
+            if now.hour >= 7 and (_fz_rpc("fz_config_get", {"p_key": "daily_refresh_last"}) or "") != today:
+                _fz_rpc("fz_config_set", {"p_key": "daily_refresh_last", "p_value": today})
+                print(f"[daily] State Auditor refresh (daily_recent) {today}", flush=True)
+                try:
+                    run_wvsao_refresh_sync(scope="daily_recent")
+                except Exception:
+                    import traceback; traceback.print_exc()
+                run_og_refresh_if_due()          # well production: once a week
+        except Exception as e:
+            print("[daily] " + str(e)[:200], flush=True)
+        _t.sleep(300)
+
 # ── 📄 Notice of Redemption zip (Anne 10/14): every PDF the land app helper saved (ntr_fill_job mode 'images', result
 # pdf_b64) in one zip + a list (county, cert, redeemed on, notice date, paid to redeem, refunded to purchaser), uploaded
 # to the private 'exports' bucket; a 7-day download link goes to fz_config notice_zip_url. Start: fz_config notice_zip='make'.
@@ -10412,6 +10434,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
         _og_threading.Thread(target=parcel_geo_loop, daemon=True).start()         # 🗺️ parcel outlines + wells inside for the O&G map (10/16)
         _og_threading.Thread(target=usgs_places_loop, daemon=True).start()        # 📍 USGS place names for locating mineral tracts (10/16)
+        _og_threading.Thread(target=daily_refresh_loop, daemon=True).start()      # 🔒 the daily State Auditor refresh, inside the server (10/16)
         for _w in range(LEASE_READ_WORKERS):                                    # 📖 the slow lease reader (10/16), several counties side by side
             _og_threading.Thread(target=lease_read_loop, args=(_w, LEASE_READ_WORKERS), daemon=True).start()
         _og_threading.Thread(target=notice_zip_loop, daemon=True).start()         # 📄 Notice of Redemption zip on request (Anne 10/14)
