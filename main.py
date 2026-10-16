@@ -10203,20 +10203,31 @@ def _lr_process_in():
         print(f"[lease-read] {county} {j['instrument']} (Chrome): {o.get('status')} {'AI' if o.get('read') else 'index'} {o.get('how') or ''} {(o.get('error') or '')[:80]}", flush=True)
     return len(rows)
 
-def lease_read_loop():
+LEASE_READ_WORKERS = 2          # the server has 2 GB / 1 CPU (10/16: ~0.8 GB used, 1.4 GB peaks) - more browsers risk a restart
+
+
+def lease_read_loop(worker=0, workers=1):
+    """Worker `worker` of `workers` (Ari 10/16: several counties side by side, each site still at a person's pace):
+    each worker reads its own share of the counties; worker 0 also does the Chrome lane and new-certificate leases.
+    fz_config lease_read = 'on:ALL' (every county the server can open) or 'on:MARSHALL,TYLER'."""
     import time as _t, random as _r
-    _t.sleep(480)
+    _t.sleep(480 + worker * 20)
     while True:
         try:
-            try:
-                while _lr_process_in(): _t.sleep(2)          # Chrome-lane leases first (no county site needed)
-            except Exception as e:
-                print("[lease-read] chrome lane: " + str(e)[:200], flush=True)
+            if worker == 0:
+                try:
+                    while _lr_process_in(): _t.sleep(2)      # Chrome-lane leases first (no county site needed)
+                except Exception as e:
+                    print("[lease-read] chrome lane: " + str(e)[:200], flush=True)
             v = (_fz_rpc("fz_config_get", {"p_key": "lease_read"}) or "off").strip()
-            counties = [c.strip().upper() for c in v[3:].split(",") if c.strip()] if v.startswith("on:") else []
-            counties = [c for c in counties if (c in IDX2_URLS or c in IDX2_SURVEY) and c not in PERSON_COUNTIES]
-            # counties switched on + (always) leases of new certificates in green counties (option 1, 10/16)
-            jobs = _fz_rpc("og_lease_read_claim", {"p_counties": counties, "p_n": 5}) or []
+            if v.upper() == "ON:ALL":
+                counties = sorted(c for c in IDX2_SURVEY if c not in PERSON_COUNTIES and c not in _FZ_NO_AUTO)
+            else:
+                counties = [c.strip().upper() for c in v[3:].split(",") if c.strip()] if v.startswith("on:") else []
+                counties = [c for c in counties if (c in IDX2_URLS or c in IDX2_SURVEY) and c not in PERSON_COUNTIES]
+            counties = [c for i, c in enumerate(sorted(counties)) if i % workers == worker]
+            # this worker's counties + (worker 0 only) leases of new certificates in green counties (option 1, 10/16)
+            jobs = _fz_rpc("og_lease_read_claim", {"p_counties": counties, "p_n": 5, "p_new": worker == 0}) or []
             if not jobs:
                 _t.sleep(300 if counties else 600); continue
             by = {}
@@ -10401,7 +10412,8 @@ if __name__ == '__main__':
         _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
         _og_threading.Thread(target=parcel_geo_loop, daemon=True).start()         # 🗺️ parcel outlines + wells inside for the O&G map (10/16)
         _og_threading.Thread(target=usgs_places_loop, daemon=True).start()        # 📍 USGS place names for locating mineral tracts (10/16)
-        _og_threading.Thread(target=lease_read_loop, daemon=True).start()         # 📖 the slow lease reader (10/16)
+        for _w in range(LEASE_READ_WORKERS):                                    # 📖 the slow lease reader (10/16), several counties side by side
+            _og_threading.Thread(target=lease_read_loop, args=(_w, LEASE_READ_WORKERS), daemon=True).start()
         _og_threading.Thread(target=notice_zip_loop, daemon=True).start()         # 📄 Notice of Redemption zip on request (Anne 10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
