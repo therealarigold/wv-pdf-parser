@@ -10169,19 +10169,57 @@ def _lr_one(ctx, pg, county, url, job):
     return out
 
 
+def _lr_process_in():
+    """Chrome-lane leases (Harrison ...): the helper sent the boxes (+ pictures when needed) - read the pictures, find a tax
+    map spot, save. Returns how many were finished."""
+    rows = _fz_rpc("og_lease_read_claim_in", {"p_n": 5}) or []
+    for j in rows:
+        county = j["county"]
+        o = {"status": "done", "descr": j.get("descr") or ""}
+        try:
+            read = None
+            if j.get("need_pics") and j.get("req_id"):
+                imgs = _fz_rpc("og_lease_read_pics", {"p_county": county, "p_req": j["req_id"]}) or []
+                if imgs:
+                    _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "lease_read", county, j.get("instrument")
+                    try:
+                        read = _idx2_read_doc("lease", [x.replace("\n", "") for x in imgs], model=_LR_CHEAP)
+                    finally:
+                        _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
+                    if read and not read.get("error"):
+                        o["read"] = read
+                        o["descr"] = " ".join(x for x in [o["descr"], read.get("tract_description") or "", read.get("watercourse") or "",
+                                                         (read.get("acres") or "") + (" AC" if read.get("acres") else "")] if x).strip()
+            spot = _lr_tax_spot(county, (read or {}).get("district"), (read or {}).get("tax_ids"))
+            if spot:
+                o["lat"], o["lng"], o["radius"], o["how"] = spot[0], spot[1], spot[2], "tax_map"
+        except FzPaused:
+            o = {"status": "in", "error": "AI paused (spending limit)"}
+        except Exception as e:
+            o = {"status": "failed", "error": str(e)[:250]}
+        _fz_rpc("og_lease_read_save", {"p_county": county, "p_instrument": j["instrument"], "p_status": o.get("status"),
+                                       "p_read": o.get("read"), "p_descr": o.get("descr"), "p_lat": o.get("lat"), "p_lng": o.get("lng"),
+                                       "p_radius": o.get("radius"), "p_how": o.get("how"), "p_error": o.get("error")})
+        print(f"[lease-read] {county} {j['instrument']} (Chrome): {o.get('status')} {'AI' if o.get('read') else 'index'} {o.get('how') or ''} {(o.get('error') or '')[:80]}", flush=True)
+    return len(rows)
+
 def lease_read_loop():
     import time as _t, random as _r
     _t.sleep(480)
     while True:
         try:
+            try:
+                while _lr_process_in(): _t.sleep(2)          # Chrome-lane leases first (no county site needed)
+            except Exception as e:
+                print("[lease-read] chrome lane: " + str(e)[:200], flush=True)
             v = (_fz_rpc("fz_config_get", {"p_key": "lease_read"}) or "off").strip()
             counties = [c.strip().upper() for c in v[3:].split(",") if c.strip()] if v.startswith("on:") else []
             counties = [c for c in counties if (c in IDX2_URLS or c in IDX2_SURVEY) and c not in PERSON_COUNTIES]
             if not counties:
-                _t.sleep(900); continue
+                _t.sleep(120); continue
             jobs = _fz_rpc("og_lease_read_claim", {"p_counties": counties, "p_n": 5}) or []
             if not jobs:
-                _t.sleep(1800); continue
+                _t.sleep(300); continue
             by = {}
             for j in jobs: by.setdefault(j["county"], []).append(j)
             for county, lst in by.items():
