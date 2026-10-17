@@ -471,6 +471,49 @@ def send_site_contact(p):
     return status, detail
 
 
+# ── 📬 "We saw your new certificates" (Ari 10/17, step 3; mail_outbox 'web_offer', made by web_offer_scan with a daily cap):
+# the certificates a client just bought that we have no job for, a link to the order page with them ticked, and a stop link.
+def send_web_offer(p):
+    o = _rpc("web_offer_for_mail", {"p_id": p.get("id")}) or {}
+    if not o.get("id"):
+        return "failed", "offer not found"
+    if o.get("status") != "queued":
+        return "skipped", "offer is " + str(o.get("status"))
+    to = (o.get("email") or "").strip()
+    if not to:
+        _rpc("web_offer_mark", {"p_id": o["id"], "p_status": "failed"}); return "failed", "no email"
+    site = _env("WEB_SITE_URL", "https://annelabes-site.netlify.app").rstrip("/")
+    certs = o.get("certs") or []
+    n = len(certs)
+    name = (o.get("name") or "").strip()
+    first = html.escape((name.title() if name.isupper() else name) or "there")      # names are often "Last First" - use it whole
+    rows = "".join("<tr><td style='padding:3px 12px 3px 0;white-space:nowrap'><b>" + html.escape(c.get("county") or "") + "</b></td><td style='padding:3px 12px 3px 0;white-space:nowrap'>"
+                   + html.escape(c.get("cert") or "") + "</td><td style='padding:3px 0;color:#4b5563'>" + html.escape((c.get("property") or "")[:70]) + "</td></tr>" for c in certs[:12])
+    more = ("<p style='color:#6b7280'>…and " + str(n - 12) + " more.</p>") if n > 12 else ""
+    link = site + "/order.html?offer=" + o["token"]
+    stop = site + "/order.html?stop=" + o["token"]
+    total = _money(n * 500)
+    subject = ("We saw your new certificate" if n == 1 else "We saw your %d new certificates" % n) + " — want us to do the title work?"
+    body = (f"<p>Hi {first},</p><p>The State Auditor's list shows you bought {'a new certificate' if n == 1 else str(n) + ' new certificates'}. "
+            f"Would you like us to handle the title work, as before? It's $500 per certificate — title search, Notice to Redeem, "
+            f"the packet to the State Auditor and the first round of supplemental notices.</p>"
+            f"<table style='border-collapse:collapse;font-size:14px;margin:10px 0'>{rows}</table>{more}"
+            + _button(link, "Choose and order online") +
+            f"<p>The link opens our order page with {'it' if n == 1 else 'them'} ticked — untick any you'd rather keep yourself "
+            f"({'$500' if n == 1 else 'all ' + str(n) + ' = ' + total}). You sign online and can pay by card, by check or at the office. "
+            f"Or just reply to this email or call us at (304) 615-8978.</p>"
+            f"<p style='color:#9ca3af;font-size:12px;margin-top:22px'>You get this because you're a client of the Office of Anne Labes, Esq., "
+            f"1507 Saint Mary's Ave, Parkersburg, WV 26101. <a href='{html.escape(stop, quote=True)}' style='color:#9ca3af'>Don't send me these emails</a>.</p>")
+    text = (f"Hi {first},\n\nThe State Auditor's list shows you bought {n} new certificate(s):\n"
+            + "\n".join("- " + (c.get('county') or '') + " " + (c.get('cert') or '') for c in certs[:30])
+            + f"\n\nWant us to do the title work ($500 each)? Choose and order: {link}\n\nOr call (304) 615-8978.\n\n"
+            f"Office of Anne Labes, Esq., 1507 Saint Mary's Ave, Parkersburg, WV 26101. Stop these emails: {stop}")
+    status, detail = _resend(to, subject, _wrap(body), text, None, bcc=True)
+    if status in ("sent", "failed"):
+        _rpc("web_offer_mark", {"p_id": o["id"], "p_status": status})
+    return status, detail
+
+
 def mailer_loop():
     have = lambda k: "yes" if _env(k) else "NO"
     print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ") — keys: resend " + have("RESEND_API_KEY")
@@ -518,10 +561,11 @@ def mailer_loop():
                     print(f"[mailer] redeemed_filing #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
-                n = _rpc("mail_outbox_next", {"p_kinds": ["surplus_agreement_email", "surplus_signed", "site_contact"]})
+                n = _rpc("mail_outbox_next", {"p_kinds": ["surplus_agreement_email", "surplus_signed", "site_contact", "web_offer"]})
                 if n:
                     try:
                         status, detail = (send_site_contact(n["payload"] or {}) if n["kind"] == "site_contact"
+                                          else send_web_offer(n["payload"] or {}) if n["kind"] == "web_offer"
                                           else send_surplus(n["kind"], n["id"], n["payload"] or {}))
                     except Exception as ex:
                         status, detail = "failed", str(ex)[:300]
