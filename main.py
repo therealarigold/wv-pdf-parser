@@ -4742,7 +4742,11 @@ def _idx2_read_doc(kind, images, model=None):
         "clause (for a deed of trust: the deed that gave the borrower the property, often in the exhibit), if present. "
         "tract_sources (deeds) = one entry PER TRACT / PARCEL conveyed: its short description, then the deed it came from exactly "
         "as written (e.g. 'Tract 2: 1/5 acre on Main St, Poca - same property conveyed by X to Y, Deed Book 500 page 10'). "
-        "tax_ids = tax map / parcel numbers as written."})
+        "tax_ids = tax map / parcel numbers as written. "
+        "lessor_interests (leases) = one entry per lessor: the name, then the interest that lessor owns or leases exactly as "
+        "written (e.g. 'Mary A. Smith - an undivided 1/6 interest', 'John Doe - 50% of the oil and gas', 'Jane Roe - life estate'); "
+        "interest_leased (leases) = what the lease covers as written (e.g. 'all of Lessor's undivided 1/12 interest in the oil and gas'); "
+        "royalty (leases) = the royalty as written (e.g. 'one-eighth (1/8)', '15%'); net_acres (leases) = net mineral acres if stated."})
     import anthropic
     client = anthropic.Anthropic(api_key=key)
     if _ai_paused(): raise FzPaused(FZ_PAUSE_MSG)
@@ -10149,7 +10153,9 @@ def usgs_places_loop():
 _IDX2_ASK["lease"] = ("a recorded oil and gas lease (or its memorandum / amendment / ratification)", {
     "lessors": "array", "lessee": "string", "lease_date": "string", "acres": "string", "district": "string",
     "watercourse": "string", "tract_description": "string", "adjoiners": "array", "prior_deed_reference": "string",
-    "tax_ids": "array", "wells_or_units": "array"})
+    "tax_ids": "array", "wells_or_units": "array",
+    # 🌳 Mineral Tree (Ari 10/17 "we need to really use the info on the lease"): who owns what % of the tract
+    "lessor_interests": "array", "interest_leased": "string", "royalty": "string", "net_acres": "string"})
 _LR_CHEAP = os.environ.get("LEASE_READ_MODEL", "claude-sonnet-5")
 
 
