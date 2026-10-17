@@ -88,6 +88,8 @@ def signed_html(e, subtitle="WV Tax Lien Title Services"):
     if e.get("esign_consent_at"):        # ✍️ the consent step before signing (Ari 10/17)
         rec.insert(2, ("Agreed to sign electronically", _et(e.get("esign_consent_at"))
                        + (" · IP " + esc(e.get("esign_consent_ip")) if e.get("esign_consent_ip") else "")))
+    if e.get("doc_hash"):                # 🔒 the document fingerprint (Ari 10/17)
+        rec.append(("Document fingerprint (SHA-256)", "<span style='font-family:monospace;word-break:break-all'>" + esc(e.get("doc_hash")) + "</span>"))
     consent = ("<div class='rec'><h4>Consent to use electronic records and signatures (as the client saw it)</h4><div style='white-space:pre-wrap'>"
                + esc(e.get("esign_consent_text")) + "</div></div>") if e.get("esign_consent_text") else ""
     css = ("@page{size:letter;margin:0.8in 0.9in}body{font:11.5pt/1.5 Georgia,'Times New Roman',serif;color:#111;max-width:7in;margin:0 auto}"
@@ -102,7 +104,10 @@ def signed_html(e, subtitle="WV Tax Lien Title Services"):
             + "".join(parts)
             + "<div class='rec'><h4>Electronic signature record</h4><table>" + "".join("<tr><td>" + a + "</td><td>" + b + "</td></tr>" for a, b in rec) + "</table>"
             + "<div style='margin-top:6px;color:#666'>Signed electronically on portal.annelabes.com. The client typed their name, drew their signature and ticked "
-            + "“I have read this agreement and I agree to it.” The text above is exactly what the client saw and signed.</div></div>" + consent + "</body></html>")
+            + "“I have read this agreement and I agree to it.” The text above is exactly what the client saw and signed."
+            + (" The document fingerprint is a code made from everything signed (text, name, signature, time, IP address, device, consent); "
+               "if even one letter were changed later, the code would no longer match." if e.get("doc_hash") else "")
+            + "</div></div>" + consent + "</body></html>")
 
 
 def signed_pdf(e, subtitle="WV Tax Lien Title Services"):
