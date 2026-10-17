@@ -9859,7 +9859,12 @@ def og_tax_loop():
                 if st == "unreachable":
                     down.add(c)
                 print(f"[ogtax] {c} {y} #{tk}: {st} {d.get('gross', '')} {('book ' + d['deed_book'] + '/' + str(d.get('deed_page'))) if d.get('deed_book') else ''} {d.get('error', '')}"[:200], flush=True)
-                _t.sleep(5 + _r.random() * 4)     # the counties are taken in turn: each sheriff site sees one visit every few minutes
+                # Ari 10/17: "slower pace so we wont get marked as ddos ... we have time" - one page every ~20-30 s overall
+                # (fz_config og_tax_gap = seconds, default 20); the counties are taken in turn, so each sheriff site sees
+                # one visit every 15-20 minutes
+                try: gap = float(_fz_rpc("fz_config_get", {"p_key": "og_tax_gap"}) or 20)
+                except Exception: gap = 20
+                _t.sleep(max(10, gap) + _r.random() * 10)
         except Exception as e:
             print("[ogtax] " + str(e)[:300], flush=True)
             _t.sleep(300)
