@@ -492,6 +492,15 @@ def build_portal_invite(p):
     return ("[TEST] " if p.get("test") else "") + "Your new client portal is ready", _wrap(body), text
 
 
+# ✉️ A one-off note from the office to one client (mail_outbox office_email: subject + html + text made in the database or
+# by Claude on Ari's word). Wrapped like the other client emails, from marci@annelabes.com, office bcc.
+def send_office_email(p):
+    to = (p.get("to") or "").strip()
+    if not to or not p.get("subject") or not p.get("html"):
+        return "failed", "to, subject and html are needed"
+    return _resend(to, p["subject"], _wrap(p["html"]), p.get("text") or "", bcc=True)
+
+
 def send_portal_invite(p):
     to = (p.get("to") or "").strip()
     if not to:
@@ -652,10 +661,10 @@ def mailer_loop():
                     print(f"[mailer] ntr_packet #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
-                n = _rpc("mail_outbox_next", {"p_kinds": ["ntr_reminder", "portal_invite"]})
+                n = _rpc("mail_outbox_next", {"p_kinds": ["ntr_reminder", "portal_invite", "office_email"]})
                 if n:
                     try:
-                        status, detail = (send_portal_invite if n.get("kind") == "portal_invite" else send_ntr_reminder)(n["payload"] or {})
+                        status, detail = {"portal_invite": send_portal_invite, "office_email": send_office_email}.get(n.get("kind"), send_ntr_reminder)(n["payload"] or {})
                     except Exception as ex:
                         status, detail = "failed", str(ex)[:300]
                     _rpc("mail_outbox_done", {"p_id": n["id"], "p_status": status, "p_detail": detail})
