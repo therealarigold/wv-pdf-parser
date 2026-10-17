@@ -399,6 +399,59 @@ def send_ntr_packet(oid, p):
     return _resend(to, p.get("subject") or "Your tax lien packet", p.get("html") or "", p.get("text") or "", atts, bcc=True)
 
 
+# 📬 NTR packet reminder (Ari 2026-10-17): every 2 days while a packet waits to be mailed, until the client presses
+# "I mailed it" in the portal (database ntr_reminder_scan). One email per client for all of their waiting packets; no
+# attachment (the packet came with the first email and is in the portal).
+def build_ntr_reminder(p):
+    certs = p.get("certs") or []
+    name = (p.get("name") or "").strip()
+    first = name.split(" ")[0].title() if name and not any(w in name.upper() for w in ("LLC", "INC", "CORP", "TRUST", "COMPANY", "LTD")) else ""
+    hi = ("Hi " + html.escape(first) + ",") if first else "Hello,"
+    n = len(certs)
+    if n == 1:
+        c = certs[0]
+        subject = "Reminder: your NTR packet for " + c.get("county", "") + " " + c.get("cert", "") + " is waiting to be mailed"
+    else:
+        subject = "Reminder: " + str(n) + " NTR packets are waiting to be mailed"
+    rows = []
+    for c in certs:
+        days = c.get("days_left")
+        left = (" (" + str(days) + " day" + ("" if days == 1 else "s") + " left)") if isinstance(days, int) else ""
+        rows.append("<li style='margin:4px 0'><b>" + html.escape(str(c.get("county", ""))) + " County, Certificate " + html.escape(str(c.get("cert", "")))
+                    + "</b><br>Check to the WVSAO: <b>" + _money(c.get("total")) + "</b> · last day to file: "
+                    + html.escape(str(c.get("deadline", ""))) + html.escape(left) + "</li>")
+    checks = "one check to the WVSAO" if n == 1 else "a separate check to the WVSAO for each certificate (please do not combine them)"
+    body = ("<p>" + hi + "</p>"
+            "<p>This is a friendly reminder that your Notice to Redeem packet" + ("" if n == 1 else "s are") + (" is" if n == 1 else "")
+            + " ready and still need" + ("s" if n == 1 else "") + " to be mailed to the State Auditor:</p>"
+            "<ul style='padding-left:20px'>" + "".join(rows) + "</ul>"
+            "<p style='margin-bottom:4px'><b>What to do:</b></p><ol style='margin-top:0;padding-left:20px'>"
+            "<li>Log in to your portal and download your packet (it was also attached to our earlier email).</li>"
+            "<li>Print all of it.</li>"
+            "<li>Write " + checks + ".</li>"
+            "<li>Mail the packet and the check" + ("" if n == 1 else "s") + " together to: <b>WVSAO, 1900 Kanawha Blvd E, Building 1, Room W114, Charleston, WV 25305</b></li></ol>"
+            "<p>Once it is in the mail, press <b>“I mailed it”</b> in your portal and these reminders stop.</p>"
+            + _button(_env("PORTAL_URL", "https://portal.annelabes.com"), "Log in to your portal") +
+            "<p>Already mailed it, or would you like us to mail it for you? Just reply to this email or call us at (304) 615-8978.</p>")
+    text = ("Reminder: your NTR packet(s) are ready and still need to be mailed to the State Auditor.\n"
+            + "\n".join("- " + str(c.get("county", "")) + " County, Certificate " + str(c.get("cert", "")) + ": check " + _money(c.get("total"))
+                         + ", last day to file " + str(c.get("deadline", "")) for c in certs)
+            + "\n\n1. Log in to your portal (https://portal.annelabes.com) and download your packet.\n2. Print all of it.\n3. Write "
+            + checks + ".\n4. Mail the packet and the check(s) to: WVSAO, 1900 Kanawha Blvd E, Building 1, Room W114, Charleston, WV 25305.\n\n"
+            "Once it is in the mail, press \"I mailed it\" in your portal and these reminders stop. Questions? Reply or call (304) 615-8978.")
+    return ("[TEST] " if p.get("test") else "") + subject, _wrap(body), text
+
+
+def send_ntr_reminder(p):
+    to = (p.get("to") or "").strip()
+    if not to:
+        return "failed", "no email address"
+    if not p.get("certs"):
+        return "skipped", "no packets in the reminder"
+    subject, body, text = build_ntr_reminder(p)
+    return _resend(to, subject, body, text)
+
+
 # 🔄 Redeemed filing (Ari + Anne 2026-10-07): the verified title search letter + notes of a redeemed certificate, to the
 # Auditor's title verification box (fz_config redeemed_filing_to; a test address until Ari switches it on). Office bcc.
 def send_redeemed_filing(oid, p):
@@ -549,6 +602,16 @@ def mailer_loop():
                         status, detail = "failed", str(ex)[:300]
                     _rpc("ntr_packet_done", {"p_outbox": n["id"], "p_status": status, "p_detail": detail})
                     print(f"[mailer] ntr_packet #{n['id']}: {status} {detail[:120]}", flush=True)
+                    time.sleep(2 if status != "queued" else 60); continue
+            if not job and _env("RESEND_API_KEY"):
+                n = _rpc("mail_outbox_next", {"p_kinds": ["ntr_reminder"]})
+                if n:
+                    try:
+                        status, detail = send_ntr_reminder(n["payload"] or {})
+                    except Exception as ex:
+                        status, detail = "failed", str(ex)[:300]
+                    _rpc("mail_outbox_done", {"p_id": n["id"], "p_status": status, "p_detail": detail})
+                    print(f"[mailer] ntr_reminder #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
                 n = _rpc("mail_outbox_next", {"p_kinds": ["redeemed_filing"]})
