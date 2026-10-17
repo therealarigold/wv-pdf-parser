@@ -388,6 +388,10 @@ def send_ntr_packet(oid, p):
     files = _rpc("ntr_packet_files", {"p_outbox": oid}) or []
     if not files:
         return "failed", "no packets found for this email"
+    # Ari 10/17: the NTR stays on our server - the email says to log in to the client portal and download it. Only an
+    # email made before that change (its text still says "Attached") gets the PDFs.
+    if "Attached" not in (p.get("text") or ""):
+        return _resend(to, p.get("subject") or "Your tax lien packet", p.get("html") or "", p.get("text") or "", None, bcc=True)
     atts = []
     for f in files:
         w = PdfWriter()
@@ -426,17 +430,17 @@ def build_ntr_reminder(p):
             + " ready and still need" + ("s" if n == 1 else "") + " to be mailed to the State Auditor:</p>"
             "<ul style='padding-left:20px'>" + "".join(rows) + "</ul>"
             "<p style='margin-bottom:4px'><b>What to do:</b></p><ol style='margin-top:0;padding-left:20px'>"
-            "<li>Log in to your portal and download your packet (it was also attached to our earlier email).</li>"
+            "<li>Log in to your client portal and download your packet.</li>"
             "<li>Print all of it.</li>"
             "<li>Write " + checks + ".</li>"
             "<li>Mail the packet and the check" + ("" if n == 1 else "s") + " together to: <b>WVSAO, 1900 Kanawha Blvd E, Building 1, Room W114, Charleston, WV 25305</b></li></ol>"
             "<p>Once it is in the mail, press <b>“I mailed it”</b> in your portal and these reminders stop.</p>"
-            + _button(_env("PORTAL_URL", "https://portal.annelabes.com"), "Log in to your portal") +
+            + _button(_env("PORTAL_URL", "https://portal.annelabes.com") + "/#client-login", "Log in to your portal") +
             "<p>Already mailed it, or would you like us to mail it for you? Just reply to this email or call us at (304) 615-8978.</p>")
     text = ("Reminder: your NTR packet(s) are ready and still need to be mailed to the State Auditor.\n"
             + "\n".join("- " + str(c.get("county", "")) + " County, Certificate " + str(c.get("cert", "")) + ": check " + _money(c.get("total"))
                          + ", last day to file " + str(c.get("deadline", "")) for c in certs)
-            + "\n\n1. Log in to your portal (https://portal.annelabes.com) and download your packet.\n2. Print all of it.\n3. Write "
+            + "\n\n1. Log in to your portal (https://portal.annelabes.com/#client-login) and download your packet.\n2. Print all of it.\n3. Write "
             + checks + ".\n4. Mail the packet and the check(s) to: WVSAO, 1900 Kanawha Blvd E, Building 1, Room W114, Charleston, WV 25305.\n\n"
             "Once it is in the mail, press \"I mailed it\" in your portal and these reminders stop. Questions? Reply or call (304) 615-8978.")
     return ("[TEST] " if p.get("test") else "") + subject, _wrap(body), text
