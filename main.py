@@ -9758,6 +9758,9 @@ def _og_tax_parse(raw, year, ticket):
         "owner": grab(r"Owner Name:\s*(.*?)\s*In Care of:"),
         "property": grab(r"Property:\s*(.*?)\s*Map:"),
         "tax_class": grab(r"Tax Class:\s*(\d)"),
+        # 🏛 the ticket's deed book / page (Ari 10/17 - untangles "MINERAL INTEREST" tickets; "WB52" = Will Book 52)
+        "deed_book": grab(r"Book:\s*(\S*)\s*Page:"),
+        "deed_page": grab(r"Page:\s*(\S*)\s*Tax Class:"),
     }
     m = re.search(r"Total\s+([\d,]+)\s+([\d,]+)\s+([\d,]*\.\d\d)", t)
     if m:
@@ -9855,8 +9858,8 @@ def og_tax_loop():
                 _fz_rpc("og_tax_save", {"p_county": c, "p_year": y, "p_ticket": tk, "p_status": st, "p_data": d})
                 if st == "unreachable":
                     down.add(c)
-                print(f"[ogtax] {c} {y} #{tk}: {st} {d.get('gross', '')} {d.get('error', '')}"[:200], flush=True)
-                _t.sleep(12 + _r.random() * 8)
+                print(f"[ogtax] {c} {y} #{tk}: {st} {d.get('gross', '')} {('book ' + d['deed_book'] + '/' + str(d.get('deed_page'))) if d.get('deed_book') else ''} {d.get('error', '')}"[:200], flush=True)
+                _t.sleep(5 + _r.random() * 4)     # the counties are taken in turn: each sheriff site sees one visit every few minutes
         except Exception as e:
             print("[ogtax] " + str(e)[:300], flush=True)
             _t.sleep(300)
