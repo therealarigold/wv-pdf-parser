@@ -9147,8 +9147,13 @@ def sao_parse_approval(t):
         "subsequent_taxes": amt("Subsequent Taxes:"), "back_taxes": amt("Back Taxes:"),
         "certification_fee": amt("Certification Fee"), "publication_fee": amt("Publication Fee"), "auditor_fee": amt("Auditor's Fee"),
         "courthouse_fee": amt("Courthouse Facility Improvement Fund"),
-        "bid": amt("Amount of Bid"), "amount_due": amt("Amount Due"), "surplus": amt("Surplus"),
+        # 2024 sales say "Amount of Bid"; 2025+ sales say "Amount Bid" (after "Amount Due") - Ari 10/17
+        "bid": amt("Amount of Bid") if amt("Amount of Bid") is not None else amt("Amount Bid"),
+        "amount_due": amt("Amount Due"), "surplus": amt("Surplus"),
     }
+    # Still no bid (a layout we haven't seen): every letter has due + surplus = bid, so never leave it empty.
+    if out["bid"] is None and out["amount_due"] is not None and out["surplus"] is not None:
+        out["bid"], out["bid_from"] = round(out["amount_due"] + out["surplus"], 2), "due+surplus"
     tp = _sao_block(t, "Taxpayer:", [r"^\{", r"^\d{4} \d{4} \d{4}", r"Delinquent Taxes"])
     if tp: out["taxpayer"], out["taxpayer_address"] = tp[0], ", ".join(tp[1:4])
     pu = _sao_block(t, "Purchaser:", [r"^\{", r"^Page \d"])
@@ -9466,6 +9471,8 @@ def sao_read_cert(site, job):
         letters = out["ntr"]["letters"]
         last = max(letters, key=lambda l: l.get("ntr_date") or "") if letters else {}
         out["ntr"].update({k: last.get(k) for k in ("ntr_date", "redeem_by", "deed_on_or_after", "redeem_total", "title_work_cost") if last.get(k) is not None})
+    if "sale" in out and out["sale"].get("bid") is None:
+        out["error"] = "approval letter read but no bid amount found - check the letter layout"   # shows up, never silent
     if "sale" not in out: out["error"] = "no approval letter read" + ("; " + "; ".join(out.get("doc_errors", [])) if out.get("doc_errors") else "")
     return out
 
