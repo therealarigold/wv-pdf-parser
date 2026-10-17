@@ -492,6 +492,33 @@ def build_portal_invite(p):
     return ("[TEST] " if p.get("test") else "") + "Your new client portal is ready", _wrap(body), text
 
 
+# 📱 Texts through Twilio (Ari 2026-10-17): the toll-free number TWILIO_FROM, an API key (TWILIO_API_KEY + TWILIO_API_SECRET,
+# pasted into Render by Ari - never in the code). Who may get a text, the words and the 9 am - 8 pm window are decided by the
+# database (sms_outbox). Twilio error 21610 = the person replied STOP -> the database turns their texting off.
+def send_sms(to, body):
+    to = (to or "").strip()
+    if not re.match(r"^\+1\d{10}$", to) or not body:
+        return "failed", None, "bad number or empty text", False
+    url = "https://api.twilio.com/2010-04-01/Accounts/" + _env("TWILIO_ACCOUNT_SID") + "/Messages.json"
+    data = urllib.parse.urlencode({"From": _env("TWILIO_FROM"), "To": to, "Body": body[:600]}).encode()
+    auth = base64.b64encode((_env("TWILIO_API_KEY") + ":" + _env("TWILIO_API_SECRET")).encode()).decode()
+    req = urllib.request.Request(url, data=data, method="POST", headers={"Authorization": "Basic " + auth,
+                                                                         "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read() or b"{}")
+        return "sent", out.get("sid"), "twilio " + str(out.get("status") or ""), False
+    except urllib.error.HTTPError as ex:
+        try:
+            err = json.loads(ex.read() or b"{}")
+        except Exception:
+            err = {}
+        code = err.get("code")
+        if ex.code in (429, 500, 502, 503, 504):
+            return "queued", None, "twilio busy " + str(ex.code), False
+        return "failed", None, "twilio " + str(code) + ": " + str(err.get("message") or ex.code)[:200], code == 21610
+
+
 # ✉️ A one-off note from the office to one client (mail_outbox office_email: subject + html + text made in the database or
 # by Claude on Ari's word). Wrapped like the other client emails, from marci@annelabes.com, office bcc.
 def send_office_email(p):
@@ -670,6 +697,16 @@ def mailer_loop():
                     _rpc("mail_outbox_done", {"p_id": n["id"], "p_status": status, "p_detail": detail})
                     print(f"[mailer] {n.get('kind')} #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
+            if not job and _env("TWILIO_ACCOUNT_SID") and _env("TWILIO_API_KEY") and _env("TWILIO_API_SECRET") and _env("TWILIO_FROM"):
+                t = _rpc("sms_outbox_next", {})
+                if t:
+                    try:
+                        status, sid, detail, opted_out = send_sms(t.get("to"), t.get("body"))
+                    except Exception as ex:
+                        status, sid, detail, opted_out = "failed", None, str(ex)[:300], False
+                    _rpc("sms_outbox_done", {"p_id": t["id"], "p_status": status, "p_sid": sid, "p_detail": detail, "p_opted_out": opted_out})
+                    print(f"[mailer] sms #{t['id']}: {status} {detail[:120]}", flush=True)
+                    time.sleep(2); continue
             if not job and _env("RESEND_API_KEY"):
                 n = _rpc("mail_outbox_next", {"p_kinds": ["redeemed_filing"]})
                 if n:
