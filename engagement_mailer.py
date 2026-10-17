@@ -85,6 +85,11 @@ def signed_html(e):
     rec = [("Signed by", esc(e.get("signer_name"))), ("Signed on", _et(e.get("signed_at"))), ("Agreement sent", _et(e.get("created_at"))),
            ("First opened by the client", _et(e.get("viewed_at"))), ("IP address", esc(e.get("signer_ip") or "—")),
            ("Device", esc(e.get("signer_agent") or "—")), ("Agreement version", esc(e.get("version") or "")), ("Document ID", esc(e.get("id")))]
+    if e.get("esign_consent_at"):        # ✍️ the consent step before signing (Ari 10/17)
+        rec.insert(2, ("Agreed to sign electronically", _et(e.get("esign_consent_at"))
+                       + (" · IP " + esc(e.get("esign_consent_ip")) if e.get("esign_consent_ip") else "")))
+    consent = ("<div class='rec'><h4>Consent to use electronic records and signatures (as the client saw it)</h4><div style='white-space:pre-wrap'>"
+               + esc(e.get("esign_consent_text")) + "</div></div>") if e.get("esign_consent_text") else ""
     css = ("@page{size:letter;margin:0.8in 0.9in}body{font:11.5pt/1.5 Georgia,'Times New Roman',serif;color:#111;max-width:7in;margin:0 auto}"
            ".lh{text-align:center;border-bottom:2px solid #1e3a8a;padding-bottom:10px;margin-bottom:22px}.lh .n{font-size:20pt;letter-spacing:.5px;color:#1e3a8a}"
            ".lh .s{font:9.5pt Arial,sans-serif;color:#555;margin-top:2px}p{margin:0 0 10px;text-align:justify}h3{font-size:12pt;margin:16px 0 6px}"
@@ -97,7 +102,7 @@ def signed_html(e):
             + "".join(parts)
             + "<div class='rec'><h4>Electronic signature record</h4><table>" + "".join("<tr><td>" + a + "</td><td>" + b + "</td></tr>" for a, b in rec) + "</table>"
             + "<div style='margin-top:6px;color:#666'>Signed electronically on portal.annelabes.com. The client typed their name, drew their signature and ticked "
-            + "“I have read this agreement and I agree to it.” The text above is exactly what the client saw and signed.</div></div></body></html>")
+            + "“I have read this agreement and I agree to it.” The text above is exactly what the client saw and signed.</div></div>" + consent + "</body></html>")
 
 
 def signed_pdf(e):
