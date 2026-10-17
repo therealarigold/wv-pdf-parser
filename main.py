@@ -10271,6 +10271,7 @@ def _lr_one(ctx, pg, county, url, job):
     read = None
     if says_little and image_id:
         imgs = _idx2_pages(ctx, url, image_id, 2)
+        if imgs: _lr_keep_pics(county, job, imgs)
         if imgs:
             _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "lease_read", county, job.get("instrument")
             try:
@@ -10320,6 +10321,56 @@ def _lr_process_in():
                                        "p_radius": o.get("radius"), "p_how": o.get("how"), "p_error": o.get("error")})
         print(f"[lease-read] {county} {j['instrument']} (Chrome): {o.get('status')} {'AI' if o.get('read') else 'index'} {o.get('how') or ''} {(o.get('error') or '')[:80]}", flush=True)
     return len(rows)
+
+def _lr_keep_pics(county, job, imgs):
+    """🌳 Keep the lease's page pictures in our own bank (idx_image) so a new question never needs the county site again
+    (Ari 10/17). Chrome-lane pictures are already there; server-lane ones get index_id = minus the instrument number."""
+    ins = str(job.get("instrument") or "")
+    if not ins.isdigit() or len(ins) > 18: return
+    for n, b in enumerate(imgs, 1):
+        try:
+            _fz_rpc("idx_image_put_srv", {"p_county": county, "p_index_id": -int(ins), "p_book_page": job.get("book_page") or "",
+                                          "p_page_no": n, "p_mime": "image/jpeg", "p_b64": b})
+        except Exception as e:
+            print(f"[lease-read] picture not kept {county} {ins}: {str(e)[:120]}", flush=True)
+
+
+def lease_reread_loop():
+    """🌳 Re-read leases from OUR saved pictures with the new questions (each lessor's %, what the lease covers, royalty,
+    net acres) - no county site, AI only (Ari 10/17 "i want the %"). fz_config lease_reread = 'HARRISON,...' / 'off'."""
+    import time as _t
+    _t.sleep(240)
+    while True:
+        try:
+            rows = _fz_rpc("og_lease_reread_claim", {"p_n": 1}) or []
+            if not rows:
+                _t.sleep(600); continue
+            for j in rows:
+                county, ins = j["county"], j["instrument"]
+                read, err = None, None
+                try:
+                    imgs = _fz_rpc("og_lease_read_pics", {"p_county": county, "p_req": j["pic_id"]}) or []
+                    if not imgs:
+                        err = "pictures not found"
+                    else:
+                        _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "lease_reread", county, ins
+                        try:
+                            read = _idx2_read_doc("lease", [x.replace(chr(10), "") for x in imgs], model=_LR_CHEAP)
+                        finally:
+                            _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
+                        if read and read.get("error"): err, read = str(read.get("error"))[:200], None
+                except FzPaused:
+                    _fz_rpc("og_lease_reread_done", {"p_county": county, "p_instrument": ins, "p_read": None, "p_error": "AI paused (spending limit)"})
+                    _t.sleep(1800); continue
+                except Exception as e:
+                    err = str(e)[:200]
+                _fz_rpc("og_lease_reread_done", {"p_county": county, "p_instrument": ins, "p_read": read, "p_error": err})
+                print(f"[lease-reread] {county} {ins}: {'ok ' + str(len(read.get('lessor_interests') or [])) + ' lessor %' if read else 'error ' + (err or '')}", flush=True)
+            _t.sleep(3)
+        except Exception as e:
+            print("[lease-reread] " + str(e)[:300], flush=True)
+            _t.sleep(300)
+
 
 LEASE_READ_WORKERS = 2          # the server has 2 GB / 1 CPU (10/16: ~0.8 GB used, 1.4 GB peaks) - more browsers risk a restart
 
@@ -10559,6 +10610,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=daily_refresh_loop, daemon=True).start()      # 🔒 the daily State Auditor refresh, inside the server (10/16)
         for _w in range(LEASE_READ_WORKERS):                                    # 📖 the slow lease reader (10/16), several counties side by side
             _og_threading.Thread(target=lease_read_loop, args=(_w, LEASE_READ_WORKERS), daemon=True).start()
+        _og_threading.Thread(target=lease_reread_loop, daemon=True).start()       # 🌳 lease % from our saved pictures (10/17, fz_config lease_reread)
         _og_threading.Thread(target=notice_zip_loop, daemon=True).start()         # 📄 Notice of Redemption zip on request (Anne 10/14)
         _og_threading.Thread(target=fz_address_suggest_loop, daemon=True).start()  # 📮 address suggestions in the decision box (10/12)
         try:   # 📨 client agreement emails (engagement_mailer.py; waits until RESEND_API_KEY is set; test mode unless ENG_LIVE=1)
