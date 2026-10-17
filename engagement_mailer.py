@@ -456,6 +456,50 @@ def send_ntr_reminder(p):
     return _resend(to, subject, body, text)
 
 
+# 📣 "Your new client portal is ready" (Ari 2026-10-17, wording approved): one email per client (database portal_invite_scan,
+# about 50 a day). Same login button for everyone; saved passwords keep working, "Forgot password?" for the rest.
+def build_portal_invite(p):
+    name = (p.get("name") or "").strip()
+    company = any(w in name.upper() for w in ("LLC", "INC", "CORP", "TRUST", "COMPANY", "LTD", "BANK", "PARTNERS", "HOLDINGS"))
+    first = name.split(" ")[0].title() if name and not company else ""
+    if "," in name and not company:   # "SMITH, JOHN" -> John
+        first = name.split(",")[1].strip().split(" ")[0].title()
+    hi = ("Hi " + html.escape(first) + ",") if first else "Hello,"
+    bidder = html.escape(str(p.get("bidder") or ""))
+    login = _env("PORTAL_URL", "https://portal.annelabes.com") + "/#client-login"
+    body = ("<p>" + hi + "</p>"
+            "<p>We have built a new client portal for you, and we would love for you to try it.</p>"
+            "<p style='margin-bottom:4px'>In your portal you can:</p><ul style='padding-left:20px;margin-top:6px'>"
+            "<li style='margin:5px 0'><b>See where every certificate stands</b>, with a progress bar from payment all the way to the State Auditor</li>"
+            "<li style='margin:5px 0'><b>Download your Notice to Redeem packets</b>, ready to print and mail</li>"
+            "<li style='margin:5px 0'><b>See everything you bought</b> under your bidder number, and what changed since your last visit</li>"
+            "<li style='margin:5px 0'><b>Ask us a question</b> any time</li>"
+            "<li style='margin:5px 0'><b>Book a short phone call</b> at a time that works for you</li></ul>"
+            + _button(login, "Log in to my portal") +
+            "<p>Sign in with your bidder number (" + bidder + ") and your password. Don't have a password, or forgot it? On the sign-in page, "
+            "press <b>“Forgot password?”</b> and we will email you a link to choose a new one.</p>"
+            "<p style='color:#6b7280;font-size:13px'>Tip: on your phone, add the portal to your home screen so it opens with one tap. "
+            "<a href='https://www.annelabes.com/faq.html#home-screen'>Here's how</a>.</p>"
+            "<p>Questions? Just reply to this email or call us at (304) 615-8978.</p>"
+            "<p>Thank you,<br>Marci<br>Office of Anne C. Labes, Esq.<br>(304) 615-8978</p>")
+    text = ((first and "Hi " + first + "," or "Hello,") + "\n\nWe have built a new client portal for you, and we would love for you to try it.\n\n"
+            "In your portal you can:\n- See where every certificate stands, with a progress bar from payment all the way to the State Auditor\n"
+            "- Download your Notice to Redeem packets, ready to print and mail\n- See everything you bought under your bidder number, and what changed since your last visit\n"
+            "- Ask us a question any time\n- Book a short phone call at a time that works for you\n\n"
+            "Log in to your portal: " + login + "\n\nSign in with your bidder number (" + str(p.get("bidder") or "") + ") and your password. "
+            "Don't have a password, or forgot it? On the sign-in page, press \"Forgot password?\" and we will email you a link to choose a new one.\n\n"
+            "Questions? Just reply to this email or call us at (304) 615-8978.\n\nThank you,\nMarci\nOffice of Anne C. Labes, Esq.\n(304) 615-8978")
+    return ("[TEST] " if p.get("test") else "") + "Your new client portal is ready", _wrap(body), text
+
+
+def send_portal_invite(p):
+    to = (p.get("to") or "").strip()
+    if not to:
+        return "failed", "no email address"
+    subject, body, text = build_portal_invite(p)
+    return _resend(to, subject, body, text)
+
+
 # 🔄 Redeemed filing (Ari + Anne 2026-10-07): the verified title search letter + notes of a redeemed certificate, to the
 # Auditor's title verification box (fz_config redeemed_filing_to; a test address until Ari switches it on). Office bcc.
 def send_redeemed_filing(oid, p):
@@ -608,14 +652,14 @@ def mailer_loop():
                     print(f"[mailer] ntr_packet #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
-                n = _rpc("mail_outbox_next", {"p_kinds": ["ntr_reminder"]})
+                n = _rpc("mail_outbox_next", {"p_kinds": ["ntr_reminder", "portal_invite"]})
                 if n:
                     try:
-                        status, detail = send_ntr_reminder(n["payload"] or {})
+                        status, detail = (send_portal_invite if n.get("kind") == "portal_invite" else send_ntr_reminder)(n["payload"] or {})
                     except Exception as ex:
                         status, detail = "failed", str(ex)[:300]
                     _rpc("mail_outbox_done", {"p_id": n["id"], "p_status": status, "p_detail": detail})
-                    print(f"[mailer] ntr_reminder #{n['id']}: {status} {detail[:120]}", flush=True)
+                    print(f"[mailer] {n.get('kind')} #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
                 n = _rpc("mail_outbox_next", {"p_kinds": ["redeemed_filing"]})
