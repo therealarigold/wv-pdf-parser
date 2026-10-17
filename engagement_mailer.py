@@ -61,7 +61,7 @@ def _et(ts):
 
 
 # ── the signed agreement as a letter (same layout as the portal's "Signed copy") ────────────────
-def signed_html(e):
+def signed_html(e, subtitle="WV Tax Lien Title Services"):
     esc = lambda s: html.escape(str(s if s is not None else ""), quote=True)
     f = e.get("fields") or {}
     sig = '<img class="sig" src="' + esc(e.get("signature")) + '" alt="signature">'
@@ -98,20 +98,20 @@ def signed_html(e):
            ".rec{font:9pt/1.45 Arial,sans-serif;color:#333;border:1px solid #1e3a8a;border-radius:6px;padding:10px 14px;margin-top:22px;break-inside:avoid}"
            ".rec h4{margin:0 0 6px;font-size:10pt;color:#1e3a8a}.rec td{padding:1px 10px 1px 0;vertical-align:top}.rec td:first-child{color:#666;white-space:nowrap}")
     return ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Signed agreement — " + esc(f.get("client_name")) + "</title><style>" + css
-            + "</style></head><body><div class='lh'><div class='n'>Anne Labes, Esq.</div><div class='s'>WV Tax Lien Title Services · anne@annelabes.com</div></div>"
+            + "</style></head><body><div class='lh'><div class='n'>Anne Labes, Esq.</div><div class='s'>" + esc(subtitle) + " · anne@annelabes.com</div></div>"
             + "".join(parts)
             + "<div class='rec'><h4>Electronic signature record</h4><table>" + "".join("<tr><td>" + a + "</td><td>" + b + "</td></tr>" for a, b in rec) + "</table>"
             + "<div style='margin-top:6px;color:#666'>Signed electronically on portal.annelabes.com. The client typed their name, drew their signature and ticked "
             + "“I have read this agreement and I agree to it.” The text above is exactly what the client saw and signed.</div></div>" + consent + "</body></html>")
 
 
-def signed_pdf(e):
+def signed_pdf(e, subtitle="WV Tax Lien Title Services"):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         b = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
         try:
             pg = b.new_page()
-            pg.set_content(signed_html(e), wait_until="load")
+            pg.set_content(signed_html(e, subtitle), wait_until="load")
             return pg.pdf(format="Letter", print_background=True, margin={"top": "0.8in", "bottom": "0.8in", "left": "0.9in", "right": "0.9in"})
         finally:
             b.close()
@@ -407,6 +407,46 @@ def send_redeemed_filing(oid, p):
     return _resend(to, p.get("subject") or "Title search", p.get("html") or "", p.get("text") or "", atts, bcc=True)
 
 
+# ── ✍️ Surplus agreements (Ari 10/17, mail_outbox): the link to sign, and once signed the PDF into the case's Files +
+# the person's own copy. The office gets the hidden copy (bcc) like the title search agreement emails.
+SURPLUS_SUB = "Surplus Funds Recovery"
+
+
+def send_surplus(kind, oid, p):
+    e = _rpc("surplus_agreement_for_mail", {"p_id": p.get("id")}) or {}
+    if not e.get("id"):
+        return "failed", "agreement not found"
+    f = e.get("fields") or {}
+    name = (e.get("client_name") or "").strip()
+    first = html.escape(name.split(" ")[0] if name else "there")
+    where = html.escape(((f.get("county") or "") + " County").strip())
+    to = (e.get("email") or "").strip()
+    if not to:
+        return "failed", "no email address"
+    if kind == "surplus_agreement_email":
+        if e.get("status") != "sent":
+            return "skipped", "already " + str(e.get("status"))
+        subject = "Please review and sign — surplus funds agreement (" + ((f.get("county") or "") + " County").strip() + ")"
+        body = (f"<p>Hi {first},</p><p>Thank you for speaking with us about the surplus funds from the tax sale of the property in {where} "
+                f"(certificate {html.escape(f.get('cert_number') or '')}). Please review and sign our agreement online — it takes a few minutes "
+                f"on your phone or computer.</p>" + _button(e["link"], "Review and sign")
+                + "<p>If you have any questions, just reply to this email.</p>")
+        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nPlease review and sign the surplus funds agreement here:\n{e['link']}\n\nMarci · Office of Anne Labes, Esq."
+        return _resend(to, subject, _wrap(body), text, None, bcc=True)
+    if kind == "surplus_signed":
+        pdf = signed_pdf(e, SURPLUS_SUB)
+        safe = "".join(c for c in (name or "client") if c.isalnum() or c in " -_").strip().replace(" ", "-") or "client"
+        fname = f"Signed-Surplus-Agreement-{safe}.pdf"
+        b64 = base64.b64encode(pdf).decode()
+        _rpc("surplus_agreement_file_put", {"p_id": e["id"], "p_filename": fname, "p_b64": b64})     # into the case's Files first
+        subject = "Your signed agreement — Anne Labes, Esq."
+        body = (f"<p>Hi {first},</p><p>Thank you for signing. Your signed agreement is attached as a PDF for your records. "
+                f"Our office will be in touch about the next steps.</p>")
+        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nThank you for signing. Your signed agreement is attached.\n\nMarci · Office of Anne Labes, Esq."
+        return _resend(to, subject, _wrap(body), text, [{"filename": fname, "content": b64}], bcc=True)
+    return "failed", "unknown kind " + kind
+
+
 def mailer_loop():
     have = lambda k: "yes" if _env(k) else "NO"
     print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ") — keys: resend " + have("RESEND_API_KEY")
@@ -452,6 +492,16 @@ def mailer_loop():
                         status, detail = "failed", str(ex)[:300]
                     _rpc("redeemed_filing_done", {"p_outbox": n["id"], "p_status": status, "p_detail": detail})
                     print(f"[mailer] redeemed_filing #{n['id']}: {status} {detail[:120]}", flush=True)
+                    time.sleep(2 if status != "queued" else 60); continue
+            if not job and _env("RESEND_API_KEY"):
+                n = _rpc("mail_outbox_next", {"p_kinds": ["surplus_agreement_email", "surplus_signed"]})
+                if n:
+                    try:
+                        status, detail = send_surplus(n["kind"], n["id"], n["payload"] or {})
+                    except Exception as ex:
+                        status, detail = "failed", str(ex)[:300]
+                    _rpc("mail_outbox_done", {"p_id": n["id"], "p_status": status, "p_detail": detail})
+                    print(f"[mailer] {n['kind']} #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
                 m = _rpc("mail_outbox_next", {"p_kinds": ["call_booked_staff", "call_booked_client", "call_callback_staff"]})
