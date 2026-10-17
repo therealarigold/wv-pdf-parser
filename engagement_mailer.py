@@ -266,13 +266,13 @@ def _office_bcc(to):
     return [x.strip() for x in _env("ENG_BCC", "marci@annelabes.com").split(",") if x.strip() and x.strip().lower() != to.lower()]
 
 
-def _resend(to, subject, body, text, attachments=None, bcc=False):
+def _resend(to, subject, body, text, attachments=None, bcc=False, reply_to=None):
     live = _env("ENG_LIVE") == "1"
     rcpt = [to] if live else [x.strip() for x in _env("ENG_TEST_TO", "ari@eqoppa.com").split(",") if x.strip()]
     if not live:
         subject = f"[TEST → {to}] " + subject
     msg = {"from": _env("ENG_FROM", "Marci at Anne Labes, Esq. <marci@annelabes.com>"), "to": rcpt,
-           "reply_to": _env("ENG_REPLY_TO", "marci@annelabes.com"), "subject": subject, "html": body, "text": text}
+           "reply_to": reply_to or _env("ENG_REPLY_TO", "marci@annelabes.com"), "subject": subject, "html": body, "text": text}
     if attachments:
         msg["attachments"] = attachments
     if bcc and live and _office_bcc(to):
@@ -452,6 +452,25 @@ def send_surplus(kind, oid, p):
     return "failed", "unknown kind " + kind
 
 
+# ── 🌐 annelabes.com contact form (Ari 10/17, mail_outbox 'site_contact'): to the office; "Reply" answers the visitor
+def send_site_contact(p):
+    to = [x.strip() for x in _env("SITE_CONTACT_TO", "marci@annelabes.com").split(",") if x.strip()]
+    esc = lambda v: html.escape(str(v or ""))
+    rows = [("Name", esc(p.get("name"))), ("Email", esc(p.get("email")) or "—"), ("Phone", esc(p.get("phone")) or "—"), ("Page", esc(p.get("page")) or "/")]
+    body = ("<p><b>New message from the website (annelabes.com)</b></p><table style='border-collapse:collapse'>"
+            + "".join("<tr><td style='color:#6b7280;padding:2px 12px 2px 0'>" + a + "</td><td>" + b + "</td></tr>" for a, b in rows)
+            + "</table><div style='margin-top:12px;padding:12px;border:1px solid #e5e7eb;border-radius:8px;white-space:pre-wrap'>" + esc(p.get("message")) + "</div>"
+            + ("<p style='color:#6b7280;font-size:13px'>Press Reply to answer " + esc(p.get("name")) + " directly.</p>" if p.get("email") else
+               "<p style='color:#6b7280;font-size:13px'>No email given - call them back.</p>"))
+    text = f"Website message from {p.get('name')}\nEmail: {p.get('email') or '-'}\nPhone: {p.get('phone') or '-'}\n\n{p.get('message')}"
+    subject = "🌐 Website message — " + str(p.get("name") or "visitor")
+    status, detail = "sent", ""
+    for t in to:
+        status, detail = _resend(t, subject, _wrap(body), text, None, bcc=False, reply_to=p.get("email") or None)
+        if status != "sent": break
+    return status, detail
+
+
 def mailer_loop():
     have = lambda k: "yes" if _env(k) else "NO"
     print("[mailer] started (" + ("LIVE" if _env("ENG_LIVE") == "1" else "TEST MODE") + ") — keys: resend " + have("RESEND_API_KEY")
@@ -499,10 +518,11 @@ def mailer_loop():
                     print(f"[mailer] redeemed_filing #{n['id']}: {status} {detail[:120]}", flush=True)
                     time.sleep(2 if status != "queued" else 60); continue
             if not job and _env("RESEND_API_KEY"):
-                n = _rpc("mail_outbox_next", {"p_kinds": ["surplus_agreement_email", "surplus_signed"]})
+                n = _rpc("mail_outbox_next", {"p_kinds": ["surplus_agreement_email", "surplus_signed", "site_contact"]})
                 if n:
                     try:
-                        status, detail = send_surplus(n["kind"], n["id"], n["payload"] or {})
+                        status, detail = (send_site_contact(n["payload"] or {}) if n["kind"] == "site_contact"
+                                          else send_surplus(n["kind"], n["id"], n["payload"] or {}))
                     except Exception as ex:
                         status, detail = "failed", str(ex)[:300]
                     _rpc("mail_outbox_done", {"p_id": n["id"], "p_status": status, "p_detail": detail})
