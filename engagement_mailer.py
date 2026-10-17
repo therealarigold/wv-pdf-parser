@@ -568,9 +568,16 @@ def send_surplus(kind, oid, p):
     if kind == "surplus_agreement_email":
         if e.get("status") != "sent":
             return "skipped", "already " + str(e.get("status"))
-        subject = "Please review and sign — surplus funds agreement (" + ((f.get("county") or "") + " County").strip() + ")"
-        body = (f"<p>Hi {first},</p><p>Thank you for speaking with us about the surplus funds from the tax sale of the property in {where} "
-                f"(certificate {html.escape(f.get('cert_number') or '')}). Please review and sign our agreement online — it takes a few minutes "
+        n = int(f.get("cert_count") or 1)
+        if n > 1:   # one agreement for all of the owner's certificates (Exhibit A, Ari 10/17)
+            cts = f.get("counties") or ""
+            where_s = cts + (" counties" if " and " in cts else " County")
+            subject = "Please review and sign — surplus funds agreement (" + where_s + ", " + str(n) + " properties)"
+            about = (f"the surplus funds from the tax sale of {n} properties in {html.escape(where_s)} (all listed in Exhibit A of the agreement)")
+        else:
+            subject = "Please review and sign — surplus funds agreement (" + ((f.get("county") or "") + " County").strip() + ")"
+            about = f"the surplus funds from the tax sale of the property in {where} (certificate {html.escape(f.get('cert_number') or '')})"
+        body = (f"<p>Hi {first},</p><p>Thank you for speaking with us about {about}. Please review and sign our agreement online — it takes a few minutes "
                 f"on your phone or computer.</p>" + _button(e["link"], "Review and sign")
                 + "<p>If you have any questions, just reply to this email.</p>")
         text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nPlease review and sign the surplus funds agreement here:\n{e['link']}\n\nMarci · Office of Anne Labes, Esq."
