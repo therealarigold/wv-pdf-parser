@@ -20,6 +20,8 @@ Render environment:
                      ENG_TEST_TO (default ari@eqoppa.com), with the client's address in the subject.
   ENG_FROM         — default "Marci at Anne Labes, Esq. <marci@annelabes.com>"
   ENG_REPLY_TO     — default marci@annelabes.com
+  ENG_BRAND        — the firm's name on every client email, default "Anne Labes, Esq." (one change when the PLLC is formed)
+  WEB_SITE_URL     — the public website (FAQ link), default https://www.annelabes.com
 """
 import base64, hashlib, hmac, html, json, os, re, time, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -100,7 +102,7 @@ def signed_html(e, subtitle="WV Tax Lien Title Services"):
            ".rec{font:9pt/1.45 Arial,sans-serif;color:#333;border:1px solid #1e3a8a;border-radius:6px;padding:10px 14px;margin-top:22px;break-inside:avoid}"
            ".rec h4{margin:0 0 6px;font-size:10pt;color:#1e3a8a}.rec td{padding:1px 10px 1px 0;vertical-align:top}.rec td:first-child{color:#666;white-space:nowrap}")
     return ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Signed agreement — " + esc(f.get("client_name")) + "</title><style>" + css
-            + "</style></head><body><div class='lh'><div class='n'>Anne Labes, Esq.</div><div class='s'>" + esc(subtitle) + " · anne@annelabes.com</div></div>"
+            + "</style></head><body><div class='lh'><div class='n'>" + esc(_brand()) + "</div><div class='s'>" + esc(subtitle) + " · anne@annelabes.com</div></div>"
             + "".join(parts)
             + "<div class='rec'><h4>Electronic signature record</h4><table>" + "".join("<tr><td>" + a + "</td><td>" + b + "</td></tr>" for a, b in rec) + "</table>"
             + "<div style='margin-top:6px;color:#666'>Signed electronically on portal.annelabes.com. The client typed their name, drew their signature and ticked "
@@ -123,11 +125,17 @@ def signed_pdf(e, subtitle="WV Tax Lien Title Services"):
 
 
 # ── the emails ────────────────────────────────────────────────────────────────────────────────
+def _brand():
+    """The firm's name on every client email (ENG_BRAND) - one change when the PLLC is formed (Ari 10/19)."""
+    return _env("ENG_BRAND", "Anne Labes, Esq.")
+
+
 def _wrap(inner):
+    b = html.escape(_brand())
     return ("<div style=\"font:15px/1.55 -apple-system,'Segoe UI',Arial,sans-serif;color:#1f2937;max-width:560px\">"
-            "<div style='font:20px Georgia,serif;color:#1e3a8a;border-bottom:2px solid #1e3a8a;padding-bottom:6px;margin-bottom:16px'>Anne Labes, Esq.</div>"
+            "<div style='font:20px Georgia,serif;color:#1e3a8a;border-bottom:2px solid #1e3a8a;padding-bottom:6px;margin-bottom:16px'>" + b + "</div>"
             + inner +
-            "<p style='color:#6b7280;font-size:13px;margin-top:24px'>Marci · Office of Anne Labes, Esq.<br>WV Tax Lien Title Services · reply to this email with any questions</p></div>")
+            "<p style='color:#6b7280;font-size:13px;margin-top:24px'>Marci · Office of " + b + "<br>WV Tax Lien Title Services · reply to this email with any questions</p></div>")
 
 
 def _button(url, label):
@@ -150,19 +158,58 @@ def build_email(kind, e):
                 ("<p>After you sign, please send your payment by check, or as arranged with our office. We start the title work as soon as it arrives.</p>"
                  if e.get("pay_by") == "check" else
                  "<p>After you sign, you'll get a secure link to pay. We start the title work as soon as the fee is paid.</p>"))
-        text = f"Hi {first},\n\nPlease review and sign your agreement ({n} lien(s), {total}):\n{e['link']}\n\nMarci · Office of Anne Labes, Esq."
+        text = f"Hi {first},\n\nPlease review and sign your agreement ({n} lien(s), {total}):\n{e['link']}\n\nMarci · Office of {_brand()}"
         return subject, _wrap(body), text, None
     if kind == "signed_copy_email":
-        subject = "Your signed agreement — Anne Labes, Esq."
+        # 📦 THE WELCOME PACKET (Ari 10/19 - 4 emails became 2): the signed agreement + the Pay button / how to pay + what
+        # happens next + the client portal + FAQ + a short about-us. Card payers get it once the Square link exists.
+        site = _env("WEB_SITE_URL", "https://www.annelabes.com").rstrip("/")
+        brand = html.escape(_brand())
+        subject = "Welcome — your signed agreement and next steps | " + _brand()
+        box = "background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:12px 16px;margin:16px 0"
+        h = "<div style='font-weight:700;color:#1e3a8a;margin-bottom:4px'>"
+        order = (f"<div style='{box}'>{h}Your order</div>{n} certificate{'' if n == 1 else 's'} × $500 = <b>{total}</b>"
+                 + (f"<div style='color:#4b5563;font-size:13.5px;margin-top:4px'>{liens}</div>" if liens else "") + "</div>")
         if e.get("pay_by") == "bill_later" or e.get("status") == "bill_later":
-            nxt = "<p>We're starting your title work now.</p>"
+            pay = f"<div style='{box}'>{h}Payment</div>Nothing to pay now — we're starting your title work.</div>"
         elif e.get("pay_by") == "check":
-            nxt = f"<p><b>Next step:</b> please send your payment of <b>{total}</b> by check, or as arranged with our office. We start as soon as it arrives.</p>"
+            pay = (f"<div style='{box}'>{h}Payment</div>Please send your payment of <b>{total}</b> by check, or as arranged with our office. "
+                   f"We start your title work as soon as it arrives.</div>")
+        elif e.get("pay_link_url"):
+            pay = (f"<div style='{box}'>{h}Last step: payment</div>We start your title work as soon as the fee of <b>{total}</b> is paid."
+                   + _button(e["pay_link_url"], "Pay " + total + " securely") +
+                   "<div style='font-size:13px;color:#4b5563'>Payment is handled by Square. Prefer to pay by check? Just reply to this email.</div></div>")
         else:
-            nxt = (f"<p><b>Next step:</b> payment of <b>{total}</b>. Your secure payment link will appear on your agreement page "
-                   f"(and we'll send it to you). We start the title work as soon as it's paid.</p>" + _button(e["link"], "Open my agreement page"))
-        body = (f"<p>Hi {html.escape(first)},</p><p>Thank you for signing. Your signed agreement is attached as a PDF for your records.</p>" + nxt)
-        text = f"Hi {first},\n\nThank you for signing. Your signed agreement is attached.\n{e['link']}\n\nMarci · Office of Anne Labes, Esq."
+            pay = (f"<div style='{box}'>{h}Last step: payment</div>We start your title work as soon as the fee of <b>{total}</b> is paid. "
+                   f"Your secure payment link is on your agreement page." + _button(e["link"], "Open my agreement page") + "</div>")
+        nxt = (f"<div style='{box}'>{h}What happens next</div>"
+               "<ol style='margin:4px 0 0 18px;padding:0'><li>We search the county records for each certificate (the title search).</li>"
+               "<li>We prepare your Notice to Redeem and file it with the State Auditor.</li>"
+               "<li>You can follow every step in your client portal — no need to call.</li></ol></div>")
+        bid = html.escape(str(e.get("bidder") or ""))
+        if e.get("portal_account"):
+            portal = (f"<div style='{box}'>{h}Your client portal</div>Sign in any time with your bidder number"
+                      + (f" (<b>{bid}</b>)" if bid else "") + " and your password."
+                      + _button("https://portal.annelabes.com/#client-login", "Client portal sign-in")
+                      + f"<div style='font-size:13px;color:#4b5563'>Forgot your password? Press <i>Forgot password</i> on the sign-in page.</div></div>")
+        elif e.get("hold_login"):
+            portal = f"<div style='{box}'>{h}Your client portal</div>Our office will email you your client portal access shortly.</div>"
+        else:
+            portal = (f"<div style='{box}'>{h}Your client portal</div>Your username is your bidder number"
+                      + (f" (<b>{bid}</b>)" if bid else "") + ". "
+                      + ("We'll email you a link to choose your password." if (e.get("pay_by") == "bill_later" or e.get("status") == "bill_later")
+                         else "Once your payment is in, we'll email you a link to choose your password.") + "</div>")
+        help_ = (f"<div style='{box}'>{h}Questions?</div>Most answers are in our "
+                 f"<a href='{html.escape(site, quote=True)}/faq.html'>questions &amp; answers</a>. Or just reply to this email, "
+                 "or call us at <a href='tel:+13046158978'>(304) 615-8978</a>.</div>")
+        about = (f"<p style='font-size:13px;color:#4b5563'><b>About us:</b> {brand} is a West Virginia attorney in Parkersburg "
+                 "(WV State Bar #13027). Our office handles the title searches, Notices to Redeem and State Auditor paperwork "
+                 "for tax lien buyers across West Virginia.</p>")
+        body = (f"<p>Hi {html.escape(first)},</p><p>Thank you for choosing us. Your signed agreement is attached as a PDF for your records.</p>"
+                + order + pay + nxt + portal + help_ + about)
+        text = (f"Hi {first},\n\nThank you for choosing us. Your signed agreement is attached.\n"
+                + (f"Pay {total} securely: {e['pay_link_url']}\n" if e.get("pay_link_url") and e.get("pay_by") not in ("check", "bill_later") else "")
+                + f"Your agreement page: {e['link']}\nQuestions & answers: {site}/faq.html\n\nMarci · Office of {_brand()} · (304) 615-8978")
         pdf = signed_pdf(e)
         safe = "".join(c for c in (name or "client") if c.isalnum() or c in " -_").strip().replace(" ", "-") or "client"
         return subject, _wrap(body), text, [{"filename": f"Signed-Agreement-{safe}.pdf", "content": base64.b64encode(pdf).decode()}]
@@ -174,7 +221,7 @@ def build_email(kind, e):
                 + _button(url, "Pay " + total + " securely") +
                 "<p>Payment is handled by Square. We start the title work as soon as it's paid (the agreement asks for payment "
                 "within 7 days of signing). Prefer to pay by check? Just reply to this email.</p>")
-        text = f"Hi {first},\n\nPlease pay {total} for your title work here:\n{url}\n\nMarci · Office of Anne Labes, Esq."
+        text = f"Hi {first},\n\nPlease pay {total} for your title work here:\n{url}\n\nMarci · Office of {_brand()}"
         return subject, _wrap(body), text, None
     raise ValueError("unknown kind " + kind)
 
@@ -247,6 +294,9 @@ def handle_square_webhook(raw, signature):
     method = "Square card"
     if _env("ENG_LIVE") != "1" and amount <= 1.0:          # the $1 test link pays the test agreement
         amount, method = float(eng["total"]), "Square TEST ($1 paid)"
+    if p.get("receipt_url"):        # the "You're all set" email links the Square receipt (Ari 10/19)
+        try: _rpc("engagement_set_receipt", {"p_id": eng["id"], "p_url": p["receipt_url"]})
+        except Exception as ex: print("[square] receipt not kept: " + str(ex)[:120], flush=True)
     _rpc("engagement_paid", {"p_id": eng["id"], "p_amount": amount, "p_ref": p["id"], "p_method": method})
     print(f"[square] agreement {eng['id']} paid {amount} ({p['id']})", flush=True)
     return 200, "ok"
@@ -271,7 +321,7 @@ def _resend(to, subject, body, text, attachments=None, bcc=False, reply_to=None)
     rcpt = [to] if live else [x.strip() for x in _env("ENG_TEST_TO", "ari@eqoppa.com").split(",") if x.strip()]
     if not live:
         subject = f"[TEST → {to}] " + subject
-    msg = {"from": _env("ENG_FROM", "Marci at Anne Labes, Esq. <marci@annelabes.com>"), "to": rcpt,
+    msg = {"from": _env("ENG_FROM", "Marci at " + _brand() + " <marci@annelabes.com>"), "to": rcpt,
            "reply_to": reply_to or _env("ENG_REPLY_TO", "marci@annelabes.com"), "subject": subject, "html": body, "text": text}
     if attachments:
         msg["attachments"] = attachments
@@ -580,7 +630,7 @@ def send_surplus(kind, oid, p):
         body = (f"<p>Hi {first},</p><p>Thank you for speaking with us about {about}. Please review and sign our agreement online — it takes a few minutes "
                 f"on your phone or computer.</p>" + _button(e["link"], "Review and sign")
                 + "<p>If you have any questions, just reply to this email.</p>")
-        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nPlease review and sign the surplus funds agreement here:\n{e['link']}\n\nMarci · Office of Anne Labes, Esq."
+        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nPlease review and sign the surplus funds agreement here:\n{e['link']}\n\nMarci · Office of {_brand()}"
         return _resend(to, subject, _wrap(body), text, None, bcc=True)
     if kind == "surplus_signed":
         pdf = signed_pdf(e, SURPLUS_SUB)
@@ -588,10 +638,10 @@ def send_surplus(kind, oid, p):
         fname = f"Signed-Surplus-Agreement-{safe}.pdf"
         b64 = base64.b64encode(pdf).decode()
         _rpc("surplus_agreement_file_put", {"p_id": e["id"], "p_filename": fname, "p_b64": b64})     # into the case's Files first
-        subject = "Your signed agreement — Anne Labes, Esq."
+        subject = "Your signed agreement — " + _brand()
         body = (f"<p>Hi {first},</p><p>Thank you for signing. Your signed agreement is attached as a PDF for your records. "
                 f"Our office will be in touch about the next steps.</p>")
-        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nThank you for signing. Your signed agreement is attached.\n\nMarci · Office of Anne Labes, Esq."
+        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nThank you for signing. Your signed agreement is attached.\n\nMarci · Office of {_brand()}"
         return _resend(to, subject, _wrap(body), text, [{"filename": fname, "content": b64}], bcc=True)
     return "failed", "unknown kind " + kind
 
@@ -646,12 +696,12 @@ def send_web_offer(p):
             f"<p>The link opens our order page with {'it' if n == 1 else 'them'} ticked — untick any you'd rather keep yourself "
             f"({'$500' if n == 1 else 'all ' + str(n) + ' = ' + total}). You sign online and can pay by card, by check or at the office. "
             f"Or just reply to this email or call us at (304) 615-8978.</p>"
-            f"<p style='color:#9ca3af;font-size:12px;margin-top:22px'>You get this because you're a client of the Office of Anne Labes, Esq., "
+            f"<p style='color:#9ca3af;font-size:12px;margin-top:22px'>You get this because you're a client of the Office of {html.escape(_brand())}, "
             f"1507 Saint Mary's Ave, Parkersburg, WV 26101. <a href='{html.escape(stop, quote=True)}' style='color:#9ca3af'>Don't send me these emails</a>.</p>")
     text = (f"Hi {first},\n\nThe State Auditor's list shows you bought {n} new certificate(s):\n"
             + "\n".join("- " + (c.get('county') or '') + " " + (c.get('cert') or '') for c in certs[:30])
             + f"\n\nWant us to do the title work ($500 each)? Choose and order: {link}\n\nOr call (304) 615-8978.\n\n"
-            f"Office of Anne Labes, Esq., 1507 Saint Mary's Ave, Parkersburg, WV 26101. Stop these emails: {stop}")
+            f"Office of {_brand()}, 1507 Saint Mary's Ave, Parkersburg, WV 26101. Stop these emails: {stop}")
     status, detail = _resend(to, subject, _wrap(body), text, None, bcc=True)
     if status in ("sent", "failed"):
         _rpc("web_offer_mark", {"p_id": o["id"], "p_status": status})
