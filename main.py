@@ -6588,6 +6588,112 @@ def fz_address_suggest_loop():
         _t.sleep(120)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🤖 REDEMPTION PENDING: Fernando finishes the title search himself (Ari 2026-10-19 - "he is autonomous ... if he sees
+# this title search hasnt even started, he starts it, finish it, verify it and mail it"). For each certificate waiting in
+# redeemed_filing (kind 'pending', status 'waiting_ts'): start / re-start his county search (first in his line), open the
+# ticket when it is done (fernando_create_ticket, as always), put his findings in with the office's OWN merge code
+# (attorney.html fzBP..fzMerge, run in a headless page) and save it complete + verified in his name (fz_pending_finish).
+# The land app check, the letter and the email to titleverification follow as for a redeemed certificate. Tickets we
+# verified ourselves are never touched; a ticket someone is editing waits; a job on hold or a county he can't search goes
+# to Anne/Ari as one question (fz_pending_flag). On/off: fz_config 'redeemed_filing'.
+# ─────────────────────────────────────────────────────────────────────────────
+_FZ_MERGE_JS = {"src": None, "at": 0}
+
+
+def _fz_merge_js():
+    """attorney.html's merge code (fzBP ... fzMerge) from the live portal, kept for an hour."""
+    import time as _t
+    if _FZ_MERGE_JS["src"] and _t.time() - _FZ_MERGE_JS["at"] < 3600:
+        return _FZ_MERGE_JS["src"]
+    req = _re_ur.Request(f"https://portal.annelabes.com/attorney.html?v={int(_t.time())}", headers={"User-Agent": "annelabes-portal/1.0"})
+    with _re_ur.urlopen(req, timeout=60) as r:
+        page = r.read().decode("utf-8").replace("\r\n", "\n")
+    a = page.index("function fzBP(")
+    b = page.index("function fzMerge(", a)
+    end = page.index("\n}\n", b) + 3
+    _FZ_MERGE_JS.update(src=page[a:end], at=_t.time())
+    return _FZ_MERGE_JS["src"]
+
+
+def _fz_merge_ticket(ticket, run):
+    """Fernando's findings into the ticket - exactly what the office's "first open" merge does. Returns (ticket, added)."""
+    from playwright.sync_api import sync_playwright
+    src = _fz_merge_js()
+    with sync_playwright() as p:
+        b = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        try:
+            pg = b.new_context(timezone_id="America/New_York", locale="en-US").new_page()
+            pg.set_content("<html><body></body></html>")
+            pg.add_script_tag(content=src)
+            out = pg.evaluate("""([t, r]) => { var it = fzMerge(t, r); delete t.fzAutoMerge;
+                                 return { t: t, added: it ? ((t.fernando && t.fernando.added) || 'his notes') : '' }; }""", [ticket, run])
+            return out["t"], out["added"]
+        finally:
+            b.close()
+
+
+def _fz_pending_one(it):
+    """One certificate. True when something was done (the loop then comes back sooner)."""
+    jid, label = it["job_id"], f"{it.get('county')} {it.get('cert')}"
+    t, run = it.get("ticket"), it.get("run") or {}
+    if t and (str(t.get("verified")).lower() == "true" or t.get("status") in ("verified", "filed")):
+        return False                                             # ours already - the filing tick takes it from here
+    st = run.get("status")
+    if it.get("held") and st != "done":
+        _fz_rpc("fz_pending_flag", {"p_job_id": jid, "p_why": "the job is on hold (agreement not signed or not paid yet), so Fernando did not start the search"})
+        print(f"[pending] {label}: job on hold - asked Anne/Ari", flush=True)
+        return True
+    if st != "done":
+        if not it.get("searchable"):
+            _fz_rpc("fz_pending_flag", {"p_job_id": jid, "p_why": f"Fernando can't search the {str(it.get('county') or '').title()} County index from here yet"})
+            print(f"[pending] {label}: county not searchable - asked Anne/Ari", flush=True)
+            return True
+        if st in ("queued", "running"):
+            if run.get("source") != "pending":
+                _fz_rpc("fz_pending_search", {"p_job_id": jid})  # to the front of his line
+            return False
+        res = _fz_rpc("fz_pending_search", {"p_job_id": jid})
+        if res == "gave up":
+            _fz_rpc("fz_pending_flag", {"p_job_id": jid, "p_why": "his county search stopped twice: " + str(run.get("reason") or run.get("status") or "")[:200]})
+        print(f"[pending] {label}: search {res}", flush=True)
+        return True
+    if not t:
+        res = _fz_rpc("fernando_create_ticket", {"p_county": it.get("county"), "p_cert": it.get("cert")})
+        print(f"[pending] {label}: ticket {res}", flush=True)
+        if res not in ("created", "ticket exists"):
+            _fz_rpc("fz_pending_flag", {"p_job_id": jid, "p_why": "Fernando could not open the title search ticket (" + str(res) + ")"})
+        return True
+    if it.get("locked"):
+        return False                                             # someone is editing it right now - next round
+    if _mem_used() > _FZ_MEM_MAX:
+        return False
+    added = ""
+    if not (t.get("fernando") or {}).get("run") == run.get("finished_at"):
+        t, added = _fz_merge_ticket(t, run)
+    res = _fz_rpc("fz_pending_finish", {"p_job_id": jid, "p_ticket": t,
+                                         "p_note": ("added " + added) if added else "his search was already in the ticket"})
+    print(f"[pending] {label}: {res}{' - added ' + added if added else ''}", flush=True)
+    return True
+
+
+def fz_pending_loop():
+    import time as _t
+    _t.sleep(480)
+    while True:
+        worked = False
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "redeemed_filing"}) or "off") == "on":
+                for it in (_fz_rpc("fz_pending_todo", {"p_limit": 5}) or []):
+                    try:
+                        worked = _fz_pending_one(it) or worked
+                    except Exception as e:
+                        print(f"[pending] {it.get('county')} {it.get('cert')}: {str(e)[:200]}", flush=True)
+        except Exception as e:
+            print(f"[pending] {str(e)[:200]}", flush=True)
+        _t.sleep(120 if worked else 300)
+
+
 def landapp_server_loop():
     import time as _t
     _t.sleep(600)
@@ -10718,6 +10824,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=idx_competitor_once_loop, daemon=True).start()  # 🏁 one-time HENNEPIN search per county (days)
         _og_threading.Thread(target=idx_history_loop, daemon=True).start()        # 📚 a county's full history, normal pace (Berkeley 10/6)
         _og_threading.Thread(target=idx_surplus_once_loop, daemon=True).start()   # 🔍 one-time surplus look-back per county (10/6)
+        _og_threading.Thread(target=fz_pending_loop, daemon=True).start()          # 🤖 REDEMPTION PENDING: Fernando finishes + verifies (10/19)
         _og_threading.Thread(target=landapp_server_loop, daemon=True).start()     # 🤵 land app NTRs on the server (10/8, fz_config landapp_server)
         _og_threading.Thread(target=agent_ticket_loop, daemon=True).start()       # 🎫 staff requests via Diego, 24/7 (10/8, fz_config agent_server; suggest only)
         _og_threading.Thread(target=og_tax_loop, daemon=True).start()             # 🛢️ O&G tax values from the sheriff sites, slow (10/14, fz_config og_tax)
