@@ -9384,11 +9384,11 @@ def _og_unit_page_read(text):
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
     msg = client.messages.create(
-        model=_OGD_MODEL, max_tokens=8000,
+        model=_OGD_MODEL, max_tokens=20000,                        # a page can hold 40 owner lines; max_tokens covers thinking too
         system=[{"type": "text", "text": _OGU_RULES, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": "Page text:\n" + text[:12000]}],
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
-        extra_body={"output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": _OGU_SCHEMA}}, "fallbacks": "default"})
+        extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": _OGU_SCHEMA}}, "fallbacks": "default"})
     _ai_log(msg, "og_unit_page")
     t = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
     try: out = json.loads(t)
