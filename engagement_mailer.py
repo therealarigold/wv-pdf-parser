@@ -143,6 +143,138 @@ def _button(url, label):
             "font-weight:700;padding:12px 22px;border-radius:8px;display:inline-block'>" + html.escape(label) + "</a></p>")
 
 
+# ── 📦 Welcome Packet look (Ari 10/19 polish, approved mockup): bigger type for older readers, one letterhead for the packet
+# and "You're all set", phone in every footer. Used only by those two client emails and the office "Paid" heads-up.
+_NAVY, _GREEN, _MUTED = "#1e3a8a", "#166534", "#4b5563"
+_PHONE, _TEL = "(304) 615-8978", "+13046158978"
+_PORTAL_LOGIN = "https://portal.annelabes.com/#client-login"
+_ABOUT_US = ("We're a small West Virginia law office in Parkersburg. Real people, real answers &mdash; call any time and "
+             "you'll reach someone who knows your file.")        # option B (Ari 10/19) - Anne still to approve the wording
+
+
+def _letter(inner):
+    b = html.escape(_brand())
+    return (f"<div style=\"font:17px/1.6 -apple-system,'Segoe UI',Arial,sans-serif;color:#1f2937;max-width:580px\">"
+            f"<div style='font:22px Georgia,serif;color:{_NAVY};border-bottom:2px solid {_NAVY};padding-bottom:6px;margin-bottom:18px'>{b}</div>"
+            + inner +
+            f"<p style='color:#6b7280;font-size:14px;margin-top:26px;border-top:1px solid #e5e7eb;padding-top:12px'>"
+            f"Marci &middot; Office of {b} &middot; Parkersburg, West Virginia<br>"
+            f"Call <a href='tel:{_TEL}' style='color:#6b7280'>{_PHONE}</a> or just reply to this email.</p></div>")
+
+
+def _big_button(url, label, color=_GREEN):
+    return (f"<p style='margin:18px 0'><a href='{html.escape(url, quote=True)}' style='background:{color};color:#fff;text-decoration:none;"
+            f"font-weight:700;font-size:17px;padding:14px 26px;border-radius:10px;display:inline-block'>{html.escape(label)}</a></p>")
+
+
+def _box(title, inner):
+    return (f"<div style='background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:14px 18px;margin:16px 0'>"
+            f"<div style='font-weight:700;color:{_NAVY};font-size:17px;margin-bottom:6px'>{title}</div>{inner}</div>")
+
+
+def _faq(anchor, label):
+    site = _env("WEB_SITE_URL", "https://www.annelabes.com").rstrip("/")
+    return f"<a href='{html.escape(site, quote=True)}/faq.html{'#' + anchor if anchor else ''}' style='color:{_NAVY}'>{label}</a>"
+
+
+def _signin_steps(bidder, password_line):
+    """3 numbered sign-in steps + locked out + iPhone tip + FAQ links (older readers - Ari 10/19)."""
+    bid = html.escape(str(bidder or ""))
+    return (f"<ol style='margin:4px 0 0 22px;padding:0;font-size:17px'>"
+            f"<li style='margin-bottom:6px'>Go to <a href='{_PORTAL_LOGIN}' style='color:{_NAVY};font-weight:700'>portal.annelabes.com</a></li>"
+            f"<li style='margin-bottom:6px'><b>Username:</b> your bidder number" + (f", <b style='font-size:19px'>{bid}</b>" if bid else "") + "</li>"
+            f"<li style='margin-bottom:6px'><b>Password:</b> {password_line}</li></ol>"
+            f"<div style='font-size:15px;color:{_MUTED};margin-top:10px'>"
+            f"&#128274; <b>Locked out?</b> Wait 15 minutes and try again, or call us at <a href='tel:{_TEL}' style='color:{_MUTED}'>{_PHONE}</a>.<br>"
+            f"&#128241; <b>On an iPhone?</b> Open the portal in Safari, tap <b>Share</b>, then <b>Add to Home Screen</b> &mdash; it becomes an app icon.<br>"
+            f"Help: {_faq('sign-in', 'How do I sign in?')} &middot; {_faq('forgot-password', 'Forgot my password')} &middot; "
+            f"{_faq('home-screen', 'Add it to my phone')}</div>")
+
+
+def _questions():
+    return _box("Questions?", f"Most answers are on our {_faq('', 'questions &amp; answers page')}. Or call us at "
+                              f"<a href='tel:{_TEL}' style='color:{_NAVY};font-weight:700'>{_PHONE}</a> &mdash; a real person answers.")
+
+
+def _cert_list(certs):
+    li = "".join(f"<li>{html.escape(c)}</li>" for c in certs[:60])
+    return f"<ul style='margin:6px 0 0 20px;padding:0;color:{_MUTED};font-size:15px'>{li}</ul>" if li else ""
+
+
+def _first_name(name):
+    """'Mary Smith' -> 'Mary'; names written 'SMITH, MARY' -> 'Mary'; companies -> '' (then 'Hello,')."""
+    name = (name or "").strip()
+    if not name or any(w in name.upper() for w in (" LLC", " INC", " CORP", "TRUST", "COMPANY", " LTD", " LP", "ENTERPRISES")):
+        return ""
+    if "," in name:
+        rest = name.split(",", 1)[1].strip()
+        name = rest or name
+    w = name.split()[0]
+    return w.title() if w.isupper() else w
+
+
+def thanks_email(job):
+    """📦 Email 2 "You're all set" (client_login_outbox 'thanks'): payment received + receipt (card) or the check's date +
+    the choose-your-password button for a new client + the sign-in steps. Never BCC'd (it can hold the password link)."""
+    first = _first_name(job.get("name"))
+    try: amt = f"${float(job.get('amount')):,.2f}"
+    except Exception: amt = ""
+    certs = [str(c).strip().title() for c in (job.get("certs") or []) if c and str(c).strip()]
+    n = len(certs) or int(job.get("liens") or 0)
+    method = str(job.get("method") or "")
+    receipt = str(job.get("receipt_url") or "")
+    if re.search(r"check", method, re.I):
+        paid = f"We received your check for <b>{amt}</b>" + (f" on {html.escape(job['paid_on'])}" if job.get("paid_on") else "") + "."
+    else:
+        paid = (f"We received your payment{' of <b>' + amt + '</b>' if amt else ''}" + (" by card" if re.search(r"card|square", method, re.I) else "")
+                + (f" &mdash; <a href='{html.escape(receipt, quote=True)}' style='color:{_NAVY}'>view or print your receipt</a>." if receipt.startswith("https://") else "."))
+    if job.get("token"):
+        link = f"https://portal.annelabes.com/set-password.html?t={job['token']}"
+        portal = _box("Set up your client portal (one time)",
+                      "Tap the button to choose your password:" + _big_button(link, "Choose your password")
+                      + f"<div style='font-size:14px;color:{_MUTED};margin-bottom:10px'>This button works once and is good for 7 days. "
+                        "If it expires, call us and we'll send a new one.</div>"
+                      + "After that, signing in is 3 steps:" + _signin_steps(job.get("bidder"), "the one you just chose"))
+    elif job.get("portal_account"):
+        portal = _box("Your client portal", "Follow the progress any time:" + _big_button(_PORTAL_LOGIN, "Open my client portal", _NAVY)
+                      + _signin_steps(job.get("bidder"), "the one you already use"))
+    else:
+        portal = _box("Your client portal", "Our office will email you your client portal access shortly &mdash; there you can follow every step.")
+    body = (f"<p>Hi{' ' + html.escape(first) if first else ''},</p>"
+            f"<p style='font-size:19px'><b>You're all set!</b> &#10003;</p>"
+            f"<p>{paid} Our title work has started" + (f" on {n} certificate{'' if n == 1 else 's'}" if n else "") + (":" if certs else ".") + "</p>"
+            + _cert_list(certs) + portal + _questions())
+    return f"You're all set — payment received | {_brand()}", _letter(body)
+
+
+def office_paid_email(job, client_email):
+    """💰 Heads-up to the office when a client pays (sent right after their "You're all set"). NEVER the password link."""
+    name = (job.get("name") or "").strip() or "A client"
+    bid = str(job.get("bidder") or "")
+    try: amt = f"${float(job.get('amount')):,.2f}"
+    except Exception: amt = "?"
+    certs = [str(c).strip().title() for c in (job.get("certs") or []) if c and str(c).strip()]
+    n = len(certs) or int(job.get("liens") or 0)
+    method = str(job.get("method") or "").strip()
+    receipt = str(job.get("receipt_url") or "")
+    went = ("new client, so it included the choose-your-password button (not copied here, for the client's security)" if job.get("token")
+            else "they already have a portal password" if job.get("portal_account")
+            else "no portal login in it - the office sends the client portal access")
+    body = (f"<p><b>{html.escape(name)}</b> (bidder {html.escape(bid)}) paid <b>{amt}</b>" + (f" by {html.escape(method)}" if method else "") + ".</p>"
+            + (f"<p>Title work started on: {html.escape(', '.join(certs))}.</p>" if certs else "")
+            + f"<p>&#9989; The <i>You're all set</i> email went to {html.escape(client_email or '?')} &mdash; {went}.</p>"
+            + (f"<p>Receipt: <a href='{html.escape(receipt, quote=True)}'>Square receipt</a></p>" if receipt.startswith("https://") else "")
+            + _big_button("https://portal.annelabes.com/#client=" + urllib.parse.quote(bid), f"Open {name.split()[0] if name.split() else 'the'}'s file", _NAVY))
+    html_ = (f"<div style=\"font:15px/1.55 -apple-system,'Segoe UI',Arial,sans-serif;color:#1f2937;max-width:580px\">{body}</div>")
+    subject = f"💰 Paid: {name} — {amt} ({n} certificate{'' if n == 1 else 's'})"
+    text = (f"{name} (bidder {bid}) paid {amt}" + (f" by {method}" if method else "") + ".\n"
+            + (f"Title work started on: {', '.join(certs)}.\n" if certs else "")
+            + f"The You're all set email went to {client_email or '?'} - {went}.\n"
+            + (f"Receipt: {receipt}\n" if receipt.startswith("https://") else "")
+            + f"Open the file: https://portal.annelabes.com/#client={bid}\n")
+    return subject, html_, text
+
+
 def build_email(kind, e):
     f = e.get("fields") or {}
     name = (e.get("client_name") or f.get("client_name") or "").strip()
@@ -161,58 +293,54 @@ def build_email(kind, e):
         text = f"Hi {first},\n\nPlease review and sign your agreement ({n} lien(s), {total}):\n{e['link']}\n\nMarci · Office of {_brand()}"
         return subject, _wrap(body), text, None
     if kind == "signed_copy_email":
-        # 📦 THE WELCOME PACKET (Ari 10/19 - 4 emails became 2): the signed agreement + the Pay button / how to pay + what
-        # happens next + the client portal + FAQ + a short about-us. Card payers get it once the Square link exists.
+        # 📦 THE WELCOME PACKET (Ari 10/19 - 4 emails became 2; polished 10/19 to the approved mockup): the signed agreement +
+        # the Pay button / how to pay + what happens next + the client portal (3 big sign-in steps) + FAQ + about us.
+        # Card payers get it once the Square link exists.
         site = _env("WEB_SITE_URL", "https://www.annelabes.com").rstrip("/")
-        brand = html.escape(_brand())
         subject = "Welcome — your signed agreement and next steps | " + _brand()
-        box = "background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:12px 16px;margin:16px 0"
-        h = "<div style='font-weight:700;color:#1e3a8a;margin-bottom:4px'>"
-        order = (f"<div style='{box}'>{h}Your order</div>{n} certificate{'' if n == 1 else 's'} × $500 = <b>{total}</b>"
-                 + (f"<div style='color:#4b5563;font-size:13.5px;margin-top:4px'>{liens}</div>" if liens else "") + "</div>")
-        if e.get("pay_by") == "bill_later" or e.get("status") == "bill_later":
-            pay = f"<div style='{box}'>{h}Payment</div>Nothing to pay now — we're starting your title work.</div>"
+        hi = _first_name(name)
+        certs = [c.strip() for c in (f.get("certificates") or "").replace(";", ",").split(",") if c.strip()]
+        order = _box("Your order", f"{n} certificate{'' if n == 1 else 's'} &times; $500 = <b>{total}</b>" + _cert_list(certs))
+        bill_later = e.get("pay_by") == "bill_later" or e.get("status") == "bill_later"
+        if bill_later:
+            pay = _box("Payment", "Nothing to pay right now &mdash; <b>we're starting your title work today.</b>")
         elif e.get("pay_by") == "check":
-            pay = (f"<div style='{box}'>{h}Payment</div>Please send your payment of <b>{total}</b> by check, or as arranged with our office. "
-                   f"We start your title work as soon as it arrives.</div>")
+            pay = _box("Payment", f"Please send your payment of <b>{total}</b> by check, or as arranged with our office. "
+                                  f"We start your title work as soon as it arrives. {_faq('pay', 'Where do I send it?')}")
         elif e.get("pay_link_url"):
-            pay = (f"<div style='{box}'>{h}Last step: payment</div>We start your title work as soon as the fee of <b>{total}</b> is paid."
-                   + _button(e["pay_link_url"], "Pay " + total + " securely") +
-                   "<div style='font-size:13px;color:#4b5563'>Payment is handled by Square. Prefer to pay by check? Just reply to this email.</div></div>")
+            pay = _box("Last step: payment", "We start your title work as soon as your payment arrives."
+                       + _big_button(e["pay_link_url"], "Pay " + total + " securely")
+                       + f"<div style='font-size:15px;color:{_MUTED}'>Payment is handled by Square. Prefer to pay by check? Just reply to this email. "
+                         f"More: {_faq('pay', 'How can I pay?')}</div>")
         else:
-            pay = (f"<div style='{box}'>{h}Last step: payment</div>We start your title work as soon as the fee of <b>{total}</b> is paid. "
-                   f"Your secure payment link is on your agreement page." + _button(e["link"], "Open my agreement page") + "</div>")
-        nxt = (f"<div style='{box}'>{h}What happens next</div>"
-               "<ol style='margin:4px 0 0 18px;padding:0'><li>We search the county records for each certificate (the title search).</li>"
-               "<li>We prepare your Notice to Redeem and file it with the State Auditor.</li>"
-               "<li>You can follow every step in your client portal — no need to call.</li></ol></div>")
-        bid = html.escape(str(e.get("bidder") or ""))
+            pay = _box("Last step: payment", f"We start your title work as soon as the fee of <b>{total}</b> is paid. "
+                       "Your secure payment link is on your agreement page." + _big_button(e["link"], "Open my agreement page"))
+        nxt = _box("What happens next",
+                   "<ol style='margin:4px 0 0 22px;padding:0'><li>We search the county records for each certificate (the title search).</li>"
+                   "<li>We prepare your Notice to Redeem and file it with the State Auditor.</li>"
+                   "<li>You can follow every step in your client portal &mdash; no need to call.</li></ol>")
+        bid = e.get("bidder")
         if e.get("portal_account"):
-            portal = (f"<div style='{box}'>{h}Your client portal</div>Sign in any time with your bidder number"
-                      + (f" (<b>{bid}</b>)" if bid else "") + " and your password."
-                      + _button("https://portal.annelabes.com/#client-login", "Client portal sign-in")
-                      + f"<div style='font-size:13px;color:#4b5563'>Forgot your password? Press <i>Forgot password</i> on the sign-in page.</div></div>")
+            portal = _box("Your client portal", "You already have an account. Sign in any time:" + _signin_steps(bid, "the one you already use")
+                          + _big_button(_PORTAL_LOGIN, "Open my client portal", _NAVY))
         elif e.get("hold_login"):
-            portal = f"<div style='{box}'>{h}Your client portal</div>Our office will email you your client portal access shortly.</div>"
+            portal = _box("Your client portal", "Our office will email you your client portal access shortly.")
+        elif bill_later:
+            portal = _box("Your client portal", "We'll email you a green <b>Choose your password</b> button shortly. Then signing in is 3 steps:"
+                          + _signin_steps(bid, "the one you choose from that email"))
         else:
-            portal = (f"<div style='{box}'>{h}Your client portal</div>Your username is your bidder number"
-                      + (f" (<b>{bid}</b>)" if bid else "") + ". "
-                      + ("We'll email you a link to choose your password." if (e.get("pay_by") == "bill_later" or e.get("status") == "bill_later")
-                         else "Once your payment is in, we'll email you a link to choose your password.") + "</div>")
-        help_ = (f"<div style='{box}'>{h}Questions?</div>Most answers are in our "
-                 f"<a href='{html.escape(site, quote=True)}/faq.html'>questions &amp; answers</a>. Or just reply to this email, "
-                 "or call us at <a href='tel:+13046158978'>(304) 615-8978</a>.</div>")
-        about = (f"<p style='font-size:13px;color:#4b5563'><b>About us:</b> {brand} is a West Virginia attorney in Parkersburg "
-                 "(WV State Bar #13027). Our office handles the title searches, Notices to Redeem and State Auditor paperwork "
-                 "for tax lien buyers across West Virginia.</p>")
-        body = (f"<p>Hi {html.escape(first)},</p><p>Thank you for choosing us. Your signed agreement is attached as a PDF for your records.</p>"
-                + order + pay + nxt + portal + help_ + about)
-        text = (f"Hi {first},\n\nThank you for choosing us. Your signed agreement is attached.\n"
-                + (f"Pay {total} securely: {e['pay_link_url']}\n" if e.get("pay_link_url") and e.get("pay_by") not in ("check", "bill_later") else "")
-                + f"Your agreement page: {e['link']}\nQuestions & answers: {site}/faq.html\n\nMarci · Office of {_brand()} · (304) 615-8978")
+            portal = _box("Your client portal", "Once your payment arrives, we'll email you a green <b>Choose your password</b> button. "
+                          "Signing in is then 3 steps:" + _signin_steps(bid, "the one you choose from that email"))
+        about = f"<p style='font-size:15px;color:{_MUTED};margin-top:18px'><b>About us:</b> {_ABOUT_US}</p>"
+        body = (f"<p>Hi{' ' + html.escape(hi) if hi else ''},</p><p>Thank you for choosing us. Your signed agreement is attached as a PDF for your records.</p>"
+                + order + pay + nxt + portal + _questions() + about)
+        text = (f"Hi{' ' + hi if hi else ''},\n\nThank you for choosing us. Your signed agreement is attached.\n"
+                + (f"Pay {total} securely: {e['pay_link_url']}\n" if e.get("pay_link_url") and e.get("pay_by") not in ("check", "bill_later") and not bill_later else "")
+                + f"Your agreement page: {e['link']}\nClient portal: portal.annelabes.com - username: your bidder number{(' ' + str(bid)) if bid else ''}\n"
+                + f"Questions & answers: {site}/faq.html\n\nMarci · Office of {_brand()} · Parkersburg, West Virginia · {_PHONE}")
         pdf = signed_pdf(e)
         safe = "".join(c for c in (name or "client") if c.isalnum() or c in " -_").strip().replace(" ", "-") or "client"
-        return subject, _wrap(body), text, [{"filename": f"Signed-Agreement-{safe}.pdf", "content": base64.b64encode(pdf).decode()}]
+        return subject, _letter(body), text, [{"filename": f"Signed-Agreement-{safe}.pdf", "content": base64.b64encode(pdf).decode()}]
     if kind == "paylink_email":
         url = e.get("pay_link_url") or e["link"]
         subject = "Payment for your title work — " + total

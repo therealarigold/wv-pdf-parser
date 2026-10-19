@@ -8236,36 +8236,9 @@ def _client_mail_body(job):
     name = (job.get("name") or "").strip()
     hi = f"Hello {_h.escape(name)}," if name else "Hello,"
     if job["kind"] == "thanks":
-        amt = job.get("amount")
-        try: amt_txt = f"${float(amt):,.2f}"
-        except Exception: amt_txt = ""
-        certs = [c.strip() for c in (job.get("certs") or []) if c and c.strip()]
-        lst = "".join(f"<li>{_h.escape(c.title())}</li>" for c in certs[:40])
-        # 📦 "You're all set" (Ari 10/19 - 4 client emails became 2): thank you + the Square receipt + the choose-your-password
-        # button for a new client, in ONE email (it used to be "payment received" + a separate portal-account email).
-        brand = os.environ.get("ENG_BRAND", "Anne Labes, Esq.")
-        btn = lambda url, label, color: (f"<p><a href='{_h.escape(url, quote=True)}' style='display:inline-block;background:{color};color:#fff;padding:10px 18px;"
-                                         f"border-radius:8px;text-decoration:none;font-weight:bold'>{_h.escape(label)}</a></p>")
-        receipt = (f"<p style='font-size:14px'>Your Square receipt: <a href='{_h.escape(job['receipt_url'], quote=True)}'>view or print it here</a>.</p>"
-                   if str(job.get("receipt_url") or "").startswith("https://") else "")
-        if job.get("token"):
-            link = f"https://portal.annelabes.com/set-password.html?t={job['token']}"
-            nxt = (f"<p><b>Your client portal</b> - follow every step of your title work there, any time.<br>"
-                   f"<b>Your username:</b> your bidder number, <b>{_h.escape(job['bidder'])}</b></p>"
-                   + btn(link, "Choose your password", "#1e3a8a")
-                   + "<p style='font-size:13px;color:#6b7280'>The link works once and is good for 7 days. Then sign in at "
-                     "<a href='https://portal.annelabes.com/#client-login'>portal.annelabes.com</a>.</p>")
-        elif job.get("portal_account"):
-            nxt = ("<p>You can follow the progress in your client portal:</p>" + btn("https://portal.annelabes.com/#client-login", "Client portal sign-in", "#1e3a8a"))
-        else:
-            nxt = "<p>Our office will email you your client portal access, where you can follow the progress.</p>"
-        body = (f"<div style='font-family:Georgia,serif;font-size:15px;color:#1f2937;max-width:560px'>"
-                f"<p>{hi}</p><p>You're all set - we received your payment{(' of <b>' + amt_txt + '</b>') if amt_txt else ''} and our title work has started"
-                f"{' on ' + str(job.get('liens')) + (' certificates' if job.get('liens') != 1 else ' certificate') if job.get('liens') else ''}:</p>"
-                f"{('<ul>' + lst + '</ul>') if lst else ''}{receipt}"
-                f"{nxt}<p>If you have any questions, just reply to this email or call us at (304) 615-8978.</p>"
-                f"<p>Thank you for your business,<br>Marci<br>{_h.escape(brand)}</p></div>")
-        return f"You're all set - payment received | {brand}", body
+        # 📦 "You're all set" (Ari 10/19): same letterhead as the Welcome Packet - engagement_mailer.thanks_email
+        from engagement_mailer import thanks_email
+        return thanks_email(job)
     link = f"https://portal.annelabes.com/set-password.html?t={job['token']}"
     brand = os.environ.get("ENG_BRAND", "Anne Labes, Esq.")
     if job["kind"] == "welcome":
@@ -8321,6 +8294,16 @@ def client_mail_one():
         with _re_ur.urlopen(req, timeout=30) as r: r.read()
         _fz_rpc("client_login_done", {"p_id": job["id"], "p_status": "sent"})
         print(f"[client-mail] {job['kind']} #{job['id']} for bidder {job['bidder']}: sent{'' if live else ' (TEST to ' + to + ')'}", flush=True)
+        if job["kind"] == "thanks":
+            # 💰 heads-up to the office (Ari 10/19) - its own email, never the client's password link; a failure here
+            # never touches the client's email (already sent)
+            try:
+                from engagement_mailer import office_paid_email, _resend
+                o_subj, o_html, o_text = office_paid_email(job, job.get("email"))
+                st, det = _resend(os.environ.get("ENG_OFFICE_TO", "marci@annelabes.com").strip() or "marci@annelabes.com", o_subj, o_html, o_text)
+                print(f"[client-mail] office 'Paid' heads-up for bidder {job['bidder']}: {st} {det[:80]}", flush=True)
+            except Exception as ex:
+                print(f"[client-mail] office 'Paid' heads-up for bidder {job['bidder']} failed: {str(ex)[:200]}", flush=True)
     except Exception as e:
         _fz_rpc("client_login_done", {"p_id": job["id"], "p_status": "failed", "p_error": str(e)[:300]})
         print(f"[client-mail] #{job['id']} failed: {str(e)[:200]}", flush=True)
