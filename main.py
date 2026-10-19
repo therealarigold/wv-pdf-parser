@@ -9123,22 +9123,54 @@ _OGD_RULES = (
     "Answer only from these words; share_kind 'none' when no share is written.")
 
 
-def _og_desc_read(desc, model):
+def _og_desc_read(desc, model, feature="og_desc_compare"):
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
     msg = client.messages.create(
-        model=model, max_tokens=1500, system=_OGD_RULES,
+        model=model, max_tokens=1500,
+        system=[{"type": "text", "text": _OGD_RULES, "cache_control": {"type": "ephemeral"}}],   # the same rules every time: cached
         messages=[{"role": "user", "content": "Description:\n" + desc}],
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
         extra_body={"output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": _OGD_SCHEMA}}, "fallbacks": "default"})
-    _ai_log(msg, "og_desc_compare")
+    _ai_log(msg, feature)
     text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
     try: out = json.loads(text)
     except Exception:
         m = _re_re.search(r"\{.*\}", text, _re_re.S); out = json.loads(m.group(0)) if m else {"error": text[:300]}
     u = getattr(msg, "usage", None)
-    usage = {"model": getattr(msg, "model", model), "in": getattr(u, "input_tokens", 0) or 0, "out": getattr(u, "output_tokens", 0) or 0} if u else {}
+    usage = {"model": getattr(msg, "model", model), "in": getattr(u, "input_tokens", 0) or 0, "out": getattr(u, "output_tokens", 0) or 0,
+             "cache_read": getattr(u, "cache_read_input_tokens", 0) or 0} if u else {}
     return out, usage
+
+
+_OGD_MODEL = os.environ.get("OG_DESC_READ_MODEL", "claude-sonnet-5-5")
+
+
+def og_desc_read_loop():
+    """🤖 AI second reader (Ari 10/19 "ok i trust you, run it"): the odd certificate descriptions (og_desc_read rows, one per
+    distinct text) read by Sonnet 5.5 with Ari's rules; the database compares with og_parse and flags disagreements 'check'.
+    Nothing is overwritten by the AI. Idle when the queue is empty."""
+    import time as _t
+    _t.sleep(100)
+    while True:
+        try:
+            job = _fz_rpc("og_desc_read_next", {})
+        except Exception:
+            job = None
+        if not job:
+            _t.sleep(600); continue
+        _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "og_desc_read", None, None
+        out = {"desc_md5": job["desc_md5"], "model": _OGD_MODEL}
+        try:
+            out["read"], out["usage"] = _og_desc_read(job["description"], _OGD_MODEL, "og_desc_read")
+            out["status"] = "done"
+        except FzPaused:
+            _t.sleep(1800); continue
+        except Exception as e:
+            out.update(status="failed", error=str(e)[:300])
+        try: _fz_rpc("og_desc_read_save", {"p": out})
+        except Exception as e: print(f"[og-desc-read] save failed: {e}", flush=True)
+        _t.sleep(1)
 
 
 def og_desc_compare_loop():
@@ -10695,6 +10727,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=client_mail_loop, daemon=True).start()        # 🔑 client portal login emails
         _og_threading.Thread(target=fz_compare_loop, daemon=True).start()         # 🔬 reader model comparison (one-off rows)
         _og_threading.Thread(target=og_desc_compare_loop, daemon=True).start()    # 🔬 description reader test: Opus 5.5 vs Sonnet 5.5 (Ari 10/19, one-off)
+        _og_threading.Thread(target=og_desc_read_loop, daemon=True).start()       # 🤖 AI second reader for odd descriptions, Sonnet 5.5 (Ari 10/19)
         _og_threading.Thread(target=putnam_loop, daemon=True).start()             # 🏛 Putnam with Fernando's own login (slow)
         _og_threading.Thread(target=client_fz_loop, daemon=True).start()          # 💬 clients ask Fernando about their own file
         _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
