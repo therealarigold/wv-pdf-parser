@@ -444,7 +444,7 @@ def _office_bcc(to):
     return [x.strip() for x in _env("ENG_BCC", "marci@annelabes.com").split(",") if x.strip() and x.strip().lower() != to.lower()]
 
 
-def _resend(to, subject, body, text, attachments=None, bcc=False, reply_to=None):
+def _resend(to, subject, body, text, attachments=None, bcc=False, reply_to=None, always_bcc=None):
     live = _env("ENG_LIVE") == "1"
     rcpt = [to] if live else [x.strip() for x in _env("ENG_TEST_TO", "ari@eqoppa.com").split(",") if x.strip()]
     if not live:
@@ -455,6 +455,8 @@ def _resend(to, subject, body, text, attachments=None, bcc=False, reply_to=None)
         msg["attachments"] = attachments
     if bcc and live and _office_bcc(to):
         msg["bcc"] = _office_bcc(to)
+    if live and always_bcc:                    # e.g. Marci on every letter to the Auditor (Ari 10/19), whatever ENG_BCC says
+        msg["bcc"] = list(dict.fromkeys((msg.get("bcc") or []) + [x for x in always_bcc if x.lower() != to.lower()]))
     req = urllib.request.Request("https://api.resend.com/emails", data=json.dumps(msg).encode(), method="POST",
                                  headers={"Authorization": "Bearer " + _env("RESEND_API_KEY"), "Content-Type": "application/json",
                                           "User-Agent": "annelabes-portal/1.0"})
@@ -724,7 +726,8 @@ def send_redeemed_filing(oid, p):
     if not f.get("letter"):
         return "failed", "no letter found for this filing"
     atts = [{"filename": p.get("file") or "Title_Search.pdf", "content": f["letter"]}]
-    return _resend(to, p.get("subject") or "Title search", p.get("html") or "", p.get("text") or "", atts, bcc=True)
+    return _resend(to, p.get("subject") or "Title search", p.get("html") or "", p.get("text") or "", atts, bcc=True,
+                   always_bcc=["marci@annelabes.com"])     # Marci sees every letter Fernando sends (Ari 10/19)
 
 
 # ── ✍️ Surplus agreements (Ari 10/17, mail_outbox): the link to sign, and once signed the PDF into the case's Files +
