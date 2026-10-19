@@ -6749,6 +6749,11 @@ def fz_pending_loop():
         _t.sleep(120 if worked else 180)
 
 
+# the land app windows are light and do the NTR / fee / REDEMPTION PENDING work: they stay open until the server is near
+# its real 2 GB limit (before 10/19 they closed at Fernando's 1.3 GB search limit - every 10-15 minutes on a busy day)
+_LANDAPP_MEM_MAX = int(float(os.environ.get("LANDAPP_MEM_MAX_GB", "1.75")) * 1024 ** 3)
+
+
 def landapp_server_loop():
     import time as _t
     _t.sleep(600)
@@ -6756,7 +6761,10 @@ def landapp_server_loop():
     pages = {}
     while True:
         try:
-            if (_fz_rpc("fz_config_get", {"p_key": "landapp_server"}) or "off") != "on" or _mem_used() > _FZ_MEM_MAX:
+            high = _mem_used() > _LANDAPP_MEM_MAX
+            if high and browser:
+                print(f"[landapp] server memory {_mem_used() / 1024 ** 3:.2f} GB - closing the land app windows for 5 minutes", flush=True)
+            if (_fz_rpc("fz_config_get", {"p_key": "landapp_server"}) or "off") != "on" or high:
                 if browser:
                     try: browser.close()
                     except Exception: pass
