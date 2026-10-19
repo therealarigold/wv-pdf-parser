@@ -9076,6 +9076,82 @@ def fz_compare_loop():
         _t.sleep(5)
 
 
+_OGD_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    "share": {"type": "string", "description": "the share of the minerals the owner holds, as a fraction or decimal exactly as the words give it (e.g. '1/16', '0.0057'); '' when the description states no share"},
+    "share_kind": {"type": "string", "enum": ["mineral", "royalty", "decimal", "unclear", "none"]},
+    "acres": {"type": "string", "description": "the acres as a number ('71.5'); '' when not stated"},
+    "less": {"type": "string", "description": "a part the owner does NOT have ('1/2 O&G out', 'less 1/4 min'); '' when none"},
+    "two_way": {"type": "boolean", "description": "true when the words can honestly be read two ways (e.g. '127 1/2 OG' = 127 acres with a 1/2 share, or 127.5 acres)"},
+    "other_reading": {"type": "string", "description": "when two_way: the other reading in a few words; else ''"},
+    "note": {"type": "string", "description": "one short sentence: how you read it"}},
+    "required": ["share", "share_kind", "acres", "less", "two_way", "other_reading", "note"]}
+
+_OGD_RULES = (
+    "You read one West Virginia tax-certificate description of a mineral / oil & gas interest, written by a county tax office in "
+    "its own shorthand. Give the facts exactly as the words state them - never invent a number.\n"
+    "Rules (from the owner of this office):\n"
+    "- A chain 'a OF b' is multiplied: '1/2 OF 1/8' = 1/16 owned. '1/3 INT IN 1/2 O&G' = 1/3 of 1/2 = 1/6.\n"
+    "- Parts joined by '&' are added: '1/3 OF 1/4 & 1/3 OF 1/4' = 1/6.\n"
+    "- If the parts add up to more than 100% (two different interests in one line, e.g. '1/4 MIN-7/8 OG'), share = '' and share_kind = 'unclear'.\n"
+    "- ROYALTY / ROYL / NPRI / OVERRIDING written on the certificate = a royalty, share_kind 'royalty' (not ownership of the minerals).\n"
+    "- A tiny decimal interest ('.0057 INT', '30303/20000000') = share_kind 'decimal' (a production interest on the tax roll).\n"
+    "- LESS / EXC / EXCEPT / OUT / RESERVED before or after a fraction = a part the owner does NOT have: put it in 'less' and leave "
+    "it out of share. Never compute 1 minus that part.\n"
+    "- Deed book/page like '(84/149)', 'DB 85/470', 'B35-131', CNR# / NRA / API / permit numbers, well numbers ('W8-21/23'), lot "
+    "numbers and civil-action numbers are NOT shares.\n"
+    "- Acres: 'AC', 'A', 'ACRES', '-A'; P / PS / PLS / POLES = perches (160 to an acre). A whole number followed by a fraction "
+    "('71 1/2', '2 3/4', '28-3/4', '48/100A') is usually acres, not a share. But a county may also write '127 1/2 OG' meaning "
+    "127 acres with a 1/2 share - when the words honestly allow both, set two_way true and give the other reading.\n"
+    "- Shorthand: OG / O&G / O G / OGM / COG = oil & gas (and other minerals); MIN / M = minerals; INT = interest; SUR = surface; "
+    "100% / ALL MINERALS = all of it; 'EXC OG' or 'LESS ALL MINERALS' = surface only (share '' , kind 'none').\n"
+    "Answer only from these words; share_kind 'none' when no share is written.")
+
+
+def _og_desc_read(desc, model):
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    msg = client.messages.create(
+        model=model, max_tokens=1500, system=_OGD_RULES,
+        messages=[{"role": "user", "content": "Description:\n" + desc}],
+        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+        extra_body={"output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": _OGD_SCHEMA}}, "fallbacks": "default"})
+    _ai_log(msg, "og_desc_compare")
+    text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+    try: out = json.loads(text)
+    except Exception:
+        m = _re_re.search(r"\{.*\}", text, _re_re.S); out = json.loads(m.group(0)) if m else {"error": text[:300]}
+    u = getattr(msg, "usage", None)
+    usage = {"model": getattr(msg, "model", model), "in": getattr(u, "input_tokens", 0) or 0, "out": getattr(u, "output_tokens", 0) or 0} if u else {}
+    return out, usage
+
+
+def og_desc_compare_loop():
+    """🔬 One-off test (Ari 10/19, og_desc_ai_test rows): 100 certificate descriptions read by Opus 5.5 and Sonnet 5.5, to compare
+    with the rules (og_parse) field by field. Only rows queued in that table; nothing else."""
+    import time as _t
+    _t.sleep(90)
+    while True:
+        try:
+            job = _fz_rpc("og_desc_compare_next", {})
+        except Exception:
+            job = None
+        if not job:
+            _t.sleep(600); continue
+        _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "og_desc_compare", job["county"], job["cert"]
+        out = {"id": job["id"]}
+        try:
+            out["opus"], out["opus_usage"] = _og_desc_read(job["description"], "claude-opus-5-5")
+            out["sonnet"], out["sonnet_usage"] = _og_desc_read(job["description"], "claude-sonnet-5-5")
+            out["status"] = "done"
+        except FzPaused:
+            _t.sleep(1800); continue
+        except Exception as e:
+            out.update(status="failed", error=str(e)[:300])
+        try: _fz_rpc("og_desc_compare_save", {"p": out})
+        except Exception as e: print(f"[og-desc-compare] save failed: {e}", flush=True)
+        _t.sleep(2)
+
+
 def client_mail_loop():
     import time as _t
     _t.sleep(60)
@@ -10602,6 +10678,7 @@ if __name__ == '__main__':
                 _og_threading.Thread(target=sao_loop, args=(_s,), daemon=True).start()
         _og_threading.Thread(target=client_mail_loop, daemon=True).start()        # 🔑 client portal login emails
         _og_threading.Thread(target=fz_compare_loop, daemon=True).start()         # 🔬 reader model comparison (one-off rows)
+        _og_threading.Thread(target=og_desc_compare_loop, daemon=True).start()    # 🔬 description reader test: Opus 5.5 vs Sonnet 5.5 (Ari 10/19, one-off)
         _og_threading.Thread(target=putnam_loop, daemon=True).start()             # 🏛 Putnam with Fernando's own login (slow)
         _og_threading.Thread(target=client_fz_loop, daemon=True).start()          # 💬 clients ask Fernando about their own file
         _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
