@@ -9352,6 +9352,80 @@ def og_desc_compare_loop():
         _t.sleep(2)
 
 
+_OGU_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    "rows": {"type": "array", "items": {"type": "object", "additionalProperties": False, "properties": {
+        "tract": {"type": "string", "description": "unit tract number or letter as written; '' if none"},
+        "parcel": {"type": "string", "description": "tax map / parcel as written (district-map-parcel, e.g. '12-13-64' or '06-00T9-0020-0000'); '' if none"},
+        "owner": {"type": "string", "description": "the royalty / mineral / executive interest owner's name exactly as written (with AKA)"},
+        "address": {"type": "string", "description": "last known address as written; '' if none; 'Unknown' when the table says unknown"},
+        "fraction": {"type": "string", "description": "the owner's fractional / decimal mineral interest in the tract as written ('0.0833334', '12.5000%', '1/8'); '' if not on this page"},
+        "gross_acres": {"type": "string", "description": "gross acres of the tract / lease as written; '' if none"},
+        "net_acres": {"type": "string", "description": "the owner's net acres (in the tract or in the unit) as written; '' if none"},
+        "leased": {"type": "string", "enum": ["Y", "N", ""], "description": "Y when the row shows the interest is leased, N when unleased, '' when not shown"},
+        "unknown": {"type": "string", "enum": ["Y", "N", ""], "description": "Y when the row marks the owner unknown / unlocatable / unfound"},
+        "consent": {"type": "string", "enum": ["Y", "N", ""], "description": "Y when the row shows consent to pool / unitize"},
+        "instrument": {"type": "string", "description": "Lease / Fee / Cotenancy / Unleased ... as written; '' if none"},
+        "book_page": {"type": "string", "description": "recording book/page or instrument number as written; '' if none"}},
+        "required": ["tract", "parcel", "owner", "address", "fraction", "gross_acres", "net_acres", "leased", "unknown", "consent", "instrument", "book_page"]}},
+    "note": {"type": "string", "description": "one short sentence: what table this page is (or 'no owner table on this page')"}},
+    "required": ["rows", "note"]}
+
+_OGU_RULES = (
+    "You read ONE page of a West Virginia Oil and Gas Conservation Commission unitization filing (an exhibit table of royalty / "
+    "mineral owners in a horizontal well unit, extracted as text, columns run together). Return one row per OWNER LINE on the page, "
+    "exactly as written - never invent, never compute. A table header on the page tells you the column order; follow it. Operators / "
+    "working-interest tables (Antero, SWN, EQT as the owner with 'WI' percentages) are owner rows too - include them. If the page is a "
+    "tract listing with no owner names, a mailing list with no interests, or not a table, return no rows and say so in the note. "
+    "Percent columns stay as written ('12.5000%'); decimals as written. Names: keep AKA / Trustee words. A row that is split over "
+    "several lines (long names, addresses) is one row.")
+
+
+def _og_unit_page_read(text):
+    import anthropic
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    msg = client.messages.create(
+        model=_OGD_MODEL, max_tokens=8000,
+        system=[{"type": "text", "text": _OGU_RULES, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": "Page text:\n" + text[:12000]}],
+        extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
+        extra_body={"output_config": {"effort": "medium", "format": {"type": "json_schema", "schema": _OGU_SCHEMA}}, "fallbacks": "default"})
+    _ai_log(msg, "og_unit_page")
+    t = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", "") == "text")
+    try: out = json.loads(t)
+    except Exception:
+        m = _re_re.search(r"\{.*\}", t, _re_re.S); out = json.loads(m.group(0)) if m else {"rows": [], "note": "unreadable: " + t[:200]}
+    u = getattr(msg, "usage", None)
+    usage = {"model": getattr(msg, "model", _OGD_MODEL), "in": getattr(u, "input_tokens", 0) or 0, "out": getattr(u, "output_tokens", 0) or 0,
+             "cache_read": getattr(u, "cache_read_input_tokens", 0) or 0} if u else {}
+    return out, usage
+
+
+def og_unit_page_loop():
+    """🏛 Unitization owner tables the regex reader cannot read (SWN / HG / Expand layouts): one page at a time through Sonnet 5.5
+    (og_unit_page rows, Ari 10/19 'A now then B', ~$12 for ~600 pages). Idle when the queue is empty."""
+    import time as _t
+    _t.sleep(120)
+    while True:
+        try:
+            job = _fz_rpc("og_unit_page_next", {})
+        except Exception:
+            job = None
+        if not job:
+            _t.sleep(900); continue
+        _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "og_unit_page", None, job["source_file"]
+        out = {"id": job["id"]}
+        try:
+            out["read"], out["usage"] = _og_unit_page_read(job["text"])
+            out["status"] = "done"
+        except FzPaused:
+            _t.sleep(1800); continue
+        except Exception as e:
+            out.update(status="failed", error=str(e)[:300])
+        try: _fz_rpc("og_unit_page_save", {"p": out})
+        except Exception as e: print(f"[og-unit-page] save failed: {e}", flush=True)
+        _t.sleep(1)
+
+
 def client_mail_loop():
     import time as _t
     _t.sleep(60)
@@ -10880,6 +10954,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=fz_compare_loop, daemon=True).start()         # 🔬 reader model comparison (one-off rows)
         _og_threading.Thread(target=og_desc_compare_loop, daemon=True).start()    # 🔬 description reader test: Opus 5.5 vs Sonnet 5.5 (Ari 10/19, one-off)
         _og_threading.Thread(target=og_desc_read_loop, daemon=True).start()       # 🤖 AI second reader for odd descriptions, Sonnet 5.5 (Ari 10/19)
+        _og_threading.Thread(target=og_unit_page_loop, daemon=True).start()       # 🏛 unitization owner-table pages the regex reader can't read, Sonnet 5.5 (Ari 10/19)
         _og_threading.Thread(target=putnam_loop, daemon=True).start()             # 🏛 Putnam with Fernando's own login (slow)
         _og_threading.Thread(target=client_fz_loop, daemon=True).start()          # 💬 clients ask Fernando about their own file
         _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
