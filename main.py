@@ -6598,22 +6598,76 @@ def fz_address_suggest_loop():
 # verified ourselves are never touched; a ticket someone is editing waits; a job on hold or a county he can't search goes
 # to Anne/Ari as one question (fz_pending_flag). On/off: fz_config 'redeemed_filing'.
 # ─────────────────────────────────────────────────────────────────────────────
-_FZ_MERGE_JS = {"src": None, "at": 0}
+_FZ_MERGE_JS = {"src": None, "letter": None, "at": 0}
 
 
-def _fz_merge_js():
-    """attorney.html's merge code (fzBP ... fzMerge) from the live portal, kept for an hour."""
+def _fz_page_js():
+    """attorney.html's own code from the live portal, kept for an hour: the merge (fzBP ... fzMerge) and the title search
+    letter (LOGO_BASE64 + generateReport + tsLetterBytes) - the server makes exactly what the page makes."""
     import time as _t
     if _FZ_MERGE_JS["src"] and _t.time() - _FZ_MERGE_JS["at"] < 3600:
-        return _FZ_MERGE_JS["src"]
+        return _FZ_MERGE_JS
     req = _re_ur.Request(f"https://portal.annelabes.com/attorney.html?v={int(_t.time())}", headers={"User-Agent": "annelabes-portal/1.0"})
     with _re_ur.urlopen(req, timeout=60) as r:
         page = r.read().decode("utf-8").replace("\r\n", "\n")
-    a = page.index("function fzBP(")
-    b = page.index("function fzMerge(", a)
-    end = page.index("\n}\n", b) + 3
-    _FZ_MERGE_JS.update(src=page[a:end], at=_t.time())
-    return _FZ_MERGE_JS["src"]
+    def block(start, upto=None):
+        a = page.index(start)
+        b = page.index(upto, a) if upto else a
+        return page[a:page.index("\n}\n", b) + 3]
+    logo_a = page.index("const LOGO_BASE64 = ")
+    logo = page[logo_a:page.index("\n", logo_a) + 1]
+    gen = block("function generateReport(")
+    tsl_a = page.index("function tsLetterBytes(")
+    tsl = page[tsl_a:page.index("\n", tsl_a) + 1]
+    _FZ_MERGE_JS.update(src=block("function fzBP(", "function fzMerge("), letter=logo + gen + tsl, at=_t.time())
+    return _FZ_MERGE_JS
+
+
+def _fz_merge_js():
+    return _fz_page_js()["src"]
+
+
+def _fz_letter_pdf(ticket, job):
+    """📄 The title search letter for a verified ticket, made by the page's own generateReport in a headless page (jsPDF
+    from the same CDN the page uses). Returns the PDF as base64."""
+    from playwright.sync_api import sync_playwright
+    js = _fz_page_js()
+    with sync_playwright() as p:
+        b = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        try:
+            pg = b.new_context(timezone_id="America/New_York", locale="en-US").new_page()
+            pg.set_content("<html><body><img id='logo-data' src=''></body></html>")
+            pg.add_script_tag(url="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js")
+            pg.add_script_tag(content="var jobs = []; var currentTS = null; window.alert = function(m){ window.__alert = m; };\n" + js["letter"])
+            return pg.evaluate("""async ([t, job]) => {
+                await new Promise((ok, bad) => { const img = new Image();
+                  img.onload = () => { const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+                                       c.getContext('2d').drawImage(img, 0, 0); document.getElementById('logo-data').src = c.toDataURL('image/png'); ok(); };
+                  img.onerror = () => bad(new Error('logo did not load')); img.src = LOGO_BASE64; });
+                jobs = job ? [job] : [];
+                const buf = tsLetterBytes(t);
+                if (!buf) throw new Error(window.__alert || 'no letter');
+                const u = new Uint8Array(buf); let s = '';
+                for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+                return btoa(s); }""", [ticket, job])
+        finally:
+            b.close()
+
+
+def fz_letters_one():
+    """Letters the redeemed / pending filings are waiting for: made here, kept on the job, email queued."""
+    did = False
+    for it in (_fz_rpc("fz_letters_todo", {"p_limit": 5}) or []):
+        try:
+            if _mem_used() > _FZ_MEM_MAX: break
+            b64 = _fz_letter_pdf(it["ticket"], it.get("job"))
+            res = _fz_rpc("fz_letter_put", {"p_job_id": it["job_id"], "p_pdf_b64": b64}) or {}
+            t = it.get("ticket") or {}
+            print(f"[letter] {t.get('county')} {t.get('cert')}: {'email queued to ' + str(res.get('to')) if res.get('ok') else res.get('why')}", flush=True)
+            did = True
+        except Exception as e:
+            print(f"[letter] {it.get('job_id')}: {str(e)[:200]}", flush=True)
+    return did
 
 
 def _fz_merge_ticket(ticket, run):
@@ -6689,9 +6743,10 @@ def fz_pending_loop():
                         worked = _fz_pending_one(it) or worked
                     except Exception as e:
                         print(f"[pending] {it.get('county')} {it.get('cert')}: {str(e)[:200]}", flush=True)
+                worked = fz_letters_one() or worked                  # 📄 the letters too (Ari 10/19 "move the letter to the server")
         except Exception as e:
             print(f"[pending] {str(e)[:200]}", flush=True)
-        _t.sleep(120 if worked else 300)
+        _t.sleep(120 if worked else 180)
 
 
 def landapp_server_loop():
