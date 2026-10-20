@@ -8628,8 +8628,9 @@ class PutnamSite:
             _fz_rpc("idx_ingest_srv", {"p_county": "PUTNAM", "p_search": "name:" + term, "p_rows": got[i:i + 1500], "p_page": 0, "p_pages": 1})
         return len(rows)
 
-    def images(self, term):
-        """term 'book/page' -> the viewer's page pictures of every paper at that book/page (first 3 pages each)."""
+    def images(self, term, collect=None):
+        """term 'book/page' -> the viewer's page pictures of every paper at that book/page (first 3 pages each).
+        collect: a list that also receives each picture as base64 JPEG (the lease reader reads them)."""
         import base64 as _b64
         self.search_page(term)
         want = _re_re.sub(r"\s+", "", term)
@@ -8658,6 +8659,7 @@ class PutnamSite:
                 mime, data = self._jpeg(body)
                 _fz_rpc("idx_image_put_srv", {"p_county": "PUTNAM", "p_index_id": int(iid), "p_book_page": want, "p_page_no": n,
                                               "p_mime": mime, "p_b64": _b64.b64encode(data).decode()})
+                if collect is not None and mime == "image/jpeg" and len(collect) < 8: collect.append(_b64.b64encode(data).decode())
                 saved += 1
         return saved
 
@@ -8695,6 +8697,58 @@ def putnam_loop():
             _t.sleep(60)
 
 
+def _putnam_lease_one(st):
+    """🛢️ Putnam leases (Ari 10/20: "putnam you have your own login"): one queued Putnam lease, opened with Fernando's own
+    membership at the county's pace (each document counts in the daily cap), read like every other lease. True = did one."""
+    if (_fz_rpc("fz_config_get", {"p_key": "lease_read"}) or "off").strip().lower().startswith("off"):
+        return False
+    jobs = _fz_rpc("og_lease_read_claim", {"p_counties": ["PUTNAM"], "p_n": 1, "p_new": False}) or []
+    if not jobs:
+        return False
+    j = jobs[0]
+    bp = (j.get("book_page") or "").strip()
+    o = {"status": "done", "descr": j.get("descr") or ""}
+    try:
+        if not bp:
+            o = {"status": "skipped", "error": "no book/page to open in RECORDhub"}
+        else:
+            if st["site"] is None: st["site"] = PutnamSite()
+            imgs = []
+            st["site"].images(bp, collect=imgs)
+            if not imgs:
+                o = {"status": "failed", "error": "no pages found at " + bp}
+            else:
+                _AI_CTX.feature, _AI_CTX.county, _AI_CTX.cert = "lease_read", "PUTNAM", j.get("instrument")
+                try:
+                    read = _idx2_read_doc("lease", imgs, model=_LR_CHEAP)
+                finally:
+                    _AI_CTX.feature = _AI_CTX.county = _AI_CTX.cert = None
+                if read and not read.get("error"):
+                    o["read"] = read
+                    o["descr"] = " ".join(x for x in [o["descr"], read.get("tract_description") or "", read.get("watercourse") or "",
+                                                     (read.get("acres") or "") + (" AC" if read.get("acres") else "")] if x).strip()
+                    spot = _lr_tax_spot("PUTNAM", read.get("district"), read.get("tax_ids"), o["descr"])
+                    if spot: o["lat"], o["lng"], o["radius"], o["how"] = spot[0], spot[1], spot[2], "tax_map"
+                else:
+                    o = {"status": "failed", "error": "could not read the pages: " + str((read or {}).get("error"))[:150]}
+    except PutnamStop as e:
+        msg = str(e)
+        o = {"status": "queued", "error": msg[:250]}                     # back in line (cap / switched off / stop)
+        if "daily cap" not in msg and "switched off" not in msg:
+            _fz_rpc("putnam_stop", {"p_reason": msg})
+        try:
+            if st["site"]: st["site"].close()
+        except Exception: pass
+        st["site"] = None
+    except FzPaused:
+        o = {"status": "queued", "error": "AI paused (spending limit)"}
+    _fz_rpc("og_lease_read_save", {"p_county": "PUTNAM", "p_instrument": j["instrument"], "p_status": o.get("status"),
+                                   "p_read": o.get("read"), "p_descr": o.get("descr"), "p_lat": o.get("lat"), "p_lng": o.get("lng"),
+                                   "p_radius": o.get("radius"), "p_how": o.get("how"), "p_error": o.get("error")})
+    print(f"[putnam] lease {j['instrument']}: {o.get('status')} {(o.get('error') or '')[:80]}", flush=True)
+    return o.get("status") != "queued"
+
+
 def _putnam_tick(st):
     """One round: serve one title request, or (7-9 pm New York) one bank name, or rest. Errors go up to putnam_loop."""
     import time as _t
@@ -8704,6 +8758,8 @@ def _putnam_tick(st):
     if (_fz_rpc("fz_config_get", {"p_key": "putnam_server"}) or "on") != "on":
         close(); _t.sleep(600); return
     req = _fz_rpc("idx_live_next_srv", {"p_county": "PUTNAM"})
+    if not req and _putnam_lease_one(st):
+        return
     if not req:
         # 🗂 collecting owners for our bank (not title work): only 7-9 pm New York time (Ari), names only, no pictures
         term = _fz_rpc("putnam_bank_next_srv", {})
