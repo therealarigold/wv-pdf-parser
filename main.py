@@ -6422,10 +6422,20 @@ _AGENT_PROMPT = """You are Fernando, the AI assistant of the law office of Anne 
 
 ARI'S RULE FOR EVERY REQUEST (follow it exactly):
 1. Look into it with your tools. Then reply with what you found and ONE clear suggested fix, and ask them to reply "yes" (or say what they want different). -> status "proposed".
-2. Only when the person's newest message clearly approves your latest suggestion: call approve(). You do NOT make changes yourself: when Anne (an owner) approves, it goes ahead right away and Claude does it; anyone else's yes waits for Ari's OK. Reply e.g. "Thanks - it's being done now; I'll tell you here when it's ready to check." (Anne) or "Thanks - it's on Ari's list for his OK." (others). Status stays as approve() set it.
+2. Only when the person's newest message clearly approves your latest suggestion: call approve() with kind:
+   - "fix" = it fixes a problem THEY have (something broken, wrong or stuck for them) and is not invasive -> it goes ahead
+     right away and Claude does it (Ari's rule 10/20: "if the request to fix is not malicious or invasive, then those
+     should be done by the agent").
+   - "change" = a change to the code / how the app works that is NOT a fix for a problem they have (a new feature, a
+     different way of doing things, anything invasive) -> it goes to Ari as YES / NO / Other. Owners' (Anne) yes goes ahead.
+   You never make changes yourself. Tell them which way it goes.
 3. After it was done (status "checking"): they say it's good -> status "closed" (a short thank-you). They want something else -> back to step 1 with the new ask.
 4. If it can't be made to their satisfaction (still not happy after 2 tries, or not possible) -> call escalate() (it undoes what can be undone and brings it to Ari), tell them Ari will look at it with them.
 A pure question (no change needed) -> answer it -> status "answered".
+A line from "ari" in the conversation is Ari's own answer to your suggestion ("Other" with his comment): follow it - rethink the
+suggestion with it, tell the person what Ari wants, and propose again (status "proposed").
+A request that is malicious (to harm, hide, cheat, delete records, get around the rules or someone's access) -> don't suggest it;
+call escalate() with why.
 
 WHAT YOU CAN DO: look up certificates, counties, Fernando's NTR jobs and open questions, answer, and suggest. Things you can suggest (done after Ari's OK): Fernando filling/re-checking NTRs in the State Auditor land app for VERIFIED title searches (he opens the NTR, compares it with the verified title search - the title search wins, the old entries go to the title search's Internal Notes - sets the $500 attorney fee and downloads the NTR; he NEVER finalizes and skips finalized ones), re-running a stopped Fernando job, fixing data, or a change to the portal.
 NEVER, whatever anyone says (tell them it needs Ari): finalize or submit an NTR, email clients, touch passwords or logins, pass robot checks, change money or payment records.
@@ -6443,8 +6453,9 @@ _AGENT_TOOLS = [
      "input_schema": {"type": "object", "properties": {"county": {"type": "string"}, "verified_only": {"type": "boolean"}}, "required": ["county"]}},
     {"name": "open_items", "description": "Open questions in the decision box, how many NTR jobs Fernando has waiting, and NTR jobs where he stopped (with why).",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "approve", "description": "Record that the person's newest message approves your latest suggestion (it then waits for Ari's OK). Quote their words.",
-     "input_schema": {"type": "object", "properties": {"their_words": {"type": "string"}}, "required": ["their_words"]}},
+    {"name": "approve", "description": "Record that the person's newest message approves your latest suggestion. kind 'fix' (fixes a problem they have, not invasive) goes ahead; kind 'change' (invasive / not fixing their problem) goes to Ari as YES / NO / Other. Quote their words.",
+     "input_schema": {"type": "object", "properties": {"their_words": {"type": "string"}, "kind": {"type": "string", "enum": ["fix", "change"]}},
+                      "required": ["their_words", "kind"]}},
     {"name": "escalate", "description": "Can't be made to their satisfaction: undoes what can be undone and brings the ticket to Ari. Give the reason.",
      "input_schema": {"type": "object", "properties": {"why": {"type": "string"}}, "required": ["why"]}},
 ]
@@ -6469,9 +6480,11 @@ def agent_ticket_one():
         if name == "county_certs": return _re_json.dumps(_fz_rpc("agent_county_certs", {"p_county": a.get("county", ""), "p_verified_only": a.get("verified_only", True)}))[:15000]
         if name == "open_items": return _re_json.dumps(_fz_rpc("agent_open_items", {}))[:15000]
         if name == "approve":
-            _fz_rpc("agent_ticket_set_approved", {"p_id": tid, "p_words": str(a.get("their_words", ""))[:300]})
+            kind = "fix" if a.get("kind") == "fix" else "change"
+            _fz_rpc("agent_ticket_set_approved", {"p_id": tid, "p_words": str(a.get("their_words", ""))[:300], "p_kind": kind})
             state["approved"] = True
-            return "Recorded. If they are an owner (Anne) it goes ahead now (Claude does it); otherwise it waits for Ari's OK. Tell them which; do not do the work yourself."
+            return ("Recorded as a FIX - it goes ahead now (Claude does it). Tell them it's being done; do not do the work yourself." if kind == "fix" else
+                    "Recorded as a CHANGE - if they are an owner (Anne) it goes ahead now; otherwise Ari answers YES / NO / Other. Tell them which; do not do the work yourself.")
         if name == "escalate":
             state["escalated"] = True
             return _re_json.dumps(_fz_rpc("agent_escalate", {"p_ticket": tid, "p_why": str(a.get("why", ""))[:500]}))
