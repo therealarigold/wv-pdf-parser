@@ -547,6 +547,9 @@ def send_gs_call(p, path="/integrations/portal-call"):
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             out = json.loads(r.read() or b"{}")
+        if path.endswith("/portal-diego") and out.get("status"):
+            # Diego checks every staff message first (Gold Standard, Ari 10/21): sent / ari (waits for Ari's Yes) / held
+            return "sent", f"diego: {out.get('status')}" + (f" - {str(out.get('why'))[:150]}" if out.get("why") else "")
         return "sent", f"{p.get('action')} → {out.get('calendar_of') or ('removed' if out.get('removed') else 'ok')}"
     except urllib.error.HTTPError as ex:
         err = ex.read().decode("utf-8", "replace")[:200]
