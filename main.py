@@ -8749,6 +8749,45 @@ def _putnam_lease_one(st):
     return o.get("status") != "queued"
 
 
+_PUTNAM_FORM_JS = """() => {
+  const lab = e => { const l = e.id && document.querySelector('label[for="' + e.id + '"]'); return (l ? l.innerText : (e.closest('label') || {}).innerText || '').trim().slice(0, 80); };
+  const ctl = [...document.querySelectorAll('input, select, textarea, button')].map(e => ({tag: e.tagName, id: e.id, name: e.name, type: e.type,
+      ph: e.placeholder || '', label: lab(e), text: (e.innerText || e.value || '').trim().slice(0, 60), shown: !!e.offsetParent,
+      options: e.tagName === 'SELECT' ? [...e.options].slice(0, 80).map(o => o.value + '=' + o.text.trim()) : undefined}));
+  const links = [...document.querySelectorAll('a, [role=tab], [data-toggle], [data-bs-toggle]')].map(a => ((a.innerText || '').trim().slice(0, 50) + ' -> ' + (a.getAttribute('href') || a.getAttribute('data-target') || a.getAttribute('data-bs-target') || ''))).filter(t => /date|advanc|record|search|type|filter|range/i.test(t)).slice(0, 60);
+  const scripts = [...document.scripts].map(x => x.src).filter(Boolean).slice(0, 40);
+  const api = [...document.scripts].map(x => x.src ? '' : x.textContent).join(' ').match(/\\/api\\/[A-Za-z0-9_\\/{}.-]+/g) || [];
+  return {url: location.href, title: document.title, controls: ctl.slice(0, 200), links, scripts, api: [...new Set(api)].slice(0, 60),
+          text: (document.querySelector('form, main, #content, body').innerText || '').slice(0, 4000)};
+}"""
+
+
+def _putnam_probe(st):
+    """🔎 One look at RECORDhub's search page (Ari 10/21: Putnam in the weekly "what's new"): which date-range / document-type
+    boxes it has, so the Putnam sweep can be built on the real form. Runs once when fz_config putnam_probe = 'go'; one
+    search-page step at the county's pace, nothing searched or opened. Result in fz_config putnam_form."""
+    if (_fz_rpc("fz_config_get", {"p_key": "putnam_probe"}) or "") != "go":
+        return False
+    _fz_rpc("fz_config_set", {"p_key": "putnam_probe", "p_value": "running"})
+    try:
+        if st["site"] is None: st["site"] = PutnamSite()
+        site = st["site"]
+        if not site.signed_in: site.login()
+        site.step()
+        site.page.goto(_PH + "/PutnamWV/Search/Records", wait_until="domcontentloaded")
+        site.check("search page")
+        site.page.wait_for_timeout(4000)
+        info = site.page.evaluate(_PUTNAM_FORM_JS)
+        _fz_rpc("fz_config_set", {"p_key": "putnam_form", "p_value": _re_json.dumps(info)[:60000]})
+        _fz_rpc("fz_config_set", {"p_key": "putnam_probe", "p_value": "done"})
+        print("[putnam] search form saved for the sweep", flush=True)
+    except PutnamStop as e:
+        _fz_rpc("fz_config_set", {"p_key": "putnam_probe", "p_value": "stopped: " + str(e)[:200]})
+    except Exception as e:
+        _fz_rpc("fz_config_set", {"p_key": "putnam_probe", "p_value": "failed: " + str(e)[:200]})
+    return True
+
+
 def _putnam_tick(st):
     """One round: serve one title request, or (7-9 pm New York) one bank name, or rest. Errors go up to putnam_loop."""
     import time as _t
@@ -8757,6 +8796,8 @@ def _putnam_tick(st):
         st["site"] = None
     if (_fz_rpc("fz_config_get", {"p_key": "putnam_server"}) or "on") != "on":
         close(); _t.sleep(600); return
+    if _putnam_probe(st):
+        return
     req = _fz_rpc("idx_live_next_srv", {"p_county": "PUTNAM"})
     if not req and _putnam_lease_one(st):
         return
