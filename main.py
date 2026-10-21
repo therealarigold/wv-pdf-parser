@@ -684,15 +684,20 @@ LIEN_TYPES = ["DEED OF TRUST","TRUST DEED","MORTGAGE","LIEN","JUDGMENT",
 RELEASE_TYPES = ["RELEASE","SATISFACTION","DISCHARGE","RECONVEYANCE"]
 DEED_TYPES = ["DEED","WARRANTY","QUITCLAIM","EXECUTOR","ADMINISTRATOR","COMMISSIONER"]
 
+import threading as _browser_threading
+_BROWSER_LAUNCH_LOCK = _browser_threading.Lock()
+
+
 def get_playwright_browser():
     from playwright.sync_api import sync_playwright
-    print("[IDX] Launching browser...", flush=True)
-    p = sync_playwright().start()
-    browser = p.chromium.launch(headless=True, args=[
-        "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
-        "--disable-gpu","--single-process","--no-zygote",
-    ])
-    print("[IDX] Browser ready", flush=True)
+    with _BROWSER_LAUNCH_LOCK:                   # one browser starts at a time (Ari 10/21 step 1: simultaneous starts spiked memory)
+        print("[IDX] Launching browser...", flush=True)
+        p = sync_playwright().start()
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
+            "--disable-gpu","--single-process","--no-zygote",
+        ])
+        print("[IDX] Browser ready", flush=True)
     return p, browser
 
 def idx_search(page, search_type, fields, from_date="01/01/1700"):
@@ -5740,15 +5745,29 @@ def _fz_rpc(name, args):
 
 
 def _mem_used():
-    """Bytes this service uses now (the container's own count - what Render's 2 GB limit is checked against); 0 if unknown."""
-    for f in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+    """Bytes this service really uses now (the container's own count - what Render's 2 GB limit is checked against) minus
+    the file cache the system takes back on its own when memory is needed (Ari 10/21 step 1: the old count included it,
+    so Fernando waited when there was room); 0 if unknown."""
+    for f, stat, key in (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "inactive_file"),
+                         ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")):
         try:
-            with open(f) as fh: return int(fh.read().strip())
+            with open(f) as fh: used = int(fh.read().strip())
+        except Exception:
+            continue
+        try:
+            with open(stat) as fh:
+                for line in fh:
+                    k, _, v = line.partition(" ")
+                    if k == key: used -= int(v); break
         except Exception: pass
+        return max(used, 0)
     return 0
 
 
 _FZ_MEM_MAX = int(float(os.environ.get("FERNANDO_MEM_MAX_GB", "1.3")) * 1024 ** 3)
+# 🙋 work staff asked for (title searches, surplus heir searches) goes first (Ari 10/21): it may use more memory than the
+# background reading (leases, sweeps, look-backs), which waits at _FZ_MEM_MAX - so staff work runs while background waits
+_FZ_STAFF_MEM_MAX = int(float(os.environ.get("FERNANDO_STAFF_MEM_MAX_GB", "1.6")) * 1024 ** 3)
 
 
 _FZ_INFLIGHT = {"msgs": set(), "gmsgs": set(), "runs": {}}
@@ -5767,7 +5786,7 @@ def fernando_handback_all(why="restart"):
 
 def fernando_work_one():
     if _ai_paused(): return False
-    if _mem_used() > _FZ_MEM_MAX:            # each search opens its own browser - wait until memory frees up (no crash)
+    if _mem_used() > _FZ_STAFF_MEM_MAX:      # each search opens its own browser - wait until memory frees up (no crash)
         FERNANDO["waiting_memory"] = round(_mem_used() / 1024 ** 3, 2); return False
     FERNANDO.pop("waiting_memory", None)
     run = _fz_rpc("fernando_claim", {})
@@ -9410,9 +9429,14 @@ def surplus_fz_one():
 def surplus_fz_loop():
     import time as _t
     _t.sleep(150)
+    try:                                         # the only surplus worker: anything still 'working' was cut off by a restart
+        n = _fz_rpc("surplus_fz_requeue_orphans", {})
+        if n: print(f"[surplus] {n} job(s) cut off by the restart - back in line", flush=True)
+    except Exception as e:
+        print(f"[surplus] requeue: {str(e)[:150]}", flush=True)
     while True:
         try:
-            if _mem_used() > _FZ_MEM_MAX: _t.sleep(60); continue
+            if _mem_used() > _FZ_STAFF_MEM_MAX: _t.sleep(30); continue
             worked = surplus_fz_one()
         except Exception as e:
             print(f"[surplus] {e}", flush=True); worked = False
@@ -10963,6 +10987,8 @@ def lease_read_loop(worker=0, workers=1):
                 counties = [c.strip().upper() for c in v[3:].split(",") if c.strip()] if v.startswith("on:") else []
                 counties = [c for c in counties if (c in IDX2_URLS or c in IDX2_SURVEY) and c not in PERSON_COUNTIES]
             counties = [c for i, c in enumerate(sorted(counties)) if i % workers == worker]
+            if _mem_used() > _FZ_MEM_MAX:              # background work: wait for memory BEFORE taking jobs (Ari 10/21 step 1)
+                _t.sleep(60); continue
             # this worker's counties + (worker 0 only) leases of new certificates in green counties (option 1, 10/16)
             jobs = _fz_rpc("og_lease_read_claim", {"p_counties": counties, "p_n": 5, "p_new": worker == 0}) or []
             if not jobs:
