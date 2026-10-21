@@ -8628,6 +8628,50 @@ class PutnamSite:
             _fz_rpc("idx_ingest_srv", {"p_county": "PUTNAM", "p_search": "name:" + term, "p_rows": got[i:i + 1500], "p_page": 0, "p_pages": 1})
         return len(rows)
 
+    def date_search(self, d_from, d_thru):
+        """🔄 Expanded Search with only Date From / Date Thru (every index type) - the weekly "what's new" (Ari 10/21)."""
+        for attempt in range(2):
+            if not self.signed_in: self.login()
+            self.step()
+            self.page.goto(_PH + "/PutnamWV/Search/Records", wait_until="domcontentloaded")
+            if self.signed_out():
+                self.signed_in = False; continue
+            self.check("search page")
+            self.page.click("#expandedTab")
+            self.page.wait_for_timeout(1500)
+            self.page.fill("#Expanded_FromDate", d_from.isoformat())
+            self.page.fill("#Expanded_ThruDate", d_thru.isoformat())
+            self.page.click("#Search")
+            self.page.wait_for_selector("#search-results-table tbody tr", timeout=120000)
+            self.check("search results")
+            return
+        raise PutnamStop("could not stay signed in")
+
+    def sweep(self, d_from, d_thru, max_pages=400):
+        """Everything recorded d_from..d_thru into the bank, page by page at the county's pace (each page is a 'search' step).
+        Returns (rows kept, pages, the table's 'Showing x of N' line)."""
+        self.date_search(d_from, d_thru)
+        key = f"sweep:{d_from.isoformat()}..{d_thru.isoformat()}"
+        kept, n = 0, 0
+        info = ""
+        while True:
+            try: info = self.page.inner_text(".dataTables_info", timeout=3000).strip()
+            except Exception: pass
+            got = self.ingest_rows([r for r in self.page.evaluate(self._ROWS) if len(r["cells"]) >= 11])
+            if got:
+                _fz_rpc("idx_ingest_srv", {"p_county": "PUTNAM", "p_search": key, "p_rows": got, "p_page": n, "p_pages": None})
+            kept += len(got); n += 1
+            nxt = self.page.locator(".paginate_button.next:not(.disabled)")
+            if n >= max_pages or not nxt.count(): break
+            self.step()
+            before = self.page.evaluate("() => (document.querySelector('#search-results-table tbody') || {}).innerText || ''")
+            nxt.first.click()
+            for _ in range(40):
+                self.page.wait_for_timeout(1000)
+                if self.page.evaluate("() => (document.querySelector('#search-results-table tbody') || {}).innerText || ''") != before: break
+            self.check("search results")
+        return kept, n, info
+
     def images(self, term, collect=None):
         """term 'book/page' -> the viewer's page pictures of every paper at that book/page (first 3 pages each).
         collect: a list that also receives each picture as base64 JPEG (the lease reader reads them)."""
@@ -8788,6 +8832,54 @@ def _putnam_probe(st):
     return True
 
 
+def _putnam_sweep(st):
+    """🔄 Putnam in the weekly "what's new" (Ari 10/21), with Fernando's own membership:
+    - fz_config putnam_sweep_test = 'YYYY-MM-DD' -> one day swept now, the result in putnam_sweep_result (then 'done')
+    - fz_config putnam_sweep = 'on' -> once a week (idx_sweep row PUTNAM), 6-10 pm New York, everything since the last sweep.
+    True = it did something this round."""
+    from datetime import date as _date, timedelta as _td
+    test = (_fz_rpc("fz_config_get", {"p_key": "putnam_sweep_test"}) or "").strip()
+    job = None
+    if _re_re.match(r"^\d{4}-\d\d-\d\d$", test):
+        _fz_rpc("fz_config_set", {"p_key": "putnam_sweep_test", "p_value": "running"})
+        a = b = _date.fromisoformat(test)
+    else:
+        if (_fz_rpc("fz_config_get", {"p_key": "putnam_sweep"}) or "off").strip() != "on":
+            return False
+        try:
+            from zoneinfo import ZoneInfo
+            hour = _re_dt.now(ZoneInfo("America/New_York")).hour
+        except Exception:
+            hour = (_re_dt.utcnow().hour - 4) % 24
+        if not 18 <= hour < 22:
+            return False
+        job = _fz_rpc("idx_sweep_next", {"p_counties": ["PUTNAM"]})
+        if not job:
+            return False
+        a, b = _date.fromisoformat(job["from"]), _date.fromisoformat(job["thru"])
+    try:
+        if st["site"] is None: st["site"] = PutnamSite()
+        n, pages, info = st["site"].sweep(a, b)
+        note = f"{a}..{b}: {n} rows, {pages} pages ({info})"[:300]
+        if job: _fz_rpc("idx_sweep_done", {"p_county": "PUTNAM", "p_thru": b.isoformat(), "p_rows": n, "p_note": note})
+        else:
+            _fz_rpc("fz_config_set", {"p_key": "putnam_sweep_result", "p_value": note})
+            _fz_rpc("fz_config_set", {"p_key": "putnam_sweep_test", "p_value": "done"})
+        print(f"[putnam] sweep {note}", flush=True)
+    except Exception as e:
+        msg = str(e)[:250]
+        if job: _fz_rpc("idx_sweep_done", {"p_county": "PUTNAM", "p_thru": None, "p_rows": 0, "p_note": "failed: " + msg})
+        else: _fz_rpc("fz_config_set", {"p_key": "putnam_sweep_test", "p_value": "failed: " + msg})
+        print(f"[putnam] sweep failed: {msg}", flush=True)
+        if isinstance(e, PutnamStop):
+            if "daily cap" not in msg and "switched off" not in msg: _fz_rpc("putnam_stop", {"p_reason": msg})
+            try:
+                if st["site"]: st["site"].close()
+            except Exception: pass
+            st["site"] = None
+    return True
+
+
 def _putnam_tick(st):
     """One round: serve one title request, or (7-9 pm New York) one bank name, or rest. Errors go up to putnam_loop."""
     import time as _t
@@ -8799,6 +8891,8 @@ def _putnam_tick(st):
     if _putnam_probe(st):
         return
     req = _fz_rpc("idx_live_next_srv", {"p_county": "PUTNAM"})
+    if not req and _putnam_sweep(st):
+        return
     if not req and _putnam_lease_one(st):
         return
     if not req:
