@@ -3246,7 +3246,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/og-intel":
                 import asyncio
-                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                body = json.loads(body or b"{}")       # the body was already read at the top of do_POST - reading again waited forever (froze the server)
                 county = body.get('county','').upper().replace(' COUNTY','').strip()
                 district = body.get('district','')
                 owner = body.get('owner','')
