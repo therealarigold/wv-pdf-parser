@@ -43,8 +43,17 @@ def nightly_certificate_check():
         return u - datetime.timedelta(hours=4 if start <= u < end else 5)
     now_run = "--check-now" in sys.argv
     last_day = None
+    told = None
     while True:
         t = ny_now()
+        # (Ari 2026-10-23) 10/23 the Auditor's site stopped answering at 12:40 am, the reader paused, and the 1 am check
+        # skipped the whole night. Now it waits for the pause to end and starts then - any time before 6 am.
+        if not now_run and t.hour >= 1 and t.hour < 6 and last_day != t.date() and time.time() < main.SAO.get("pause_until", 0):
+            if told != t.date():
+                told = t.date()
+                print(f"[night check] the State Auditor site paused us - waiting {int((main.SAO['pause_until'] - time.time()) / 60)} min, then starting (until 6 am)", flush=True)
+            time.sleep(60)
+            continue
         if now_run or (t.hour >= 1 and t.hour < 6 and last_day != t.date()):
             forced = now_run                           # a manual catch-up runs on any day (weekend rule only for the 1 am run)
             now_run, last_day = False, t.date()

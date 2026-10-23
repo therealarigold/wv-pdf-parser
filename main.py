@@ -3963,15 +3963,17 @@ async def run_wvsao_refresh(scope='daily_recent'):
             print('[refresh] skipped - the server backup is off (the office PC does the nightly check)', flush=True)
             years, stop = [], True
             log['notes'] = 'skipped: State Auditor reading is off on the server'
+        elif _t.time() < SAO.get("pause_until", 0):
+            # (Ari 2026-10-23) checked BEFORE taking tonight's turn: a skipped run no longer holds the night, so the
+            # office PC can start again as soon as the pause is over (sao_local.py waits for it until 6 am)
+            print(f'[refresh] skipped - the State Auditor site is blocking us (paused {int((SAO["pause_until"] - _t.time()) / 60)} more min)', flush=True)
+            years, stop = [], True
+            log['notes'] = 'skipped: State Auditor site blocking ' + runner
         elif not _fz_rpc("refresh_night_claim", {"p_runner": runner}):
             # ONE runner a night (Ari): the office PC at 1 am, the server only as the backup when the PC did not start
             print(f'[refresh] skipped - tonight\'s check is already done / running on the other computer', flush=True)
             years, stop = [], True
             log['notes'] = 'skipped: tonight\'s check is done or running on the other computer'
-        elif _t.time() < SAO.get("pause_until", 0):
-            print(f'[refresh] skipped - the State Auditor site is blocking us (paused {int((SAO["pause_until"] - _t.time()) / 60)} more min)', flush=True)
-            years, stop = [], True
-            log['notes'] = 'skipped: State Auditor site blocking the server'
         for year in years:
             if stop: break
             for county in _WV_COUNTIES_ALL:
