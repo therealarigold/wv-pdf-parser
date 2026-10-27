@@ -23,7 +23,7 @@ Render environment:
   ENG_BRAND        — the firm's name on every client email, default "Labes Legal Services LLC" (Ari 10/27; was "Anne Labes, Esq.")
   WEB_SITE_URL     — the public website (FAQ link), default https://www.annelabes.com
 """
-import base64, hashlib, hmac, html, json, os, re, time, urllib.request, urllib.error, urllib.parse
+import base64, hashlib, hmac, html, json, os, re, threading, time, urllib.request, urllib.error, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 SB_URL = "https://uhunhyfgwvoknqnkzlmr.supabase.co"
@@ -125,9 +125,14 @@ def signed_pdf(e, subtitle="WV Tax Lien Title Services"):
 
 
 # ── the emails ────────────────────────────────────────────────────────────────────────────────
+_SURPLUS_BRAND = "Anne Labes, Esq."      # surplus clients contract with Anne herself, not the LLC (Ari 10/27)
+_brand_for = threading.local()
+
+
 def _brand():
-    """The firm's name on every client email (ENG_BRAND) - Labes Legal Services LLC since Ari 10/27 (was "Anne Labes, Esq.")."""
-    return _env("ENG_BRAND", "Labes Legal Services LLC")
+    """The firm's name on every client email (ENG_BRAND) - Labes Legal Services LLC since Ari 10/27 (was "Anne Labes, Esq.").
+    Surplus emails (send_surplus) say "Anne Labes, Esq." - surplus is Anne's own practice, not the title-search LLC."""
+    return getattr(_brand_for, "name", None) or _env("ENG_BRAND", "Labes Legal Services LLC")
 
 
 def _wrap(inner):
@@ -449,7 +454,8 @@ def _resend(to, subject, body, text, attachments=None, bcc=False, reply_to=None,
     rcpt = [to] if live else [x.strip() for x in _env("ENG_TEST_TO", "ari@eqoppa.com").split(",") if x.strip()]
     if not live:
         subject = f"[TEST → {to}] " + subject
-    msg = {"from": _env("ENG_FROM", "Marci at " + _brand() + " <marci@annelabes.com>"), "to": rcpt,
+    sender = ("Marci at " + _brand() + " <marci@annelabes.com>") if getattr(_brand_for, "name", None) else _env("ENG_FROM", "Marci at " + _brand() + " <marci@annelabes.com>")
+    msg = {"from": sender, "to": rcpt,
            "reply_to": reply_to or _env("ENG_REPLY_TO", "marci@annelabes.com"), "subject": subject, "html": body, "text": text}
     if attachments:
         msg["attachments"] = attachments
@@ -739,6 +745,14 @@ SURPLUS_SUB = "Surplus Funds Recovery"
 
 
 def send_surplus(kind, oid, p):
+    _brand_for.name = _SURPLUS_BRAND
+    try:
+        return _send_surplus(kind, oid, p)
+    finally:
+        _brand_for.name = None
+
+
+def _send_surplus(kind, oid, p):
     e = _rpc("surplus_agreement_for_mail", {"p_id": p.get("id")}) or {}
     if not e.get("id"):
         return "failed", "agreement not found"
