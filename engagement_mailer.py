@@ -18,9 +18,9 @@ Render environment:
   RESEND_API_KEY   — needed; without it the thread only waits (nothing is sent)
   ENG_LIVE=1       — send to the real clients. Anything else = TEST MODE: every email goes only to
                      ENG_TEST_TO (default ari@eqoppa.com), with the client's address in the subject.
-  ENG_FROM         — default "Marci at Anne Labes, Esq. <marci@annelabes.com>"
+  ENG_FROM         — default "Marci at <ENG_BRAND> <marci@annelabes.com>"
   ENG_REPLY_TO     — default marci@annelabes.com
-  ENG_BRAND        — the firm's name on every client email, default "Anne Labes, Esq." (one change when the PLLC is formed)
+  ENG_BRAND        — the firm's name on every client email, default "Labes Legal Services LLC" (Ari 10/27; was "Anne Labes, Esq.")
   WEB_SITE_URL     — the public website (FAQ link), default https://www.annelabes.com
 """
 import base64, hashlib, hmac, html, json, os, re, time, urllib.request, urllib.error, urllib.parse
@@ -126,8 +126,8 @@ def signed_pdf(e, subtitle="WV Tax Lien Title Services"):
 
 # ── the emails ────────────────────────────────────────────────────────────────────────────────
 def _brand():
-    """The firm's name on every client email (ENG_BRAND) - one change when the PLLC is formed (Ari 10/19)."""
-    return _env("ENG_BRAND", "Anne Labes, Esq.")
+    """The firm's name on every client email (ENG_BRAND) - Labes Legal Services LLC since Ari 10/27 (was "Anne Labes, Esq.")."""
+    return _env("ENG_BRAND", "Labes Legal Services LLC")
 
 
 def _wrap(inner):
@@ -135,7 +135,7 @@ def _wrap(inner):
     return ("<div style=\"font:15px/1.55 -apple-system,'Segoe UI',Arial,sans-serif;color:#1f2937;max-width:560px\">"
             "<div style='font:20px Georgia,serif;color:#1e3a8a;border-bottom:2px solid #1e3a8a;padding-bottom:6px;margin-bottom:16px'>" + b + "</div>"
             + inner +
-            "<p style='color:#6b7280;font-size:13px;margin-top:24px'>Marci · Office of " + b + "<br>WV Tax Lien Title Services · reply to this email with any questions</p></div>")
+            "<p style='color:#6b7280;font-size:13px;margin-top:24px'>Marci · " + b + "<br>WV Tax Lien Title Services · reply to this email with any questions</p></div>")
 
 
 def _button(url, label):
@@ -158,7 +158,7 @@ def _letter(inner):
             f"<div style='font:22px Georgia,serif;color:{_NAVY};border-bottom:2px solid {_NAVY};padding-bottom:6px;margin-bottom:18px'>{b}</div>"
             + inner +
             f"<p style='color:#6b7280;font-size:14px;margin-top:26px;border-top:1px solid #e5e7eb;padding-top:12px'>"
-            f"Marci &middot; Office of {b} &middot; Parkersburg, West Virginia<br>"
+            f"Marci &middot; {b} &middot; Parkersburg, West Virginia<br>"
             f"Call <a href='tel:{_TEL}' style='color:#6b7280'>{_PHONE}</a> or just reply to this email.</p></div>")
 
 
@@ -290,7 +290,7 @@ def build_email(kind, e):
                 ("<p>After you sign, please send your payment by check, or as arranged with our office. We start the title work as soon as it arrives.</p>"
                  if e.get("pay_by") == "check" else
                  "<p>After you sign, you'll get a secure link to pay. We start the title work as soon as the fee is paid.</p>"))
-        text = f"Hi {first},\n\nPlease review and sign your agreement ({n} lien(s), {total}):\n{e['link']}\n\nMarci · Office of {_brand()}"
+        text = f"Hi {first},\n\nPlease review and sign your agreement ({n} lien(s), {total}):\n{e['link']}\n\nMarci · {_brand()}"
         return subject, _wrap(body), text, None
     if kind == "signed_copy_email":
         # 📦 THE WELCOME PACKET (Ari 10/19 - 4 emails became 2; polished 10/19 to the approved mockup): the signed agreement +
@@ -337,7 +337,7 @@ def build_email(kind, e):
         text = (f"Hi{' ' + hi if hi else ''},\n\nThank you for choosing us. Your signed agreement is attached.\n"
                 + (f"Pay {total} securely: {e['pay_link_url']}\n" if e.get("pay_link_url") and e.get("pay_by") not in ("check", "bill_later") and not bill_later else "")
                 + f"Your agreement page: {e['link']}\nClient portal: portal.annelabes.com - username: your bidder number{(' ' + str(bid)) if bid else ''}\n"
-                + f"Questions & answers: {site}/faq.html\n\nMarci · Office of {_brand()} · Parkersburg, West Virginia · {_PHONE}")
+                + f"Questions & answers: {site}/faq.html\n\nMarci · {_brand()} · Parkersburg, West Virginia · {_PHONE}")
         pdf = signed_pdf(e)
         safe = "".join(c for c in (name or "client") if c.isalnum() or c in " -_").strip().replace(" ", "-") or "client"
         return subject, _letter(body), text, [{"filename": f"Signed-Agreement-{safe}.pdf", "content": base64.b64encode(pdf).decode()}]
@@ -349,7 +349,7 @@ def build_email(kind, e):
                 + _button(url, "Pay " + total + " securely") +
                 "<p>Payment is handled by Square. We start the title work as soon as it's paid (the agreement asks for payment "
                 "within 7 days of signing). Prefer to pay by check? Just reply to this email.</p>")
-        text = f"Hi {first},\n\nPlease pay {total} for your title work here:\n{url}\n\nMarci · Office of {_brand()}"
+        text = f"Hi {first},\n\nPlease pay {total} for your title work here:\n{url}\n\nMarci · {_brand()}"
         return subject, _wrap(body), text, None
     raise ValueError("unknown kind " + kind)
 
@@ -386,7 +386,7 @@ def make_paylink(job_id, e):
                       "line_items": [{"name": name[:500], "quantity": "1", "note": (f.get("certificates") or "")[:500],
                                       "base_price_money": {"amount": cents, "currency": "USD"}}]},
             "checkout_options": {"redirect_url": e["link"], "ask_for_shipping_address": False},
-            "payment_note": f"Anne Labes agreement {e['id']} · bidder {f.get('bidder', '')}"[:500]}
+            "payment_note": f"Labes Legal Services agreement {e['id']} · bidder {f.get('bidder', '')}"[:500]}
     em = (e.get("email") or "").strip().lower()
     if live and re.match(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$", em):   # Square rejects anything it doesn't like; test mode leaves it out
         body["pre_populated_data"] = {"buyer_email": em}
@@ -476,7 +476,7 @@ def _ics(p, summary, desc):
     end = start + timedelta(minutes=int(p.get("minutes") or 10))
     f = lambda d: d.strftime("%Y%m%dT%H%M%SZ")
     esc = lambda t: str(t or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
-    return "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Anne Labes Esq//Client calls//EN", "METHOD:PUBLISH",
+    return "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Labes Legal Services//Client calls//EN", "METHOD:PUBLISH",
                          "BEGIN:VEVENT", f"UID:client-call-{p.get('call_id')}@annelabes.com", "DTSTAMP:" + f(datetime.now(timezone.utc)),
                          "DTSTART:" + f(start), "DTEND:" + f(end), "SUMMARY:" + esc(summary), "DESCRIPTION:" + esc(desc),
                          "BEGIN:VALARM", "TRIGGER:-PT10M", "ACTION:DISPLAY", "DESCRIPTION:" + esc(summary), "END:VALARM",
@@ -522,7 +522,7 @@ def build_call_email(kind, p):
             + (f" at <b>{esc(str(p['phone']))}</b>" if p.get("phone") else "") + ". It takes about 10 minutes, and we'll have your file open.</p>"
             "<p>If you need to change the time, you can cancel it on your portal page and pick a new one, or just reply to this email.</p>")
     text = f"Thank you for scheduling a call. We'll call you on {when}. To change it, cancel it on your portal page or reply to this email."
-    return subject, _wrap(body), text, [{"filename": "call.ics", "content": base64.b64encode(_ics(p, "Call with Anne Labes' office", text).encode()).decode(),
+    return subject, _wrap(body), text, [{"filename": "call.ics", "content": base64.b64encode(_ics(p, "Call with Labes Legal Services", text).encode()).decode(),
                                           "content_type": "text/calendar"}]
 
 
@@ -664,14 +664,14 @@ def build_portal_invite(p):
             "<p style='color:#6b7280;font-size:13px'>Tip: on your phone, add the portal to your home screen so it opens with one tap. "
             "<a href='https://www.annelabes.com/faq.html#home-screen'>Here's how</a>.</p>"
             "<p>Questions? Just reply to this email or call us at (304) 615-8978.</p>"
-            "<p>Thank you,<br>Marci<br>Office of Anne C. Labes, Esq.<br>(304) 615-8978</p>")
+            "<p>Thank you,<br>Marci<br>" + html.escape(_brand()) + "<br>(304) 615-8978</p>")
     text = ((first and "Hi " + first + "," or "Hello,") + "\n\nWe have built a new client portal for you, and we would love for you to try it.\n\n"
             "In your portal you can:\n- See where every certificate stands, with a progress bar from payment all the way to the State Auditor\n"
             "- Download your Notice to Redeem packets, ready to print and mail\n- See everything you bought under your bidder number, and what changed since your last visit\n"
             "- Ask us a question any time\n- Book a short phone call at a time that works for you\n\n"
             "Log in to your portal: " + login + "\n\nSign in with your bidder number (" + str(p.get("bidder") or "") + ") and your password. "
             "Don't have a password, or forgot it? On the sign-in page, press \"Forgot password?\" and we will email you a link to choose a new one.\n\n"
-            "Questions? Just reply to this email or call us at (304) 615-8978.\n\nThank you,\nMarci\nOffice of Anne C. Labes, Esq.\n(304) 615-8978")
+            "Questions? Just reply to this email or call us at (304) 615-8978.\n\nThank you,\nMarci\n" + _brand() + "\n(304) 615-8978")
     return ("[TEST] " if p.get("test") else "") + "Your new client portal is ready", _wrap(body), text
 
 
@@ -764,7 +764,7 @@ def send_surplus(kind, oid, p):
         body = (f"<p>Hi {first},</p><p>Thank you for speaking with us about {about}. Please review and sign our agreement online — it takes a few minutes "
                 f"on your phone or computer.</p>" + _button(e["link"], "Review and sign")
                 + "<p>If you have any questions, just reply to this email.</p>")
-        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nPlease review and sign the surplus funds agreement here:\n{e['link']}\n\nMarci · Office of {_brand()}"
+        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nPlease review and sign the surplus funds agreement here:\n{e['link']}\n\nMarci · {_brand()}"
         return _resend(to, subject, _wrap(body), text, None, bcc=True)
     if kind == "surplus_signed":
         pdf = signed_pdf(e, SURPLUS_SUB)
@@ -775,7 +775,7 @@ def send_surplus(kind, oid, p):
         subject = "Your signed agreement — " + _brand()
         body = (f"<p>Hi {first},</p><p>Thank you for signing. Your signed agreement is attached as a PDF for your records. "
                 f"Our office will be in touch about the next steps.</p>")
-        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nThank you for signing. Your signed agreement is attached.\n\nMarci · Office of {_brand()}"
+        text = f"Hi {name.split(' ')[0] if name else 'there'},\n\nThank you for signing. Your signed agreement is attached.\n\nMarci · {_brand()}"
         return _resend(to, subject, _wrap(body), text, [{"filename": fname, "content": b64}], bcc=True)
     return "failed", "unknown kind " + kind
 
@@ -830,12 +830,12 @@ def send_web_offer(p):
             f"<p>The link opens our order page with {'it' if n == 1 else 'them'} ticked — untick any you'd rather keep yourself "
             f"({'$500' if n == 1 else 'all ' + str(n) + ' = ' + total}). You sign online and can pay by card, by check or at the office. "
             f"Or just reply to this email or call us at (304) 615-8978.</p>"
-            f"<p style='color:#9ca3af;font-size:12px;margin-top:22px'>You get this because you're a client of the Office of {html.escape(_brand())}, "
+            f"<p style='color:#9ca3af;font-size:12px;margin-top:22px'>You get this because you're a client of {html.escape(_brand())}, "
             f"1507 Saint Mary's Ave, Parkersburg, WV 26101. <a href='{html.escape(stop, quote=True)}' style='color:#9ca3af'>Don't send me these emails</a>.</p>")
     text = (f"Hi {first},\n\nThe State Auditor's list shows you bought {n} new certificate(s):\n"
             + "\n".join("- " + (c.get('county') or '') + " " + (c.get('cert') or '') for c in certs[:30])
             + f"\n\nWant us to do the title work ($500 each)? Choose and order: {link}\n\nOr call (304) 615-8978.\n\n"
-            f"Office of {_brand()}, 1507 Saint Mary's Ave, Parkersburg, WV 26101. Stop these emails: {stop}")
+            f"{_brand()}, 1507 Saint Mary's Ave, Parkersburg, WV 26101. Stop these emails: {stop}")
     status, detail = _resend(to, subject, _wrap(body), text, None, bcc=True)
     if status in ("sent", "failed"):
         _rpc("web_offer_mark", {"p_id": o["id"], "p_status": status})

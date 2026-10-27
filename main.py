@@ -6439,7 +6439,7 @@ def _landapp_browser():
 # fz_config agent_server = 'on' switches it on.
 # ─────────────────────────────────────────────────────────────────────────────
 _AGENT_MODEL = os.environ.get("AGENT_TICKET_MODEL", "claude-opus-5-5")
-_AGENT_PROMPT = """You are Fernando, the AI assistant of the law office of Anne Labes, Esq. (West Virginia tax lien title work). Staff (Anne the attorney/owner, Marci the office manager, and the title workers) write to you through Diego in their work chat. You work on ONE request (a "ticket") at a time and answer them through Diego. You are an AI - never claim to be human.
+_AGENT_PROMPT = """You are Fernando, the AI assistant of Labes Legal Services LLC, the law office of Anne Labes, Esq. (West Virginia tax lien title work). Staff (Anne the attorney/owner, Marci the office manager, and the title workers) write to you through Diego in their work chat. You work on ONE request (a "ticket") at a time and answer them through Diego. You are an AI - never claim to be human.
 
 ARI'S RULE FOR EVERY REQUEST (follow it exactly):
 1. Look into it with your tools. Then reply with what you found and ONE clear suggested fix, and ask them to reply "yes" (or say what they want different). -> status "proposed".
@@ -8443,7 +8443,7 @@ def _client_mail_body(job):
         from engagement_mailer import thanks_email
         return thanks_email(job)
     link = f"https://portal.annelabes.com/set-password.html?t={job['token']}"
-    brand = os.environ.get("ENG_BRAND", "Anne Labes, Esq.")
+    brand = os.environ.get("ENG_BRAND", "Labes Legal Services LLC")
     if job["kind"] == "welcome":
         subj = f"Your client portal account - {brand}"
         lead = "Your client portal account is ready - there you can follow your certificates and title searches."
@@ -8489,7 +8489,7 @@ def client_mail_one():
         subj, body = _client_mail_body(job)
         if not live: subj = f"[TEST for {job['email']}] " + subj
         req = _re_ur.Request("https://api.resend.com/emails", method="POST",
-                             data=_re_json.dumps({"from": os.environ.get("ENG_FROM", "Marci at Anne Labes, Esq. <marci@annelabes.com>"),
+                             data=_re_json.dumps({"from": os.environ.get("ENG_FROM", "Marci at Labes Legal Services LLC <marci@annelabes.com>"),
                                                   "reply_to": os.environ.get("ENG_REPLY_TO", "marci@annelabes.com"),
                                                   "to": [to], "subject": subj, "html": body, "text": _mail_plain_text(body)}).encode(),
                              headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
@@ -8961,7 +8961,7 @@ def _putnam_tick(st):
 # (5 questions a day, $2 a month per client; the client is never told there is a limit). He answers only from those facts - never title-search findings or advice.
 # ─────────────────────────────────────────────────────────────────────────────
 _CLIENT_FZ_MODEL = "claude-sonnet-5"
-_CLIENT_FZ_PROMPT = """You are Fernando, who helps clients of the law office of Anne Labes, Esq. (West Virginia tax lien title work) with questions about their own file, in the office's client portal. Most clients are older West Virginia folks: write warm, plain, human English - short paragraphs, no headings, no tables, no bullet symbols, no markdown. Use the client's name. Sign off simply as "Fernando" when a sign-off fits.
+_CLIENT_FZ_PROMPT = """You are Fernando, who helps clients of Labes Legal Services LLC, the law office of Anne Labes, Esq. (West Virginia tax lien title work) with questions about their own file, in the office's client portal. Most clients are older West Virginia folks: write warm, plain, human English - short paragraphs, no headings, no tables, no bullet symbols, no markdown. Use the client's name. Sign off simply as "Fernando" when a sign-off fits.
 
 WHAT YOU KNOW: only the FILE FACTS given below for this one client. Never invent anything that is not in them. If the facts do not answer the question, say so kindly.
 
