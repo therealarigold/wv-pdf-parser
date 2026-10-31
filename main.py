@@ -6190,8 +6190,9 @@ _IDX2_ASK["surplus_paper"] = (
     "a recorded paper in which a former owner of tax-sold land (or an heir) signs over the right to the surplus money from "
     "the tax sale to a company (an assignment, agreement, assignment of certificate of sale or power of attorney)", {
         "certificate_numbers": "array", "county": "string", "tax_year": "string", "sale_date": "string",
-        "property": "string", "former_owner": "string", "assignors": "array", "assignee": "string",
-        "signed_date": "string", "share_or_amount": "string"})
+        "property": "string", "district": "string", "map": "string", "parcel": "string", "sub_parcel": "string",
+        "tax_ticket": "string", "property_address": "string", "former_owner": "string", "assignors": "array",
+        "assignee": "string", "signed_date": "string", "share_or_amount": "string"})   # map / parcel: Ari 10/31 - every paper carries them
 _COMPETITOR_HELPER = {"HARRISON", "WETZEL", "MONONGALIA"}
 
 
