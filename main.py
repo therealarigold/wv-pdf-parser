@@ -6179,6 +6179,142 @@ def idx_competitor_once_loop():
             _t.sleep(300)
 
 
+# 📄 READ the competitors' surplus papers (Ari 10/31: "go to the idx, read the assignment with hennepin - it should say the
+# certificate number ... that will solve all of the mystery"). surplus_competitor_doc only held the index LINE, so cases were
+# matched by guessing names. Each paper is opened once and Claude reads the certificate numbers, county, property and who
+# signed over to whom (surplus_competitor_read_put -> surplus_competitor_match: "paper names <cert>" = certain).
+# Where the pages come from: the county index straight from the server (search the company's name, open the row's pages);
+# Harrison / Wetzel / Monongalia through the office Chrome helper (Ari's computer - queued, read when they come in);
+# Putnam through its own signed-in window. Person's pace (22 s), at most 3 tries a paper, off switch fz_config competitor_read.
+_IDX2_ASK["surplus_paper"] = (
+    "a recorded paper in which a former owner of tax-sold land (or an heir) signs over the right to the surplus money from "
+    "the tax sale to a company (an assignment, agreement, assignment of certificate of sale or power of attorney)", {
+        "certificate_numbers": "array", "county": "string", "tax_year": "string", "sale_date": "string",
+        "property": "string", "former_owner": "string", "assignors": "array", "assignee": "string",
+        "signed_date": "string", "share_or_amount": "string"})
+_COMPETITOR_HELPER = {"HARRISON", "WETZEL", "MONONGALIA"}
+
+
+def _cr_digits(s):
+    return _re_re.sub(r"\D", "", str(s or "")).lstrip("0")
+
+
+def _cr_terms(docs):
+    out = set()
+    for d in docs:
+        c = (d.get("company") or "").upper()
+        if "HENN" in c: out.update(_COMPETITOR_TERMS)
+        elif c and "UNKNOWN" not in c: out.add(_idx2_firm_core(c) or c.split()[0])
+    return sorted(out)
+
+
+def _cr_put(d, rd, pages, note=None):
+    try:
+        r = _fz_rpc("surplus_competitor_read_put", {"p_county": d["county"], "p_instrument": d["instrument"], "p_read": rd,
+                                                   "p_pages": pages, "p_note": note})
+        print(f"[competitor read] {d['county']} {d.get('book_page')}: " + (f"certs {rd.get('certificate_numbers')} "
+              f"(+{(r or {}).get('new_hits')} hits)" if rd else f"not read - {note}"), flush=True)
+    except Exception as e:
+        print(f"[competitor read] save {d['county']} {d.get('instrument')}: {str(e)[:150]}", flush=True)
+
+
+def _cr_read(d, imgs):
+    rd = _idx2_read_doc("surplus_paper", imgs[:5])
+    if not isinstance(rd, dict) or rd.get("error"):
+        _cr_put(d, None, len(imgs), "read failed: " + str((rd or {}).get("error") if isinstance(rd, dict) else rd)[:150])
+    else:
+        _cr_put(d, rd, len(imgs))
+
+
+def competitor_read_loop():
+    import time as _t
+    _t.sleep(420)
+    asked = set()
+    while True:
+        try:
+            if str(_fz_rpc("fz_config_get", {"p_key": "competitor_read"}) or "").strip().lower() == "off":
+                _t.sleep(1800); continue
+            todo = _fz_rpc("surplus_competitor_read_todo", {}) or []
+            if not todo:
+                _t.sleep(3600); continue
+            if _mem_used() > _FZ_MEM_MAX:
+                _t.sleep(600); continue
+            by = {}
+            for d in todo: by.setdefault(d["county"], []).append(d)
+            for county, docs in by.items():
+                if county in _COMPETITOR_HELPER or county in PERSON_COUNTIES:
+                    for d in docs:
+                        b, p_ = _idx2_bp(d.get("book_page"))
+                        if not (b and p_):
+                            _cr_put(d, None, None, "no book / page on the index line"); continue
+                        term = ("MISC" if "MISC" in (d.get("doc_type") or "").upper() else "DEED") + f"|{b}/{p_}"
+                        rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
+                        imgs = [(r.get("mime") or "image/jpeg", r["b64"]) for r in rows if r.get("b64")]
+                        if imgs:
+                            _cr_read(d, imgs); continue
+                        if (county, term) not in asked:
+                            asked.add((county, term))
+                            try:
+                                _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando", "p_kind": "image", "p_for": None})
+                            except Exception as e:
+                                print(f"[competitor read] {county} {term} could not be queued: {str(e)[:120]}", flush=True)
+                    continue
+                if county in BANK_COUNTIES:
+                    for d in docs:
+                        bp = str(d.get("book_page") or "").replace("/", " @ ")
+                        imgs = bank_image(county, bp)
+                        if imgs: _cr_read(d, imgs)
+                        else: _cr_put(d, None, None, f"{county.title()} pages did not come in from its window")
+                        _t.sleep(22)
+                    continue
+                url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
+                if not url:
+                    for d in docs: _cr_put(d, None, None, "no county index site the server can open")
+                    continue
+                terms = _cr_terms(docs)
+                if not terms:
+                    for d in docs: _cr_put(d, None, None, "no company name to search for")
+                    continue
+                p, browser = get_playwright_browser()
+                try:
+                    ctx = browser.new_context(viewport={"width": 1280, "height": 900}, ignore_https_errors=True)
+                    pg = ctx.new_page()
+                    _idx2_open(pg, county, url)
+                    rows = []
+                    for term in terms:
+                        if _SWEEP_BLOCK_RE.search(pg.evaluate("() => document.body.innerText.slice(0, 800)") or ""):
+                            raise RuntimeError("the site pushed back - stopped")
+                        rows += _idx2_search(pg, 0, {"txtLname": term, "txtFname": "", "txtMname": ""}, "txtLname") or []
+                        _t.sleep(22)
+                    for d in docs:
+                        hit = next((r for r in rows if r.get("image_id") and (
+                            (_cr_digits(r.get("instrument")) and _cr_digits(r.get("instrument")) == _cr_digits(d.get("instrument")))
+                            or (_idx2_bp(r.get("bookpage"))[0] and _idx2_bp(r.get("bookpage")) == _idx2_bp(d.get("book_page"))))), None)
+                        if not hit:
+                            _cr_put(d, None, None, f"not in {county.title()}'s search for {', '.join(terms)}"); continue
+                        imgs = _idx2_pages(ctx, url, hit["image_id"], max(1, min(int(d.get("pages") or 4), 5)))
+                        if imgs: _cr_read(d, imgs)
+                        else: _cr_put(d, None, None, "the paper's pages did not open")
+                        _t.sleep(22)
+                except FzPaused:
+                    raise
+                except Exception as e:
+                    msg = str(e)[:150]
+                    for d in docs: _cr_put(d, None, None, f"{county.title()} site: {msg}")
+                finally:
+                    try: browser.close()
+                    except Exception: pass
+                    try: p.stop()
+                    except Exception: pass
+                _t.sleep(30)
+            _t.sleep(600)
+        except FzPaused:
+            _t.sleep(1800)
+        except Exception as e:
+            print(f"[competitor read] loop: {str(e)[:200]}", flush=True)
+            _t.sleep(300)
+
+
 def idx_history_loop():
     """📚 A county's full history into the bank from the server (Ari 2026-10-06: Berkeley - "collect mega data").
     Every certificate-owner surname, every page, at a person's pace (22 s between searches and pages), daytime only,
@@ -11286,6 +11422,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
         _og_threading.Thread(target=idx_sweep_loop, daemon=True).start()          # 🔄 weekly "what's new" sweep of every county (nights)
         _og_threading.Thread(target=idx_competitor_once_loop, daemon=True).start()  # 🏁 one-time HENNEPIN search per county (days)
+        _og_threading.Thread(target=competitor_read_loop, daemon=True).start()      # 📄 read each competitor surplus paper (cert numbers, 10/31)
         _og_threading.Thread(target=idx_history_loop, daemon=True).start()        # 📚 a county's full history, normal pace (Berkeley 10/6)
         _og_threading.Thread(target=idx_surplus_once_loop, daemon=True).start()   # 🔍 one-time surplus look-back per county (10/6)
         _og_threading.Thread(target=fz_pending_loop, daemon=True).start()          # 🤖 REDEMPTION PENDING: Fernando finishes + verifies (10/19)
