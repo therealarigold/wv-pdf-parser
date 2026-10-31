@@ -10020,19 +10020,23 @@ def sao_read_cert(site, job):
     if docs is None: return {"county": county, "cert": cert, "status": "none", "error": "no 'View Images' for this certificate"}
     out = {"county": county, "cert": cert, "status": "done", "docs": [d[0] for d in docs], "people": [], "texts": []}
     want_notice = wv in ("DEEDED", "SOLD", "CANCELED")
+    own = bool(job.get("own"))      # (10/31) our own certs (Gold Enterprises / Abba): their DEED INVOICE is downloaded too
     seen = {}
     for label, btn in docs:
         L = label.upper()
-        kind = "approval" if "APPROVAL" in L else "ntr" if "NTR" in L else "mail" if "CERTIFIED MAIL" in L else None
-        if not kind or (kind != "approval" and not want_notice): continue
+        kind = "approval" if "APPROVAL" in L else "ntr" if "NTR" in L else "mail" if "CERTIFIED MAIL" in L else                "invoice" if "DEED INVOICE" in L and own else None
+        if not kind or (kind not in ("approval", "invoice") and not want_notice): continue
         idx = seen.get(L, 0); seen[L] = idx + 1
         try:
-            text = _sao_pdf_text(site.fetch(btn))
+            data = site.fetch(btn)
+            text = _sao_pdf_text(data)
         except SaoBlocked:
             raise
         except Exception as e:
             out.setdefault("doc_errors", []).append(f"{label}: {str(e)[:80]}"); continue
         out["texts"].append({"label": L, "idx": idx, "text": text[:60000]})
+        if kind == "invoice" and len(data) < 8_000_000:    # the PDF itself for Gold Standard (sao_save -> sao_doc_file)
+            out.setdefault("files", []).append({"label": L, "idx": idx, "pdf_b64": __import__("base64").b64encode(data).decode()})
         if kind == "approval" and "sale" not in out:
             s = sao_parse_approval(text); out["sale"] = s
             if s.get("taxpayer"): out["people"].append({"name": s["taxpayer"], "address": s.get("taxpayer_address", ""), "source": "taxpayer", "doc_date": s.get("sale_date")})
