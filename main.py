@@ -10684,6 +10684,96 @@ def parcel_geo_loop():
             print("[parcel-geo] " + str(e)[:300], flush=True)
             _t.sleep(300)
 
+# ── ⭐ "Next to ours" (Ari 10/31: "we want to know there when we go to county listings and bidding if its next to one of
+# our stuff") ─ every SOLD / DEEDED cert of ours with land (own_parcel) is found on the state parcel map, then every
+# parcel touching it (intersects, 3 m) is kept; own_neighbor_badges flags listings next to / on the same parcel.
+# Same method as Gold Standard (auction_matches). Public map service, one parcel every ~3 s. fz_config own_neighbors = on.
+def _on_nums(s):
+    return set(re.findall(r"\d+(?:\.\d+)?", (s or "").upper()))
+
+
+def _on_fit(a, b):
+    """how well two legal descriptions agree: numbers count double (lot 12 & 14 vs lot 16)"""
+    na, nb = _on_nums(a), _on_nums(b)
+    wa, wb = set(re.findall(r"[A-Z]{3,}", (a or "").upper())), set(re.findall(r"[A-Z]{3,}", (b or "").upper()))
+    s = 2.0 * len(na & nb) / len(na | nb) if (na or nb) else 0.0
+    return s + (len(wa & wb) / len(wa | wb) if (wa or wb) else 0.0)
+
+
+def _on_resolve(row):
+    """-> the parcel on the state map (GISPID, Suffix, FullLegalDescription), choosing the sub-parcel whose legal
+    description fits the certificate's when the Auditor's sub-parcel is off (GS 10/31: Magaw LTS 12 & 14)."""
+    county = row["county"]
+    pad = lambda v: (str(v or "").strip().upper() or "0").zfill(4)[-4:] if len(str(v or "").strip()) <= 4 else str(v).strip().upper()
+    mp, pc, sub = pad(row.get("map")), pad(row.get("parcel")), pad(row.get("sub") or "0")
+    dists = _pf_districts(county)
+    code = dists.get(_pf_norm(re.sub(r"\s+DISTRICT$", "", (row.get("district") or "").upper().strip())))
+    cid = next(iter(dists.values()))[0] if dists else None
+    if not cid:
+        return None
+    where = f"CountyID='{cid}' AND Map='{mp}' AND Parcel='{pc}'" + (f" AND Dist='{code[1]}'" if code else "")
+    feats = [f.get("attributes") or {} for f in (_pf_get_json(_PF_LAYER + "/0/query", {
+        "where": where, "outFields": "GISPID,Suffix,Dist,FullLegalDescription", "returnGeometry": "false"}).get("features") or [])]
+    if not feats or (not code and len({f.get("Dist") for f in feats}) > 1):
+        return None
+    exact = [f for f in feats if (f.get("Suffix") or "") == sub]
+    desc = row.get("description") or ""
+    best = max(feats, key=lambda f: _on_fit(desc, f.get("FullLegalDescription"))) if desc else None
+    if exact and (not best or _on_fit(desc, exact[0].get("FullLegalDescription")) >= _on_fit(desc, best.get("FullLegalDescription"))):
+        return exact[0]
+    if best and _on_fit(desc, best.get("FullLegalDescription")) > 0:
+        return best
+    return exact[0] if exact else (feats[0] if len(feats) == 1 else None)
+
+
+def _on_neighbors(pid):
+    """GISPIDs of every parcel touching this one (within 3 m), not itself"""
+    g = _pf_get_json(_PF_LAYER + "/0/query", {"where": "GISPID='" + str(pid).replace("'", "''") + "'", "outFields": "GISPID",
+                                             "returnGeometry": "true", "maxAllowableOffset": "1"})
+    feats = g.get("features") or []
+    if not feats or not (feats[0].get("geometry") or {}).get("rings"):
+        return []
+    sr = (g.get("spatialReference") or {}).get("latestWkid") or (g.get("spatialReference") or {}).get("wkid")
+    body = urllib.parse.urlencode({"f": "json", "geometry": json.dumps({"rings": feats[0]["geometry"]["rings"], "spatialReference": {"wkid": sr}}),
+                                   "geometryType": "esriGeometryPolygon", "inSR": str(sr), "spatialRel": "esriSpatialRelIntersects",
+                                   "distance": "3", "units": "esriSRUnit_Meter", "outFields": "GISPID", "returnGeometry": "false"}).encode()
+    req = urllib.request.Request(_PF_LAYER + "/0/query", data=body, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                                                             "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        d = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    if d.get("error"):
+        raise RuntimeError("map service: " + str(d["error"].get("message") or d["error"])[:150])
+    return sorted({(f.get("attributes") or {}).get("GISPID") for f in d.get("features") or []} - {pid, None, ""})
+
+
+def own_neighbor_loop():
+    import time as _t, random as _r
+    _t.sleep(480)
+    last_seed = 0
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "own_neighbors"}) or "off") != "on":
+                _t.sleep(900); continue
+            if _t.time() - last_seed > 6 * 3600:
+                _fz_rpc("own_parcel_seed", {}); last_seed = _t.time()
+            rows = _fz_rpc("own_parcel_claim", {"p_n": 5}) or []
+            if not rows:
+                _t.sleep(1800); continue
+            for row in rows:
+                try:
+                    a = _on_resolve(row)
+                    if not a:
+                        st, d = "not_found", {"error": "not on the state parcel map"}
+                    else:
+                        st, d = "done", {"pid": a.get("GISPID"), "legal": a.get("FullLegalDescription"), "neighbors": _on_neighbors(a.get("GISPID"))}
+                except Exception as e:
+                    st, d = "error", {"error": str(e)[:200]}
+                _fz_rpc("own_parcel_save", {"p_county": row["county"], "p_cert": row["cert"], "p_status": st, "p_data": d})
+                _t.sleep(2 + _r.random() * 2)
+        except Exception as e:
+            print("[own-neighbors] " + str(e)[:300], flush=True)
+            _t.sleep(300)
+
 # ── 📍 USGS place names for locating mineral tracts (Ari 10/16) ─────────────────────────────────────────────────────
 # Every named creek / run / hollow / ridge / town in WV from the USGS Geographic Names file (public, ~1 MB) -> og_place
 # (og_place_usgs_put). Once: fz_config usgs_places = 'load' (set back to 'done ...'). Streams keep mouth + head.
@@ -11206,6 +11296,7 @@ if __name__ == '__main__':
         _og_threading.Thread(target=county_access_loop, daemon=True).start()      # 🚦 red/yellow/green county switches from the main page (10/14)
         _og_threading.Thread(target=parcel_fact_loop, daemon=True).start()        # 🏠 mapwv.gov property facts for every listed certificate (10/14)
         _og_threading.Thread(target=parcel_geo_loop, daemon=True).start()         # 🗺️ parcel outlines + wells inside for the O&G map (10/16)
+        _og_threading.Thread(target=own_neighbor_loop, daemon=True).start()       # ⭐ parcels next to ours for the listing badges (10/31)
         _og_threading.Thread(target=usgs_places_loop, daemon=True).start()        # 📍 USGS place names for locating mineral tracts (10/16)
         _og_threading.Thread(target=daily_refresh_loop, daemon=True).start()      # 🔒 the daily State Auditor refresh, inside the server (10/16)
         for _w in range(LEASE_READ_WORKERS):                                    # 📖 the slow lease reader (10/16), several counties side by side
