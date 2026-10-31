@@ -4760,7 +4760,7 @@ def _idx2_read_doc(kind, images, model=None):
     client = anthropic.Anthropic(api_key=key)
     if _ai_paused(): raise FzPaused(FZ_PAUSE_MSG)
     try:
-        msg = _idx2_read_call(client, content, schema, model)
+        msg = _idx2_read_call(client, content, schema, model, 12000 if kind == "surplus_paper" else 4000)   # full transcript of up to 8 pages
     except Exception as e:
         _ai_pause_check(e); raise
     _ai_log(msg)
@@ -4774,9 +4774,9 @@ def _idx2_read_doc(kind, images, model=None):
         return json.loads(m.group(0)) if m else {"error": "unreadable answer"}
 
 
-def _idx2_read_call(client, content, schema, model=None):
+def _idx2_read_call(client, content, schema, model=None, max_tokens=4000):
     return client.messages.create(
-        model=model or _fz_read_model(), max_tokens=4000,
+        model=model or _fz_read_model(), max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}],
         extra_headers={"anthropic-beta": "server-side-fallback-2026-07-01"},
         extra_body={"output_config": {"effort": "low", "format": {"type": "json_schema", "schema": schema}},
@@ -6188,11 +6188,14 @@ def idx_competitor_once_loop():
 # Putnam through its own signed-in window. Person's pace (22 s), at most 3 tries a paper, off switch fz_config competitor_read.
 _IDX2_ASK["surplus_paper"] = (
     "a recorded paper in which a former owner of tax-sold land (or an heir) signs over the right to the surplus money from "
-    "the tax sale to a company (an assignment, agreement, assignment of certificate of sale or power of attorney)", {
-        "certificate_numbers": "array", "county": "string", "tax_year": "string", "sale_date": "string",
-        "property": "string", "district": "string", "map": "string", "parcel": "string", "sub_parcel": "string",
-        "tax_ticket": "string", "property_address": "string", "former_owner": "string", "assignors": "array",
-        "assignee": "string", "signed_date": "string", "share_or_amount": "string"})   # map / parcel: Ari 10/31 - every paper carries them
+    "the tax sale to a company (an assignment, agreement, assignment of certificate of sale or power of attorney). One paper "
+    "often covers SEVERAL certificates / parcels (Ari 10/31): certificate_numbers = every tax sale certificate number on it; "
+    "properties = one entry PER parcel, written exactly as 'CERT=<certificate number or blank> | DISTRICT=<district> | "
+    "MAP=<map> | PARCEL=<parcel> | SUB=<sub-parcel> | TICKET=<tax ticket / account> | DESC=<legal description or address>' "
+    "(blank after = when that part is not on the pages)", {
+        "certificate_numbers": "array", "properties": "array", "county": "string", "tax_year": "string", "sale_date": "string",
+        "former_owner": "string", "assignors": "array", "assignee": "string", "signed_date": "string",
+        "share_or_amount": "string", "transcription": "string"})   # the whole paper word for word too (Ari 10/31)
 _COMPETITOR_HELPER = {"HARRISON", "WETZEL", "MONONGALIA"}
 
 
@@ -6220,7 +6223,7 @@ def _cr_put(d, rd, pages, note=None):
 
 
 def _cr_read(d, imgs):
-    rd = _idx2_read_doc("surplus_paper", imgs[:5])
+    rd = _idx2_read_doc("surplus_paper", imgs[:8])
     if not isinstance(rd, dict) or rd.get("error"):
         _cr_put(d, None, len(imgs), "read failed: " + str((rd or {}).get("error") if isinstance(rd, dict) else rd)[:150])
     else:
@@ -6293,7 +6296,7 @@ def competitor_read_loop():
                             or (_idx2_bp(r.get("bookpage"))[0] and _idx2_bp(r.get("bookpage")) == _idx2_bp(d.get("book_page"))))), None)
                         if not hit:
                             _cr_put(d, None, None, f"not in {county.title()}'s search for {', '.join(terms)}"); continue
-                        imgs = _idx2_pages(ctx, url, hit["image_id"], max(1, min(int(d.get("pages") or 4), 5)))
+                        imgs = _idx2_pages(ctx, url, hit["image_id"], max(1, min(int(d.get("pages") or 4), 8)))
                         if imgs: _cr_read(d, imgs)
                         else: _cr_put(d, None, None, "the paper's pages did not open")
                         _t.sleep(22)
