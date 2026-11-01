@@ -6264,12 +6264,23 @@ def competitor_read_loop():
                                 print(f"[competitor read] {county} {term} could not be queued: {str(e)[:120]}", flush=True)
                     continue
                 if county in BANK_COUNTIES:
+                    # Putnam: its own signed-in window brings the pages - queue them and move on (waiting 25 min a paper
+                    # held every other county up on 10/31 night); read on a later pass once they are in
                     for d in docs:
-                        bp = str(d.get("book_page") or "").replace("/", " @ ")
-                        imgs = bank_image(county, bp)
-                        if imgs: _cr_read(d, imgs)
-                        else: _cr_put(d, None, None, f"{county.title()} pages did not come in from its window")
-                        _t.sleep(22)
+                        b, p_ = _idx2_bp(str(d.get("book_page") or "").replace("/", " @ "))
+                        if not (b and p_):
+                            _cr_put(d, None, None, "no book / page on the index line"); continue
+                        term = f"{b}/{p_}"
+                        rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
+                        imgs = [(r.get("mime") or "image/jpeg", r["b64"]) for r in rows if r.get("b64")]
+                        if imgs:
+                            _cr_read(d, imgs); continue
+                        if (county, term) not in asked:
+                            asked.add((county, term))
+                            try:
+                                _fz_rpc("idx_live_ask", {"p_county": county, "p_term": term, "p_by": "fernando", "p_kind": "image", "p_for": None})
+                            except Exception as e:
+                                print(f"[competitor read] {county} {term} could not be queued: {str(e)[:120]}", flush=True)
                     continue
                 url = IDX2_URLS.get(county) or IDX2_SURVEY.get(county)
                 if not url:
