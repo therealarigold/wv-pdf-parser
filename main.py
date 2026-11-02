@@ -6196,7 +6196,7 @@ _IDX2_ASK["surplus_paper"] = (
         "certificate_numbers": "array", "properties": "array", "county": "string", "tax_year": "string", "sale_date": "string",
         "former_owner": "string", "assignors": "array", "assignee": "string", "signed_date": "string",
         "share_or_amount": "string", "transcription": "string"})   # the whole paper word for word too (Ari 10/31)
-_COMPETITOR_HELPER = {"HARRISON", "WETZEL", "MONONGALIA"}
+_COMPETITOR_HELPER = {"HARRISON", "WETZEL", "MONONGALIA", "RITCHIE"}   # RITCHIE: times out from the server (Ari 11/2)
 
 
 def _cr_digits(s):
@@ -6251,8 +6251,13 @@ def competitor_read_loop():
                         b, p_ = _idx2_bp(d.get("book_page"))
                         if not (b and p_):
                             _cr_put(d, None, None, "no book / page on the index line"); continue
-                        term = ("MISC" if "MISC" in (d.get("doc_type") or "").upper() else "DEED") + f"|{b}/{p_}"
-                        rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": term}) or []
+                        # misc book by the doc type, or a low book number (Ritchie's AGREE papers sit in misc book 37)
+                        misc = "MISC" in (d.get("doc_type") or "").upper() or (str(b).isdigit() and int(b) < 100)
+                        term = ("MISC" if misc else "DEED") + f"|{b}/{p_}"
+                        rows = []
+                        for t_ in (term, ("DEED" if misc else "MISC") + f"|{b}/{p_}"):
+                            rows = _fz_rpc("idx_image_get", {"p_county": county, "p_book_page": t_}) or []
+                            if any(r.get("b64") for r in rows): break
                         imgs = [(r.get("mime") or "image/jpeg", r["b64"]) for r in rows if r.get("b64")]
                         if imgs:
                             _cr_read(d, imgs); continue
