@@ -3652,8 +3652,8 @@ def _re_is_entity(name):
     return False
 
 
-def _re_sb_get(path):
-    """Supabase GET with Range pagination (returns ALL rows)."""
+def _re_sb_get(path, strict=False):
+    """Supabase GET with Range pagination (returns ALL rows). strict: a failed page stops the run instead of returning part."""
     out = []
     offset = 0
     BATCH = 1000
@@ -3667,6 +3667,7 @@ def _re_sb_get(path):
                 rows = _re_json.loads(r.read())
         except Exception as e:
             print(f'[refresh] SB GET error: {e}', flush=True)
+            if strict: raise RuntimeError(f'could not load {path.split("?")[0]} (page at {offset}): {e}')
             return out
         out.extend(rows)
         if len(rows) < BATCH: break
@@ -3921,7 +3922,9 @@ async def run_wvsao_refresh(scope='daily_recent'):
     print(f'[refresh] Loading existing certs from DB...', flush=True)
     existing = {}
     for y in years:
-        rows = _re_sb_get(f'wvsao_certs?year=eq.{y}&select=year,county,cert_number,status,buyer_normalized,buyer_name_raw,was_late_round_flip')
+        # ordered + all-or-nothing (Ari 11/2): 10/31 counted 4,375 certs we already had as "new" - pages read without an
+        # order can skip rows, and a missed cert's status change would be saved without being noticed
+        rows = _re_sb_get(f'wvsao_certs?year=eq.{y}&select=year,county,cert_number,status,buyer_normalized,buyer_name_raw,was_late_round_flip&order=id', strict=True)
         for r in rows:
             key = (r['year'], r['county'], r['cert_number'])
             existing[key] = r
