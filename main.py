@@ -4382,7 +4382,7 @@ IDX2_SURVEY = {
     "MORGAN": "http://129.71.118.67/", "NICHOLAS": "https://nicholaswv.compiled-technologies.com/", "OHIO": "http://129.71.117.182/",
     "PENDLETON": "http://129.71.118.1/", "PLEASANTS": "https://pleasantswv.compiled-technologies.com/IDXSearch/Default.aspx",
     "POCAHONTAS": "http://129.71.203.38/", "PRESTON": "https://prestonwv.compiled-technologies.com/IDXSearch/Default.aspx",
-    "RITCHIE": "https://www.ritchiecountyclerk.com/IDXSearch/Default.aspx", "ROANE": "http://129.71.205.30/", "SUMMERS": "http://129.71.206.41/",
+    "RITCHIE": "https://ritchiewvidx.compiled-technologies.com/Default.aspx", "ROANE": "http://129.71.205.30/", "SUMMERS": "http://129.71.206.41/",
     "TAYLOR": "http://taylorwv.compiled-technologies.com/", "TYLER": "https://tylerwv.compiled-technologies.com/IDXSearch/",
     "UPSHUR": "http://inquiry.upshurcounty.org/", "WAYNE": "http://www.waynecountywv.us/IDXSearch/Default.aspx",
     "WIRT": "http://records.wirtcountywv.net/", "WOOD": "https://inquiries.woodcountywv.com/legacywebinquiry/default.aspx",
@@ -6199,7 +6199,7 @@ _IDX2_ASK["surplus_paper"] = (
         "certificate_numbers": "array", "properties": "array", "county": "string", "tax_year": "string", "sale_date": "string",
         "former_owner": "string", "assignors": "array", "assignee": "string", "signed_date": "string",
         "share_or_amount": "string", "transcription": "string"})   # the whole paper word for word too (Ari 10/31)
-_COMPETITOR_HELPER = {"HARRISON", "WETZEL", "MONONGALIA", "RITCHIE"}   # RITCHIE: times out from the server (Ari 11/2)
+_COMPETITOR_HELPER = {"HARRISON", "WETZEL", "MONONGALIA"}   # RITCHIE is read by the server (its real index address, Ari 11/2)
 
 
 def _cr_digits(s):
