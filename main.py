@@ -8611,10 +8611,10 @@ def _client_mail_body(job):
         subj = f"Set a new password - {brand} client portal"
         lead = "We received a request to set a new password for your client portal account."
         valid = "The link works once and is good for 2 hours. If you did not ask for this, you can ignore this email."
-    bid = _h.escape(job["bidder"])
+    from engagement_mailer import _username_line
     body = (f"<div style='font-family:Georgia,serif;font-size:15px;color:#1f2937;max-width:560px'>"
             f"<p>{hi}</p><p>{lead}</p>"
-            f"<p><b>Your username:</b> your bidder number, <b>{bid}</b></p>"
+            f"<p><b>Your username:</b> {_username_line(job['bidder'], job.get('email'))}</p>"
             f"<p><a href='{link}' style='display:inline-block;background:#1e3a8a;color:#fff;padding:10px 18px;border-radius:8px;"
             f"text-decoration:none;font-weight:bold'>Choose your password</a></p>"
             f"<p style='font-size:13px;color:#6b7280'>{valid}<br>Then sign in at <a href='https://portal.annelabes.com'>portal.annelabes.com</a>.</p>"

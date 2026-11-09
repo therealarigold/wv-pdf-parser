@@ -182,12 +182,21 @@ def _faq(anchor, label):
     return f"<a href='{html.escape(site, quote=True)}/faq.html{'#' + anchor if anchor else ''}' style='color:{_NAVY}'>{label}</a>"
 
 
-def _signin_steps(bidder, password_line):
+def _username_line(bidder, email=None):
+    """Username: the bidder number, or the email when we have no real number (Ari 11/9 - NEW-xxxxxx orders)."""
+    bid, em = str(bidder or "").strip(), str(email or "").strip()
+    big = "<b style='font-size:19px'>{}</b>"
+    if not bid or bid.upper().startswith("NEW-"):
+        return "your email address" + (", " + big.format(html.escape(em)) if em else "")
+    return ("your bidder number, " + big.format(html.escape(bid))
+            + (" (or your email address, <b>" + html.escape(em) + "</b>)" if em else " (or your email address)"))
+
+
+def _signin_steps(bidder, password_line, email=None):
     """3 numbered sign-in steps + locked out + iPhone tip + FAQ links (older readers - Ari 10/19)."""
-    bid = html.escape(str(bidder or ""))
     return (f"<ol style='margin:4px 0 0 22px;padding:0;font-size:17px'>"
             f"<li style='margin-bottom:6px'>Go to <a href='{_PORTAL_LOGIN}' style='color:{_NAVY};font-weight:700'>portal.annelabes.com</a></li>"
-            f"<li style='margin-bottom:6px'><b>Username:</b> your bidder number" + (f", <b style='font-size:19px'>{bid}</b>" if bid else "") + "</li>"
+            f"<li style='margin-bottom:6px'><b>Username:</b> " + _username_line(bidder, email) + "</li>"
             f"<li style='margin-bottom:6px'><b>Password:</b> {password_line}</li></ol>"
             f"<div style='font-size:15px;color:{_MUTED};margin-top:10px'>"
             f"&#128274; <b>Locked out?</b> Wait 15 minutes and try again, or call us at <a href='tel:{_TEL}' style='color:{_MUTED}'>{_PHONE}</a>.<br>"
@@ -239,10 +248,10 @@ def thanks_email(job):
                       "Tap the button to choose your password:" + _big_button(link, "Choose your password")
                       + f"<div style='font-size:14px;color:{_MUTED};margin-bottom:10px'>This button works once and is good for 7 days. "
                         "If it expires, call us and we'll send a new one.</div>"
-                      + "After that, signing in is 3 steps:" + _signin_steps(job.get("bidder"), "the one you just chose"))
+                      + "After that, signing in is 3 steps:" + _signin_steps(job.get("bidder"), "the one you just chose", job.get("email")))
     elif job.get("portal_account"):
         portal = _box("Your client portal", "Follow the progress any time:" + _big_button(_PORTAL_LOGIN, "Open my client portal", _NAVY)
-                      + _signin_steps(job.get("bidder"), "the one you already use"))
+                      + _signin_steps(job.get("bidder"), "the one you already use", job.get("email")))
     else:
         portal = _box("Your client portal", "Our office will email you your client portal access shortly &mdash; there you can follow every step.")
     body = (f"<p>Hi{' ' + html.escape(first) if first else ''},</p>"
@@ -326,16 +335,16 @@ def build_email(kind, e):
                    "<li>You can follow every step in your client portal &mdash; no need to call.</li></ol>")
         bid = e.get("bidder")
         if e.get("portal_account"):
-            portal = _box("Your client portal", "You already have an account. Sign in any time:" + _signin_steps(bid, "the one you already use")
+            portal = _box("Your client portal", "You already have an account. Sign in any time:" + _signin_steps(bid, "the one you already use", e.get("email"))
                           + _big_button(_PORTAL_LOGIN, "Open my client portal", _NAVY))
         elif e.get("hold_login"):
             portal = _box("Your client portal", "Our office will email you your client portal access shortly.")
         elif bill_later:
             portal = _box("Your client portal", "We'll email you a green <b>Choose your password</b> button shortly. Then signing in is 3 steps:"
-                          + _signin_steps(bid, "the one you choose from that email"))
+                          + _signin_steps(bid, "the one you choose from that email", e.get("email")))
         else:
             portal = _box("Your client portal", "Once your payment arrives, we'll email you a green <b>Choose your password</b> button. "
-                          "Signing in is then 3 steps:" + _signin_steps(bid, "the one you choose from that email"))
+                          "Signing in is then 3 steps:" + _signin_steps(bid, "the one you choose from that email", e.get("email")))
         about = f"<p style='font-size:15px;color:{_MUTED};margin-top:18px'><b>About us:</b> {_ABOUT_US}</p>"
         body = (f"<p>Hi{' ' + html.escape(hi) if hi else ''},</p><p>Thank you for choosing us. Your signed agreement is attached as a PDF for your records.</p>"
                 + order + pay + nxt + portal + _questions() + about)
