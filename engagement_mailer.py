@@ -413,6 +413,24 @@ def make_paylink(job_id, e):
     return "sent", ("" if live else "TEST $1 · ") + "link " + pl["id"]
 
 
+def cancel_paylink(job_id, e):
+    """❌ (Ari 11/12) Delete an unused Square payment link (e.g. the client already paid another way). Already gone = done."""
+    link_id = (e.get("pay_link_id") or "").strip()
+    if not link_id:
+        return "failed", "no Square payment link on this agreement"
+    try:
+        _square("DELETE", "/v2/online-checkout/payment-links/" + urllib.parse.quote(link_id, safe=""))
+        how = "deleted"
+    except urllib.error.HTTPError as ex:
+        if ex.code == 404:
+            how = "already gone in Square"
+        else:
+            err = ex.read().decode("utf-8", "replace")[:300]
+            return ("queued" if ex.code in (429, 500, 502, 503) else "failed"), f"Square HTTP {ex.code}: {err}"
+    _rpc("engagement_paylink_cancelled", {"p_id": e["id"], "p_link_id": link_id})
+    return "sent", f"link {link_id} {how}"
+
+
 def handle_square_webhook(raw, signature):
     """Square -> POST /square-webhook. Checks Square's signature, then marks the agreement paid."""
     key = _env("SQUARE_WEBHOOK_SIGNATURE_KEY")
@@ -874,7 +892,7 @@ def mailer_loop():
         try:
             if not _env("SUPABASE_SECRET_KEY") or not (_env("RESEND_API_KEY") or _env("SQUARE_ACCESS_TOKEN")):
                 time.sleep(60); continue
-            kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
+            kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink", "cancel_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
             job = _rpc("engagement_outbox_next", {"p_kinds": kinds})
             if not job and _env("PORTAL_INTEGRATION_SECRET") and time.time() >= _GS_PAUSE[0]:
                 g = _rpc("mail_outbox_next", {"p_kinds": ["gs_call", "gs_diego", "gs_photo"]})
@@ -958,6 +976,8 @@ def mailer_loop():
             try:
                 if job["kind"] == "make_paylink":
                     status, detail = make_paylink(job["id"], job["engagement"])
+                elif job["kind"] == "cancel_paylink":
+                    status, detail = cancel_paylink(job["id"], job["engagement"])
                 else:
                     status, detail = send(job["kind"], job["engagement"])
             except Exception as ex:
