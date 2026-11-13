@@ -3841,6 +3841,30 @@ async def _re_scrape_county_year(page, year, county):
 _RE_LAST_ERR = {"msg": ""}
 
 
+async def _re_offered_years(page):
+    """(Ari 11/13) The tax years the Auditor's Certified-to-State search offers, plus the counties listed for the newest one
+    (a new year like 2026-C fills in a few counties at a time). Returns (set of int years, set of county names) or (set(), set())."""
+    try:
+        await page.goto('https://www.wvsao.gov/CountyCollections/Default', wait_until='domcontentloaded', timeout=30000)
+        try: await page.wait_for_load_state('networkidle', timeout=15000)
+        except Exception: pass
+        vals = await page.evaluate("""() => { const s = document.querySelector('select[name="ctl00$FixedWidthContent$YearDD"]');
+            return s ? [...s.options].map(o => o.value).filter(v => /^\\d{4}$/.test(v)) : []; }""")
+        offered = {int(v) for v in vals or []}
+        if not offered: return set(), set()
+        newest = max(offered)
+        async with page.expect_navigation(wait_until='domcontentloaded', timeout=20000):
+            await page.select_option('select[name="ctl00$FixedWidthContent$YearDD"]', value=str(newest))
+        try: await page.wait_for_load_state('networkidle', timeout=15000)
+        except Exception: pass
+        names = await page.evaluate("""() => { const s = document.querySelector('select[name="ctl00$FixedWidthContent$CountyDD"]');
+            return s ? [...s.options].filter(o => o.value && o.value !== '0').map(o => o.text.trim().toUpperCase()) : []; }""")
+        return offered, set(names or [])
+    except Exception as e:
+        print(f'[refresh] year list read failed: {e}', flush=True)
+        return set(), set()
+
+
 def _re_parse_cert_row(row, year, county):
     """Same parsing as the original loader."""
     if len(row) < 6: return None
@@ -3856,6 +3880,8 @@ def _re_parse_cert_row(row, year, county):
     parts = status_full.split('\n', 1)
     status = parts[0].strip()
     status_detail = parts[1].strip() if len(parts) > 1 else ''
+    # 🆕 (Ari 11/13) a cert of the newest year (2026-C) that is still open has a blank status on the Auditor's page
+    if not status: status = 'CERTIFIED'
 
     buyer_raw = (row[4] if len(row) > 4 else '').strip()
     return {
@@ -3891,9 +3917,10 @@ async def run_wvsao_refresh(scope='daily_recent'):
     # The dropdown shows TAX YEAR (CERT YEAR) — e.g. "2024 (2025-C)".
     # The state publishes a new tax year roughly 6 months after the calendar year ends.
     # In May 2026, the most recent tax year in the dropdown is 2024 (which holds 2025-C certs).
-    # Safe rule: most recent tax year available = calendar year minus 2.
+    # 🆕 (Ari 11/13) 2026-C (tax year 2025) appeared in November 2026, county by county - so the newest year asked for is
+    # calendar year minus 1, and the Auditor's own year + county lists (read once below) drop what is not there yet
     current_year = _re_dt.now().year
-    most_recent_tax = current_year - 2
+    most_recent_tax = current_year - 1
     # The daily scope only watches the two newest tax years, so a NO BID cert from
     # an earlier year was never re-checked and a flip on it could never be seen -
     # which is exactly what the online rounds sell. One day a week the daily run
@@ -3912,7 +3939,7 @@ async def run_wvsao_refresh(scope='daily_recent'):
         print('[refresh] Weekly full sweep day - covering all tax years', flush=True)
 
     if scope == 'daily_recent':
-        years = [most_recent_tax, most_recent_tax - 1]
+        years = [most_recent_tax, most_recent_tax - 1, most_recent_tax - 2]
     else:
         years = list(range(EARLIEST_TAX_YEAR, most_recent_tax + 1))
     log['years_scraped'] = [str(y) for y in years]
@@ -3977,9 +4004,35 @@ async def run_wvsao_refresh(scope='daily_recent'):
             print(f'[refresh] skipped - tonight\'s check is already done / running on the other computer', flush=True)
             years, stop = [], True
             log['notes'] = 'skipped: tonight\'s check is done or running on the other computer'
+        # 🆕 (Ari 11/13) the Auditor adds a new year (2026-C) a few counties at a time: read its year list + the newest year's
+        # county list once (one pace turn), skip a year that is not offered yet and ask the newest year only for its counties
+        year_counties, newest = {}, None
+        if years and not stop:
+            t_wait = _t.time()
+            while not _fz_rpc("sao_pace_take", {"p_by": "refresh", "p_lane": runner}):
+                if _t.time() - t_wait > 3600: break
+                await _re_asyncio.sleep(20)
+            offered, newest_counties = await _re_offered_years(page)
+            if offered:
+                dropped = [y for y in years if y not in offered]
+                years = [y for y in years if y in offered]
+                newest = max(offered)
+                if newest in years and newest_counties:
+                    year_counties[newest] = [c for c in _WV_COUNTIES_ALL if c in newest_counties]
+                elif newest in years:
+                    years.remove(newest)   # its county list did not load: skip it tonight rather than knock 55 times
+                print(f'[refresh] Auditor offers {sorted(offered)}; reading {years} (not offered: {dropped}); newest {newest}: {len(year_counties.get(newest, []))} counties', flush=True)
+            else:
+                # list not readable: never guess a year the Auditor may not have
+                years = [y for y in years if y <= current_year - 2]
+                print(f'[refresh] could not read the Auditor\'s year list - reading {years}', flush=True)
+            log['years_scraped'] = [str(y) for y in years]
+            if newest in years:
+                log['newest_year_counties'] = len(year_counties.get(newest, []))
+        removed_upserts = []
         for year in years:
             if stop: break
-            for county in _WV_COUNTIES_ALL:
+            for county in year_counties.get(year, _WV_COUNTIES_ALL):
                 log['counties_scraped'] += 1
                 t_wait = _t.time()
                 try: _fz_rpc("refresh_night_beat", {"p_runner": runner, "p_done": False})
@@ -4002,12 +4055,14 @@ async def run_wvsao_refresh(scope='daily_recent'):
                         break
                 else:
                     fails = 0
+                seen = set()
                 for raw in rows:
                     parsed = _re_parse_cert_row(raw, year, county)
                     if not parsed: continue
                     log['total_certs_seen'] += 1
 
                     key = (parsed['year'], parsed['county'], parsed['cert_number'])
+                    seen.add(key)
                     old = existing.get(key)
 
                     if not old:
@@ -4038,6 +4093,21 @@ async def run_wvsao_refresh(scope='daily_recent'):
                             'first_seen_at': _re_dt.utcnow().isoformat(),
                         }
 
+                # 🆕 (Ari 11/13) newest year only: a cert that drops off the county's list (paid before the sale) becomes
+                # REMOVED. Only after a clean read that still shows most of the county, so a cut-off page never removes certs.
+                if year == newest and seen and not _RE_LAST_ERR["msg"]:
+                    mine = [k for k, v in existing.items() if k[0] == str(year) and k[1] == county]
+                    if len(seen) * 2 >= len(mine):
+                        for k in mine:
+                            old = existing[k]
+                            if k in seen or old['status'] == 'REMOVED': continue
+                            removed_upserts.append({'year': k[0], 'county': k[1], 'cert_number': k[2], 'status': 'REMOVED',
+                                                    'previous_status': old['status'], 'status_changed_at': _re_dt.utcnow().isoformat(),
+                                                    'was_late_round_flip': bool(old.get('was_late_round_flip'))})
+                            log['status_changes'] += 1
+                            flip = f"{old['status']}_TO_REMOVED".replace(' ', '_')
+                            log['status_change_summary'][flip] = log['status_change_summary'].get(flip, 0) + 1
+
                 # Upsert batch every 500 to avoid huge requests
                 if len(cert_upserts) >= 500:
                     _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number', log)
@@ -4050,6 +4120,11 @@ async def run_wvsao_refresh(scope='daily_recent'):
     # Flush remaining
     if cert_upserts:
         _re_sb_upsert('wvsao_certs', cert_upserts, 'year,county,cert_number', log)
+    # (own batch: these rows carry only the status fields, so they must not be padded with blank taxpayer / ticket columns)
+    if removed_upserts:
+        _re_sb_upsert('wvsao_certs', removed_upserts, 'year,county,cert_number', log)
+        log['removed'] = len(removed_upserts)
+        print(f'[refresh] {len(removed_upserts)} newest-year certs dropped off the Auditor\'s list -> REMOVED', flush=True)
 
     # 4. Insert new buyers
     if new_buyer_norms_seen:
@@ -10152,6 +10227,35 @@ class SaoHttp:
         labels = [x.strip() for x in (part[1] if len(part) > 1 else "").split("\n") if x.strip() and x.strip() != "View" and "new tab" not in x.lower()]
         return list(zip(labels[:len(f.views)], f.views))
 
+    def statement(self, year, county, cert):
+        """🆕 (Ari 11/13) a newest-year (2026-C) certificate's 'Statement': district / map / parcel / sub-parcel / special id,
+        account number and class - what the MapWV link needs. Same search as open_images, then the Statement link."""
+        f = self._page(SAO_URL)
+        yr = next(n for n in f.selects if n.endswith("YearDD"))
+        f = self._post({yr: str(year), "__EVENTTARGET": yr, "__EVENTARGUMENT": ""})
+        cn = next(n for n in f.selects if n.endswith("CountyDD"))
+        val = next((o[0] for o in f.selects[cn] if o[1].strip().upper() == county.upper()), None)
+        if not val: raise ValueError(f"county {county} not in the {year} list")
+        cb = next(n for n in f.fields if n.endswith("CertTB"))
+        sb = _re_re.search(r'name="([^"]*SearchBTN)"', self.html).group(1)
+        self._post({yr: str(year), cn: val, cb: cert.split("-")[-1], sb: "Search", "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
+        h = self.html.replace("&#39;", "'")
+        i = h.find(">" + cert + "<")
+        if i < 0: return None                                          # not on the list any more (paid / removed)
+        m = _re_re.search(r"__doPostBack\('([^']*lbCertSaleNumber)','([^']*)'\)", h[i:i + 1500])
+        if not m: return None
+        self._post({"__EVENTTARGET": m.group(1), "__EVENTARGUMENT": m.group(2)})
+        import html as _h
+        def lbl(name):
+            x = _re_re.search(r'id="[^"]*rptStatement_lbl' + name + r'_0"[^>]*>(.*?)</span>', self.html, _re_re.S)
+            return _h.unescape(_re_re.sub(r"<[^>]+>", " ", x.group(1))).strip() if x else ""
+        if lbl("DetailViewCertNo") != cert: raise ValueError("the statement page did not show " + cert)
+        txt = _re_re.sub(r"\s+", " ", _h.unescape(_re_re.sub(r"<[^>]+>", "\n", self.html)))
+        acct = _re_re.search(r"Account Number\s+(\d+)", txt)
+        cls = _re_re.search(r"\bClass\s+(\d)\b", txt)
+        return {"district": lbl("District"), "map": lbl("Map"), "parcel": lbl("Parcel"), "sub_parcel": lbl("SubParcel"),
+                "special_id": lbl("SpecialID"), "account": acct.group(1) if acct else "", "tax_class": cls.group(1) if cls else ""}
+
     def prereg_pdf(self):
         """📋 County Reports > 'Pre-Registration Report' > View Report = the whole pre-registered buyer list as one PDF
         (tested 2026-10-14: the button answers with SB552PreRegistrationList.pdf). One page + 2 posts, once a day."""
@@ -10224,6 +10328,14 @@ def sao_read_cert(site, job):
         out["error"] = "approval letter read but no bid amount found - check the letter layout"   # shows up, never silent
     if "sale" not in out: out["error"] = "no approval letter read" + ("; " + "; ".join(out.get("doc_errors", [])) if out.get("doc_errors") else "")
     return out
+
+
+def sao_read_statement(site, job):
+    """🆕 (Ari 11/13) one newest-year certificate's statement -> sao_statement_save (map numbers for the next auction list)."""
+    st = site.statement(job.get("year"), job["county"], job["cert"])
+    if st is None: return {"kind": "statement", "county": job["county"], "cert": job["cert"], "status": "none", "error": "not on the Auditor's list (paid or removed?)"}
+    if not st.get("map"): return {"kind": "statement", "county": job["county"], "cert": job["cert"], "status": "failed", "error": "statement read but no map number on it", **st}
+    return {"kind": "statement", "county": job["county"], "cert": job["cert"], "status": "done", **st}
 
 
 def prereg_daily(site, lane, rid):
@@ -10303,8 +10415,9 @@ def sao_loop(n=0):
             SAO["state"] = "working"
             SAO.setdefault("current", {})[n] = f"{job['county']} {job['cert']}"
             t0 = _t.time()
+            kind = job.get("kind") or "letters"     # 🆕 (Ari 11/13) 'statement' = a 2026-C map-number read, only when no letters wait
             try:
-                res = sao_read_cert(site, job)
+                res = sao_read_statement(site, job) if kind == "statement" else sao_read_cert(site, job)
             except SaoBlocked as e:
                 if "timed out" in str(e):
                     # Ari 2026-10-02: a timeout pauses this reader 30 min and it restarts by itself; a second timeout
@@ -10346,15 +10459,16 @@ def sao_loop(n=0):
                 if SAO.get("careful"):
                     SAO["careful"] -= 1
                     if SAO["careful"] <= 0: SAO["pause_n"] = 0              # 20 good ones after a pause: back to normal
+            save_fn = "sao_statement_save" if kind == "statement" else "sao_save"
             try:
-                _fz_rpc("sao_save", {"p": res})
+                _fz_rpc(save_fn, {"p": res})
             except Exception as e:
                 body = ""
                 try: body = e.read().decode("utf-8", "replace")[:300]
                 except Exception: pass
                 print(f"[sao] save refused {job['county']} {job['cert']}: {e} {body}", flush=True)
                 res = {"county": job["county"], "cert": job["cert"], "status": "failed", "error": ("save refused: " + body)[:300]}
-                try: _fz_rpc("sao_save", {"p": res})
+                try: _fz_rpc(save_fn, {"p": res})
                 except Exception: pass
             if res["status"] == "done": SAO["slow_last_cert"] = False
             st = res["status"] if res["status"] in ("done", "none", "failed") else "requeued"
