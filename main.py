@@ -10696,6 +10696,75 @@ def _og_tax_fetch(county, year, ticket):
         return "missing", {"error": "no ticket page for this year/ticket"}
     return "done", d
 
+# 📈 (Ari 11/14) value history: the sheriff's "Search by Account" lists every year's ticket of one account (+ half-year tax);
+# NO BID accounts also get each year's ticket page read (exact value). Same slow pace as the tickets above.
+def _og_hist_get(op, url, data=None):
+    body = urllib.parse.urlencode(data).encode() if data is not None else None
+    return op.open(url, data=body, timeout=30).read().decode("latin-1", "replace")
+
+def _og_hist_rows(raw):
+    out = []
+    for tr in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", raw):
+        m = re.search(r"TICKET\.html\?TPTYR=(\d{4})&(?:amp;)?TPTICK=(\d+)", tr)
+        if not m or "RE-Info" not in tr:
+            continue
+        flat = re.sub(r"(?is)<table.*?</table>", " ", tr)
+        txt = [re.sub(r"\s+", " ", _ogt_html.unescape(re.sub(r"<[^>]+>", " ", c))).strip()
+               for c in re.findall(r"(?is)<td[^>]*>(.*?)</td>", flat)]
+        acct = next((x for x in txt if re.fullmatch(r"\d{6,10}", x)), None)
+        half = re.findall(r"(-?[\d,]*\.\d\d)", txt[-1]) if txt else []
+        out.append({"year": int(m.group(1)), "ticket": m.group(2), "name": txt[2] if len(txt) > 2 else None,
+                    "account": acct, "half": half[-1].replace(",", "") if half else None})
+    return out
+
+def _og_hist_fetch(county, account, exact, have, pause):
+    """-> (status, rows, tickets). pause() is called before every page after the search (the sheriff pace)."""
+    base = get_sheriff_url(county)
+    if not base or county in WEBTAX_URLS:
+        return "later", [], []
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_ogt_cj.CookieJar()))
+    op.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
+    try:
+        _og_hist_get(op, base + "/index.html")
+    except Exception:
+        return "unreachable", [], []
+    try:
+        raw = _og_hist_get(op, base + "/INDEX.html", {"TPNAME": "", "TPACCT": account, "SBYACCT": "Search by Account", "TPTYR": "",
+                                                       "TPTICK": "", "TPSX": "", "lyear": "", "rpb": "B", "pub": "B"})
+    except Exception:
+        return "error", [], []
+    rows = [r for r in _og_hist_rows(raw) if (r["account"] or account) == account]
+    if not rows:
+        return "none", [], []
+    tickets = []
+    if exact:
+        for r in sorted(rows, key=lambda x: -x["year"]):
+            if r["year"] in have:
+                continue
+            pause()
+            try:
+                page = _og_hist_get(op, base + "/TICKET.html?TPTYR=%d&TPTICK=%s&TPSX=" % (r["year"], r["ticket"]))
+            except Exception:
+                continue
+            d = _og_tax_parse(page, r["year"], r["ticket"])
+            if d and d.get("account"):
+                d.update({"year": r["year"], "ticket": r["ticket"]})
+                tickets.append(d)
+    return "done", rows, tickets
+
+def _og_hist_turn(gap_fn):
+    """one claimed batch of accounts (one per county in turn); returns how many accounts were looked up"""
+    import time as _t, random as _r
+    jobs = _fz_rpc("og_hist_claim", {"p_n": 3}) or []
+    pause = lambda: _t.sleep(gap_fn() + _r.random() * 10)
+    for i, j in enumerate(jobs):
+        if i: pause()
+        c, a = j["county"], j["account"]
+        st, rows, tickets = _og_hist_fetch(c, a, bool(j.get("exact")), set(int(y) for y in (j.get("have") or [])), pause)
+        _fz_rpc("og_hist_save", {"p": {"county": c, "account": a, "status": st, "rows": rows, "tickets": tickets}})
+        print(f"[oghist] {c} {a}: {st} years={[r['year'] for r in rows]} exact={len(tickets)}"[:200], flush=True)
+    return len(jobs)
+
 def og_tax_loop():
     import time as _t, random as _r
     _t.sleep(300)
@@ -10705,6 +10774,12 @@ def og_tax_loop():
                 _t.sleep(900); continue
             rows = _fz_rpc("og_tax_claim", {"p_n": 5}) or []
             if not rows:
+                # 📈 no tickets waiting -> the value history of the accounts (Ari 11/14), same pace; fz_config og_hist = off stops it
+                def _gap():
+                    try: return max(10, float(_fz_rpc("fz_config_get", {"p_key": "og_tax_gap"}) or 20))
+                    except Exception: return 20
+                if (_fz_rpc("fz_config_get", {"p_key": "og_hist"}) or "on") != "off" and _og_hist_turn(_gap):
+                    _t.sleep(_gap() + _r.random() * 10); continue
                 _t.sleep(1800); continue
             down = set()
             for r in rows:
