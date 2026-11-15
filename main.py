@@ -10765,6 +10765,89 @@ def _og_hist_turn(gap_fn):
         print(f"[oghist] {c} {a}: {st} years={[r['year'] for r in rows]} exact={len(tickets)}"[:200], flush=True)
     return len(jobs)
 
+# 🧭 (Ari 11/14) owner holdings: the sheriff's "Search by Name" lists every account an owner holds (all years, with the
+# MapWV id); same address as the owner's own certificate ticket = same person. Each account's newest ticket page gives its
+# description + district -> og_own_save rules out the leases those explain and places the blank "MINERAL INTEREST" ones.
+_OG_OWN = {"turn": 0}
+
+def _og_norm(v):
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", (v or "").upper())).strip()
+
+def _og_own_rows(raw):
+    out = []
+    for tr in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", raw):
+        m = re.search(r"TICKET\.html\?TPTYR=(\d{4})&(?:amp;)?TPTICK=(\d+)", tr)
+        if not m or "RE-Info" not in tr:
+            continue
+        pm = re.search(r"pid=([\d-]+)", tr)
+        flat = re.sub(r"(?is)<table.*?</table>", " ", tr)
+        txt = [re.sub(r"\s+", " ", _ogt_html.unescape(re.sub(r"<[^>]+>", " ", c))).strip()
+               for c in re.findall(r"(?is)<td[^>]*>(.*?)</td>", flat)]
+        half = re.findall(r"(-?[\d,]*\.\d\d)", txt[-1]) if txt else []
+        out.append({"year": int(m.group(1)), "ticket": m.group(2), "pid": pm.group(1) if pm else None,
+                    "name": txt[2] if len(txt) > 2 else None, "address": txt[3] if len(txt) > 3 else None,
+                    "half": half[-1].replace(",", "") if half else None})
+    return out
+
+def _og_own_fetch(county, owner, name_q, tickets, have, pause, max_pages=15):
+    """-> (status, rows, pages). status: done / more / none / later / unreachable / error"""
+    base = get_sheriff_url(county)
+    if not base or county in WEBTAX_URLS:
+        return "later", [], []
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_ogt_cj.CookieJar()))
+    op.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
+    try:
+        _og_hist_get(op, base + "/index.html")
+    except Exception:
+        return "unreachable", [], []
+    try:
+        raw = _og_hist_get(op, base + "/INDEX.html", {"TPNAME": name_q[:30], "SBYNAME": "Search by Name", "TPACCT": "", "TPTYR": "",
+                                                       "TPTICK": "", "TPSX": "", "lyear": "", "rpb": "B", "pub": "B"})
+    except Exception:
+        return "error", [], []
+    allrows = _og_own_rows(raw)
+    own_t = {(int(t["year"]), int(t["ticket"])) for t in (tickets or []) if str(t.get("ticket", "")).isdigit()}
+    addrs = {_og_norm(r["address"]) for r in allrows if (r["year"], int(r["ticket"])) in own_t and r.get("address")}
+    on = _og_norm(owner)
+    keep = [r for r in allrows
+            if _og_norm(r["name"]) == on or _og_norm(r["name"]).startswith(on + " ")
+            or (addrs and _og_norm(r["address"]) in addrs and _og_norm(r["name"]).startswith(_og_norm(name_q)))]
+    if not keep:
+        return "none", [], []
+    newest = {}
+    for r in keep:
+        k = r["pid"] or r["ticket"]
+        if k not in newest or r["year"] > newest[k]["year"]:
+            newest[k] = r
+    todo = [r for r in sorted(newest.values(), key=lambda x: -x["year"]) if "%d-%s" % (r["year"], r["ticket"].lstrip("0")) not in have]
+    pages = []
+    for r in todo[:max_pages]:
+        pause()
+        try:
+            page = _og_hist_get(op, base + "/TICKET.html?TPTYR=%d&TPTICK=%s&TPSX=" % (r["year"], r["ticket"]))
+        except Exception:
+            continue
+        d = _og_tax_parse(page, r["year"], r["ticket"])
+        if not d:
+            continue
+        dm = re.search(r"District:\s*(.*?)\s*More Info", _og_tax_text(page))
+        d.update({"year": r["year"], "ticket": r["ticket"], "district": dm.group(1).strip() if dm else None})
+        pages.append(d)
+    return ("more" if len(todo) > max_pages else "done"), keep, pages
+
+def _og_own_turn(gap_fn):
+    """one claimed batch of owners (one per county in turn); returns how many owners were looked up"""
+    import time as _t, random as _r
+    jobs = _fz_rpc("og_own_claim", {"p_n": 2}) or []
+    pause = lambda: _t.sleep(gap_fn() + _r.random() * 10)
+    for i, j in enumerate(jobs):
+        if i: pause()
+        c, o = j["county"], j["owner"]
+        st, rows, pages = _og_own_fetch(c, o, j.get("name_q") or o, j.get("tickets") or [], set(j.get("have") or []), pause)
+        _fz_rpc("og_own_save", {"p": {"county": c, "owner": o, "status": st, "rows": rows, "pages": pages}})
+        print(f"[ogown] {c} {o}: {st} accounts={len(rows)} pages={len(pages)}"[:200], flush=True)
+    return len(jobs)
+
 def og_tax_loop():
     import time as _t, random as _r
     _t.sleep(300)
@@ -10778,7 +10861,15 @@ def og_tax_loop():
                 def _gap():
                     try: return max(10, float(_fz_rpc("fz_config_get", {"p_key": "og_tax_gap"}) or 20))
                     except Exception: return 20
-                if (_fz_rpc("fz_config_get", {"p_key": "og_hist"}) or "on") != "off" and _og_hist_turn(_gap):
+                # 🧭 (Ari 11/14) owner holdings and value history take turns (fz_config og_own / og_hist = off stops either)
+                _OG_OWN["turn"] += 1
+                lanes = [("og_own", _og_own_turn), ("og_hist", _og_hist_turn)]
+                if _OG_OWN["turn"] % 2: lanes.reverse()
+                did = False
+                for key, fn in lanes:
+                    if (_fz_rpc("fz_config_get", {"p_key": key}) or "on") != "off" and fn(_gap):
+                        did = True; break
+                if did:
                     _t.sleep(_gap() + _r.random() * 10); continue
                 _t.sleep(1800); continue
             down = set()
