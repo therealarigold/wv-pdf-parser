@@ -9662,14 +9662,17 @@ def surplus_fz_one():
     return True
 
 
-def surplus_fz_loop():
+def surplus_fz_loop(w=0):
+    """w = worker number (SURPLUS_WORKERS, Ari 11/18 after the 4 GB upgrade: 2 cases at once, never two in the same county -
+    surplus_fz_next skips a county that already has a case working)."""
     import time as _t
-    _t.sleep(150)
-    try:                                         # the only surplus worker: anything still 'working' was cut off by a restart
-        n = _fz_rpc("surplus_fz_requeue_orphans", {})
-        if n: print(f"[surplus] {n} job(s) cut off by the restart - back in line", flush=True)
-    except Exception as e:
-        print(f"[surplus] requeue: {str(e)[:150]}", flush=True)
+    _t.sleep(150 + 40 * w)
+    if w == 0:
+        try:                                     # at start-up: anything still 'working' was cut off by the restart
+            n = _fz_rpc("surplus_fz_requeue_orphans", {})
+            if n: print(f"[surplus] {n} job(s) cut off by the restart - back in line", flush=True)
+        except Exception as e:
+            print(f"[surplus] requeue: {str(e)[:150]}", flush=True)
     while True:
         try:
             if _mem_used() > _FZ_STAFF_MEM_MAX: _t.sleep(30); continue
@@ -11722,7 +11725,8 @@ if __name__ == '__main__':
         _og_threading.Thread(target=og_unit_page_loop, daemon=True).start()       # 🏛 unitization owner-table pages the regex reader can't read, Sonnet 5.5 (Ari 10/19)
         _og_threading.Thread(target=putnam_loop, daemon=True).start()             # 🏛 Putnam with Fernando's own login (slow)
         _og_threading.Thread(target=client_fz_loop, daemon=True).start()          # 💬 clients ask Fernando about their own file
-        _og_threading.Thread(target=surplus_fz_loop, daemon=True).start()         # 🔎 surplus: find the heirs (owners send him)
+        for _sw in range(int(os.environ.get("SURPLUS_WORKERS", "1"))):   # 🔎 surplus: find the heirs (owners send him); 2 since the 4 GB server (11/18)
+            _og_threading.Thread(target=surplus_fz_loop, args=(_sw,), daemon=True).start()
         _og_threading.Thread(target=idx_sweep_loop, daemon=True).start()          # 🔄 weekly "what's new" sweep of every county (nights)
         _og_threading.Thread(target=idx_competitor_once_loop, daemon=True).start()  # 🏁 one-time HENNEPIN search per county (days)
         _og_threading.Thread(target=competitor_read_loop, daemon=True).start()      # 📄 read each competitor surplus paper (cert numbers, 10/31)
