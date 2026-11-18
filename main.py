@@ -9402,15 +9402,27 @@ class SmartSkipSite:
         except Exception:
             return None
 
-    _BOX = {"FIRST NAME": "input[name='firstName']", "LAST NAME": "input[name='lastName']",
-            "MIDDLE NAME OR INITIAL": "input[placeholder='Enter Middle Name']", "CITY": "input[name='city']",
-            "STATE": "input[placeholder='Enter State']", "MAILING ADDRESS": "input[name='mailing-address']",
-            "ZIP CODE": "input[placeholder='Enter Zip']"}
+    # Each box sits in a div.field-item whose heading reads "Input State", "Middle name or initial"… (seen 2026-11-18). The
+    # heading is the stable anchor: the placeholders changed on 11/18 ("Enter State" -> "VA", "Enter Zip" -> "23509"), which
+    # stopped every surplus case with "no 'STATE' box" (Tyler 2024-C-000051) while SmartSkip itself was up. name= attributes
+    # (firstName / lastName / city / mailing-address) are tried first; the heading second; the old placeholders last.
+    _BOX = {"FIRST NAME": ("input[name='firstName']", "First Name"), "LAST NAME": ("input[name='lastName']", "Last Name"),
+            "MIDDLE NAME OR INITIAL": ("input[placeholder='Enter Middle Name']", "Middle Name"), "CITY": ("input[name='city']", "City"),
+            "STATE": ("input[placeholder='Enter State']", "State"), "MAILING ADDRESS": ("input[name='mailing-address']", "Address"),
+            "ZIP CODE": ("input[placeholder='Enter Zip']", "Zip")}
 
     def _fill(self, label, value):
         if not value: return
-        box = self.page.locator(self._BOX[label])
-        if not box.count(): raise SmartSkipStop(f"SmartSkip form changed - no '{label}' box")
+        sel, heading = self._BOX[label]
+        box = None
+        for cand in (self.page.locator(sel) if sel.startswith("input[name=") else None,
+                     self.page.locator("div.field-item", has_text=_re_re.compile(r"^\s*(Input\s+)?" + heading + r"\b", _re_re.I)).locator("input").first,
+                     self.page.locator(sel)):
+            try:
+                if cand is not None and cand.count(): box = cand; break
+            except Exception:
+                pass
+        if box is None: raise SmartSkipStop(f"SmartSkip form changed - no '{label}' box")
         box.first.fill(str(value))
 
     def search(self, first, last, middle="", city="", state="", address="", zip_=""):
