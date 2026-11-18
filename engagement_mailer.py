@@ -592,6 +592,35 @@ def send_gs_call(p, path="/integrations/portal-call"):
         return "queued", f"unreachable: {ex.reason}"
 
 
+# 📅 Booking page vs Marci's calendar (Ari 11/18, ticket 15): every 10 minutes copy the call-taker's time off / half days /
+# appointments (approved or requested) from Gold Standard into the portal (call_busy); _call_slots hides overlapping times.
+# Gold Standard not answering / endpoint not there yet -> the old list stays (never wiped by an error).
+_BUSY = {"next": 0.0, "said": ""}
+
+
+def sync_call_busy():
+    if time.time() < _BUSY["next"] or not _env("PORTAL_INTEGRATION_SECRET"):
+        return
+    _BUSY["next"] = time.time() + 600
+    url = _env("GS_URL", "https://real-estate-app-hr1c.onrender.com").rstrip("/") + "/integrations/portal-busy?days=15"
+    req = urllib.request.Request(url, headers={"X-Portal-Secret": _env("PORTAL_INTEGRATION_SECRET"), "User-Agent": "annelabes-portal/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            out = json.loads(r.read() or b"{}")
+        blocks = out.get("blocks")
+        if not isinstance(blocks, list):
+            raise ValueError("no blocks in the answer")
+        n = _rpc("call_busy_replace", {"p_blocks": blocks})
+        said = f"{out.get('user') or '?'}: {n} busy time(s)"
+    except urllib.error.HTTPError as ex:
+        said = f"HTTP {ex.code} - kept the old list"
+    except Exception as ex:
+        said = f"{str(ex)[:120]} - kept the old list"
+    if said != _BUSY["said"]:                       # log only when it changes
+        print(f"[mailer] call_busy: {said}", flush=True)
+        _BUSY["said"] = said
+
+
 # 📧 NTR packets to the client (Ari 2026-10-06): one email per client for the certificates staff chose; each
 # certificate's NTR + letter + title-search notes joined into one PDF; the text was made by the database
 # (_ntr_packet_text, also shown as the preview before Send). Office bcc as for the agreements.
@@ -892,6 +921,10 @@ def mailer_loop():
         try:
             if not _env("SUPABASE_SECRET_KEY") or not (_env("RESEND_API_KEY") or _env("SQUARE_ACCESS_TOKEN")):
                 time.sleep(60); continue
+            try:
+                sync_call_busy()
+            except Exception as ex:
+                print(f"[mailer] call_busy: {str(ex)[:150]}", flush=True)
             kinds = (KINDS + ["paylink_email"] if _env("RESEND_API_KEY") else []) + (["make_paylink", "cancel_paylink"] if _env("SQUARE_ACCESS_TOKEN") else [])
             job = _rpc("engagement_outbox_next", {"p_kinds": kinds})
             if not job and _env("PORTAL_INTEGRATION_SECRET") and time.time() >= _GS_PAUSE[0]:
