@@ -5306,8 +5306,10 @@ def _idx2_name(s):
     return (n[0], n[1]) if len(n) >= 2 else (None, None)
 
 
-def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=24, middle=None, firm=None, district=None):
-    """firm: a company owner - searched in the index's Firm mode; last/first are ignored."""
+def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=True, desc=None, max_reads=24, middle=None, firm=None, district=None, light=False):
+    """firm: a company owner - searched in the index's Firm mode; last/first are ignored.
+    light: the surplus heir search (Ari 11/18) - the owner's own papers only (will / estate papers read, marriages, deeds);
+    no chain of title, earlier owners, sale checks or debts (those took 20-40 minutes on slow county sites)."""
     core = _idx2_firm_core(firm) if firm else ""
     if firm: last, first = core, ""
     last, first = last.upper().strip(), first.upper().strip()
@@ -5419,6 +5421,22 @@ def idx2_owner_report(county, last, first, book=None, page=None, log=None, read=
         spouses = [{"spouse": r["other"], "date": r["date"], "desc": r["desc"]} for r in mine if "MARRIAGE" in r["doc"].upper()]
         deeds = [{"type": r["doc"], "date": r["date"], "bookpage": r["bookpage"], "role": r["role"], "other": r["other"], "desc": r["desc"]}
                  for r in mine if _idx2_is_deed(r)]
+        if light:
+            # 🔎 surplus: who are the heirs? The owner's will / estate papers say it best - read up to 4 of them (bank first);
+            # Fernando's own tools (search_person, read_document, old books) can still dig further when he needs to
+            est_bp, n_will = set(e["bookpage"] for e in estate), 0
+            rank = lambda r: (next((i for i, k in enumerate(["WILL", "HEIRSHIP", "TRANSFER ON DEATH", "SETTLEMENT", "FIDUCIARY", "ADMINISTRATION", "APPRAISEMENT"])
+                                    if k in r["doc"].upper()), 9), -int(_idx2_day(r["date"]) or 0))
+            for r in sorted([r for r in mine if r["bookpage"] in est_bp and r.get("image_id")], key=rank):   # wills first, newest first
+                if n_will >= 4: break
+                rd = read_item("will", {"image_id": r["image_id"], "bookpage": r["bookpage"]})
+                n_will += 1
+                if rd and not rd.get("error"):
+                    for e in estate:
+                        if e["bookpage"] == r["bookpage"]: e["read"] = rd
+            return {"county": county, "owner": f"{last} {first}", "found": len(mine), "estate": estate, "estate_skipped_old": old_namesakes[:10],
+                    "spouses": spouses, "deeds": deeds, "chain": [], "sold": None, "prior_owners": [], "property": {"description": desc or ""},
+                    "light": "surplus search: the chain of title, earlier owners and debts were not searched"}
 
         # no book/page given: the owner's own purchase of this property (similar description, else the latest)
         found_deed = None
@@ -9532,8 +9550,9 @@ def surplus_fz_one():
                         idx = bank_owner_report(county, last, first, desc=wv.get("description"))
                     else:
                         if county not in IDX2_URLS and county in IDX2_SURVEY: IDX2_URLS[county] = IDX2_SURVEY[county]
-                        idx = idx2_owner_report(county, last, first, desc=wv.get("description"), middle=fernando_owner_middle(owner))
-                small = {k: idx.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "sold", "property", "prior_owners")} if idx else {}
+                        light = (_fz_rpc("fz_config_get", {"p_key": "surplus_light"}) or "on") != "off"   # Ari 11/18: owner's own papers only
+                        idx = idx2_owner_report(county, last, first, desc=wv.get("description"), middle=fernando_owner_middle(owner), light=light)
+                small = {k: idx.get(k) for k in ("owner", "estate", "spouses", "chain", "deeds", "sold", "property", "prior_owners", "light") if idx.get(k) is not None} if idx else {}
                 _surp_step(job, f"2. County index: {len(idx.get('deeds') or [])} deeds, {len(idx.get('estate') or [])} estate / will papers for {last} {first}"
                                 if last else f"2. County index: skipped ({note or 'no person name'})")
             except FzPaused:
