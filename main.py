@@ -10303,6 +10303,48 @@ class SaoHttp:
         if not raw.startswith(b"%PDF"): raise ValueError("the report did not come back as a PDF (" + ctype + ")")
         return raw
 
+    # 🏛 (Ari 11/19) "Certified to Deputy Land Commissioners" = the old sheriff-era tax sales (~102,684 certificates).
+    # One county at a time, 100 a page; the reader keeps its place (self.dlc_at) so the next page is one Next press.
+    DLC_P = "ctl00$FixedWidthContent$"
+
+    def dlc_search(self, code):
+        f = self._page(SAO_URL)
+        if self.DLC_P + "ddlCounties" not in f.selects: raise ValueError("the Deputy Land Commissioner search is not on the page")
+        self._post({self.DLC_P + "ddlCounties": code, self.DLC_P + "ddPageSize": "100", self.DLC_P + "btnSearch": "Search",
+                    "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
+        return self.dlc_parse(code)
+
+    def dlc_press(self, code, value):
+        """Press a pager button by its label ('Next', a page number, or '...' = the next block of 10)."""
+        btns = _re_re.findall(r'<input type="submit" name="([^"]*lvResultsDataPager[^"]*)" value="([^"]*)"(?![^>]*disabled)', self.html)
+        hit = [n for n, v in btns if v == value]
+        if not hit: raise ValueError(f"no '{value}' button on the list page")
+        self._post({hit[-1]: value, "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
+        return self.dlc_parse(code)
+
+    def dlc_parse(self, code):
+        import html as _h
+        h = self.html
+        def lab(name):
+            x = _re_re.search(r'id="FixedWidthContent_lvResults_lvResultsDataPager_ctl\d+_' + name + r'"[^>]*>([^<]*)<', h)
+            return int(x.group(1)) if x and x.group(1).strip().isdigit() else None
+        rows = []
+        for i in _re_re.findall(r'id="FixedWidthContent_lvResults_lblCertNo_(\d+)"', h):
+            def v(k):
+                x = _re_re.search(r'id="FixedWidthContent_lvResults_' + k + '_' + i + r'"[^>]*>(.*?)</span>', h, _re_re.S)
+                return _h.unescape(_re_re.sub(r"<[^>]+>", " ", x.group(1))).strip() if x else ""
+            m = _re_re.search(r'id="FixedWidthContent_lvResults_hlMap_' + i + r'"[^>]*href="([^"]*)"', h)
+            rows.append({"cert_no": v("lblCertNo"), "district": v("lblDistrict"), "name1": v("lblName1"), "name2": v("lblName2"),
+                         "description": v("lblDescription"), "municipality": v("lblMunicipality"), "map": v("lblMap"),
+                         "mapwv_url": _h.unescape(m.group(1)) if m else "", "parcel": v("lblParcel"), "deed_book": v("lblDeedBook"),
+                         "page_no": v("lblPageNumber"), "account_no": v("lblAccountNumber"), "status": v("lblStatus"),
+                         "has_images": ("lvResults_lbViewImages_" + i + '"') in h or ("$ctrl" + i + "$lbViewImages") in h})
+        cur, pages, total = lab("CurrentPageLabel"), lab("TotalPagesLabel"), lab("TotalItemsLabel")
+        if cur is None:                      # one page or nothing: no pager at all
+            cur, pages, total = 1, (1 if rows else 0), len(rows)
+        self.dlc_at = (code, cur)
+        return {"code": code, "page": cur, "pages": pages, "total": total, "rows": rows}
+
     def fetch(self, btn):
         """One document: the View button posts the page, the PDF is then served at Document.aspx."""
         self._post({btn: "View", "__EVENTTARGET": "", "__EVENTARGUMENT": ""})
@@ -10362,6 +10404,60 @@ def sao_read_cert(site, job):
         out["error"] = "approval letter read but no bid amount found - check the letter layout"   # shows up, never silent
     if "sale" not in out: out["error"] = "no approval letter read" + ("; " + "; ".join(out.get("doc_errors", [])) if out.get("doc_errors") else "")
     return out
+
+
+DLC_SITE = {}      # the list reader's own session (kept across the letter readers' fresh sessions, so Next keeps working)
+
+
+def dlc_goto(site, code, page, step):
+    """🏛 Bring the list reader to `page` of county `code` and read it. Normally one visit (Next from the page before);
+    after a restart: search + jump buttons, each extra visit taking its own turn of the shared pace (step())."""
+    at = getattr(site, "dlc_at", None)
+    if page > 1 and at == (code, page - 1):
+        return site.dlc_press(code, "Next")
+    r = site.dlc_search(code)
+    while r["page"] < page:
+        if r["pages"] is not None and page > r["pages"]:
+            raise ValueError(f"page {page} asked but the list has {r['pages']}")
+        step()
+        btns = [v for _n, v in _re_re.findall(r'<input type="submit" name="([^"]*lvResultsDataPager[^"]*)" value="([^"]*)"(?![^>]*disabled)', site.html)]
+        r = site.dlc_press(code, str(page) if str(page) in btns else "...")
+    if r["page"] != page: raise ValueError(f"wanted page {page}, the site showed {r['page']}")
+    return r
+
+
+def dlc_turn(site, job, lane):
+    """🏛 One page of the old tax-sale list (Ari 11/19) -> dlc_save. Pushback: pause like the letters; a real block also
+    switches the list reader off (fz_config dlc_list) and tells the owners."""
+    import time as _t
+    def step():
+        for _ in range(120):                       # wait for a free turn of the shared pace (up to ~40 min)
+            if _fz_rpc("dlc_step", {"p_lane": lane}): return
+            _t.sleep(20)
+        raise ValueError("no free Auditor turn for the list reader")
+    try:
+        r = dlc_goto(site, job["code"], int(job["page"]), step)
+        n = _fz_rpc("dlc_save", {"p": r})
+        SAO["dlc"] = f"{_re_dt.utcnow().isoformat()[:16]}Z {job['county']} page {r['page']}/{r['pages']} ({len(r['rows'])} rows, {n} saved)"
+    except SaoBlocked as e:
+        site.dlc_at = None
+        SAO["pause_until"] = _t.time() + 1800
+        SAO.setdefault("pushback", []).append(f"{_re_dt.utcnow().isoformat()[:19]}Z {e} on the old-sales list {job['county']} p{job['page']} - pause 30 min")
+        SAO["dlc"] = f"pushback: {e}"
+        if "timed out" not in str(e):
+            try:
+                _fz_rpc("fz_config_set_srv", {"p_key": "dlc_list", "p_value": "off"})
+                _fz_rpc("owner_alert", {"p_title": "⚠ State Auditor: old-sales list reader stopped",
+                                        "p_body": f"The Auditor's site pushed back ({e}) while reading the old tax-sale list. The list reader is off; the letters pause 30 min."})
+            except Exception as ex: print(f"[dlc] could not switch off: {ex}", flush=True)
+        try: _fz_rpc("dlc_save", {"p": {"code": job["code"], "page": job["page"], "error": str(e)}})
+        except Exception: pass
+    except Exception as e:
+        site.dlc_at = None
+        SAO["dlc"] = f"failed {job['county']} p{job['page']}: {str(e)[:150]}"
+        print(f"[dlc] {SAO['dlc']}", flush=True)
+        try: _fz_rpc("dlc_save", {"p": {"code": job["code"], "page": job["page"], "error": str(e)}})
+        except Exception: pass
 
 
 def sao_read_statement(site, job):
@@ -10442,6 +10538,14 @@ def sao_loop(n=0):
                         rid = None; print(f"[prereg] claim: {e}", flush=True)
                     if rid:
                         prereg_daily(site, lane, rid); continue
+            if n == 0 and lane == "server":
+                # 🏛 (Ari 11/19) the old tax-sale list: at most one page every 10 min, from the same shared turns (dlc_claim)
+                try: dj = _fz_rpc("dlc_claim", {"p_lane": lane})
+                except Exception as e: dj = None; print(f"[dlc] claim: {e}", flush=True)
+                if dj:
+                    if "site" not in DLC_SITE: DLC_SITE["site"] = SaoHttp(os.environ.get("WVSAO_PROXY", "").strip() or None)
+                    SAO["state"] = "working (old-sales list)"
+                    dlc_turn(DLC_SITE["site"], dj, lane); _t.sleep(1.5); continue
             job = _fz_rpc("sao_claim", {"p_lane": lane})
             if not job:
                 # not our turn yet (or nothing waiting): ask again soon - the server used to wait 5 min here, which capped it at ~12/h
