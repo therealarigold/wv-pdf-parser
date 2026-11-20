@@ -10810,6 +10810,141 @@ def _og_webtax_fetch(county, year, ticket):
         return "missing", {"error": "no ticket page for this year/ticket"}
     return "done", d
 
+# ── 📈 WEB Tax Inquiry (compiled-technologies / CSSI) account history (Ari 11/20: "build a reader for those 10 counties too") ──
+# The 10 counties not on softwaresystems.com. One "Account" search with "All" years lists every year the account existed
+# (year, ticket, owner, total billed). The form is ASP.NET: choosing Account and All posts back first, so the session (cookie +
+# the page's own form state) is kept per county and reused - after the first account a search is ONE page.
+import threading as _wt_threading
+_WT_SESS = {}
+_WT_LOCK = _wt_threading.Lock()
+
+def _wt_hidden(raw):
+    d = {m.group(1): _ogt_html.unescape(m.group(2))
+         for m in re.finditer(r'<input type="hidden" name="([^"]+)" id="[^"]*" value="([^"]*)"', raw)}
+    for m in re.finditer(r'(?is)<select name="([^"]+)"[^>]*>(.*?)</select>', raw):
+        s = re.search(r'<option selected="selected" value="([^"]*)"', m.group(2)) or re.search(r'<option[^>]*value="([^"]*)"', m.group(2))
+        if s:
+            d[m.group(1)] = s.group(1)
+    for m in re.finditer(r'<input name="([^"]+)" type="text"(?:[^>]*?value="([^"]*)")?', raw):
+        d.setdefault(m.group(1), _ogt_html.unescape(m.group(2) or ""))
+    return d
+
+def _wt_post(op, base, form):
+    return op.open(base, data=urllib.parse.urlencode(form).encode(), timeout=40).read().decode("utf-8", "replace")
+
+def _wt_ready(county, pause):
+    """-> (opener, raw page with Key = Account and What = All), reusing this county's session when it still works"""
+    with _WT_LOCK:
+        s = _WT_SESS.get(county)
+    if s:
+        return s
+    base = WEBTAX_URLS[county]
+    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_ogt_cj.CookieJar()))
+    op.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
+    raw = op.open(base, timeout=25).read().decode("utf-8", "replace")
+    f = _wt_hidden(raw)
+    f.update({"__EVENTTARGET": "ctl00$ContentForm$cboKey", "__EVENTARGUMENT": "", "ctl00$ContentForm$cboKey": "5"})
+    pause()
+    raw = _wt_post(op, base, f)
+    f = _wt_hidden(raw)
+    f.update({"__EVENTTARGET": "ctl00$ContentForm$cboWhat", "__EVENTARGUMENT": "", "ctl00$ContentForm$cboWhat": "2",
+              "ctl00$ContentForm$cboKey": "5"})
+    pause()
+    raw = _wt_post(op, base, f)
+    s = (op, raw)
+    with _WT_LOCK:
+        _WT_SESS[county] = s
+    return s
+
+def _wt_rows(raw):
+    m = re.search(r'(?is)id="ctl00_ContentForm_grdLookup".*?</table>', raw)
+    if not m:
+        return None
+    trs = [_og_webtax_cells(x) for x in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", m.group(0))]
+    if not trs:
+        return []
+    head = [h.lower() for h in trs[0]]
+    ix = lambda name: head.index(name) if name in head else None
+    iy, it, itk, inm, ibl, iac = ix("year"), ix("type"), ix("ticket"), ix("name"), ix("total billed"), ix("account no")
+    if None in (iy, itk, iac):
+        return None
+    out = []
+    for c in trs[1:]:
+        if len(c) <= max(iy, itk, iac) or not re.fullmatch(r"\d{4}", c[iy] or "") or not (c[itk] or "").isdigit():
+            continue
+        if it is not None and (c[it] or "R") != "R":
+            continue
+        billed = (c[ibl] or "").replace(",", "") if ibl is not None else ""
+        half = ("%.2f" % (float(billed) / 2)) if re.fullmatch(r"-?\d*\.?\d+", billed) else None
+        out.append({"year": int(c[iy]), "ticket": c[itk], "name": c[inm] if inm is not None else None,
+                    "account": c[iac] or None, "half": half})
+    return out
+
+def _og_webtax_hist_fetch(county, account, exact, have, pause):
+    """WEB Tax Inquiry version of _og_hist_fetch -> (status, rows, tickets)"""
+    base = WEBTAX_URLS[county]
+    for attempt in (1, 2):
+        try:
+            op, raw = _wt_ready(county, pause)
+        except Exception:
+            return "unreachable", [], []
+        f = _wt_hidden(raw)
+        f.update({"__EVENTTARGET": "", "__EVENTARGUMENT": "", "ctl00$ContentForm$cboKey": "5", "ctl00$ContentForm$cboWhat": "2",
+                  "ctl00$ContentForm$Search": "Search"})
+        for k in list(f):
+            if k.endswith("$Account") or k.endswith("$txtText"):
+                f[k] = account
+        pause()
+        try:
+            res = _wt_post(op, base, f)
+        except Exception:
+            res = ""
+        rows = _wt_rows(res) if res else None
+        if rows is None:                             # session expired / page changed -> start a fresh session once
+            with _WT_LOCK:
+                _WT_SESS.pop(county, None)
+            if attempt == 1:
+                continue
+            return "error", [], []
+        # long histories: follow "Next" (enabled only when the grid has more pages), at most 5 more pages
+        for _ in range(5):
+            if not re.search(r'name="ctl00\$ContentForm\$btnNext"(?![^>]*disabled)', res):
+                break
+            f = _wt_hidden(res)
+            f.update({"__EVENTTARGET": "ctl00$ContentForm$btnNext", "__EVENTARGUMENT": ""})
+            pause()
+            try:
+                res = _wt_post(op, base, f)
+            except Exception:
+                break
+            more = _wt_rows(res)
+            if not more:
+                break
+            rows += more
+        with _WT_LOCK:
+            _WT_SESS[county] = (op, res)
+        break
+    seen = set()
+    rows = [r for r in rows if (r["account"] or account) == account
+            and not ((r["year"], r["ticket"]) in seen or seen.add((r["year"], r["ticket"])))]
+    if not rows:
+        return "none", [], []
+    tickets = []
+    if exact:
+        for r in sorted(rows, key=lambda x: -x["year"]):
+            if r["year"] in have:
+                continue
+            pause()
+            try:
+                page = op.open(base + "Detail.aspx?taxtype=R&year=%d&ticket=%d&ticketsuff=" % (r["year"], int(r["ticket"])), timeout=30).read().decode("utf-8", "replace")
+            except Exception:
+                continue
+            d = _og_webtax_parse(page, r["year"], r["ticket"])
+            if d and d.get("account"):
+                d.update({"year": r["year"], "ticket": r["ticket"]})
+                tickets.append(d)
+    return "done", rows, tickets
+
 def _og_tax_fetch(county, year, ticket):
     """-> (status, data). status: done / missing / unreachable / error"""
     if county in WEBTAX_URLS:
@@ -10857,6 +10992,8 @@ def _og_hist_rows(raw):
 
 def _og_hist_fetch(county, account, exact, have, pause):
     """-> (status, rows, tickets). pause() is called before every page after the search (the sheriff pace)."""
+    if county in WEBTAX_URLS:                    # 📈 the 10 WEB Tax Inquiry counties (Ari 11/20)
+        return _og_webtax_hist_fetch(county, account, exact, have, pause)
     base = get_sheriff_url(county)
     if not base or county in WEBTAX_URLS:
         return "later", [], []
