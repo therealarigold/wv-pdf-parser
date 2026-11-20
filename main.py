@@ -2554,6 +2554,11 @@ SHERIFF_URLS = {
     "GILMER":      None,
     "RALEIGH":     None,
     "WIRT":        None,
+    # found 11/20 (Ari: "make sure afterwards you have all counties covered") - softwaresystems hosts for these are dead
+    "HARDY":       None,
+    "TUCKER":      None,
+    "SUMMERS":     None,
+    "WAYNE":       None,
 }
 
 # "WEB Tax Inquiry" (compiled-technologies / CSSI) sheriff sites, found 10/16. Ticket detail = <base>Detail.aspx?taxtype=R&year=&ticket=
@@ -2568,6 +2573,10 @@ WEBTAX_URLS = {
     "GILMER":      "https://webtax.gilmercountywv.gov/",
     "RALEIGH":     "http://rcto-dhbwdrhnmvc.dynamic-m.com/",
     "WIRT":        "http://taxlookup.wirtcountysheriff.com/",
+    "HARDY":       "https://hardytax.compiled-technologies.com/",      # 11/20
+    "TUCKER":      "https://tuckertax.compiled-technologies.com/",     # 11/20
+    "SUMMERS":     "https://summers.wvsheriff.com/",                   # 11/20 (county Tax Office page link)
+    "WAYNE":       "http://waynecountywv.us/WEBTax/",                  # 11/20 (waynecountywv.org "Tax Inquiry")
 }
 
 def get_sheriff_url(county):
@@ -10778,7 +10787,7 @@ def _og_webtax_parse(raw, year, ticket):
         m = re.search(rx, t)
         return m.group(1).strip() if m else None
     num = lambda v: float(v.replace(",", "")) if v and re.match(r"^-?[\d,]*\.?\d+$", v) else None
-    out = {"account": grab(r"Account\s+([\d-]+)\s+District"),
+    out = {"account": grab(r"Account\s+([\dA-Z-]+)\s+District"),   # Wayne accounts carry letters (02-10E-01550000)
            "owner": grab(r"Name 1\s+(.*?)\s+(?:Address 1|Name 2|In Care of|Real Estate)"),
            "property": grab(r"Description\s+(.*?)\s+Class\s+Land Value")}
     m = re.search(r'(?is)id="[^"]*grdValue".*?</table>', raw)
