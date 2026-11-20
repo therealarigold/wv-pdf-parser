@@ -10987,6 +10987,66 @@ def _og_own_turn(gap_fn):
     return len(jobs)
 
 def og_tax_loop():
+    """🛢️ Sheriff road (Ari 11/20: more CPU + memory -> more workers). fz_config og_workers (default 4, read at start) workers
+    run side by side; og_lane_claim gives each one job from a county no other worker is on, so every sheriff site still sees
+    one visitor at the old 20-30 s pace (Ari 10/17 "slower pace so we wont get marked as ddos") while 4 counties move at once.
+    Tickets first; even workers prefer value history, odd workers owner holdings (separate lanes, Ari 11/20)."""
+    import time as _t
+    try: n = int(_fz_rpc("fz_config_get", {"p_key": "og_workers"}) or 4)
+    except Exception: n = 4
+    n = max(1, min(8, n))
+    for i in range(n):
+        _og_threading.Thread(target=_og_lane_worker, args=(i,), daemon=True).start()
+        _t.sleep(1)
+    print(f"[ogtax] {n} sheriff-road workers started", flush=True)
+
+
+def _og_lane_worker(widx):
+    import time as _t, random as _r
+    _t.sleep(300 + widx * 20)
+
+    def _gap():
+        try: return max(10, float(_fz_rpc("fz_config_get", {"p_key": "og_tax_gap"}) or 20))
+        except Exception: return 20
+
+    pause = lambda: _t.sleep(_gap() + _r.random() * 10)
+    pref = ["og_hist", "og_own"] if widx % 2 == 0 else ["og_own", "og_hist"]
+    while True:
+        try:
+            if (_fz_rpc("fz_config_get", {"p_key": "og_tax"}) or "off") != "on":
+                _t.sleep(900); continue
+            if _mem_used() > _FZ_MEM_MAX:              # background work waits for memory (Ari 10/21)
+                _t.sleep(60); continue
+            kinds = ["tax"] + [k[3:] for k in pref if (_fz_rpc("fz_config_get", {"p_key": k}) or "on") != "off"]
+            j = _fz_rpc("og_lane_claim", {"p_kinds": kinds})
+            if not j:
+                _t.sleep(600); continue
+            kind, c = j.get("kind"), j.get("county")
+            if kind == "tax":
+                y, tk = j["tax_year"], j["ticket"]
+                st, d = _og_tax_fetch(c, y, tk)
+                _fz_rpc("og_tax_save", {"p_county": c, "p_year": y, "p_ticket": tk, "p_status": st, "p_data": d})
+                book = ("book " + str(d.get("deed_book")) + "/" + str(d.get("deed_page"))) if d.get("deed_book") else ""
+                print(f"[ogtax w{widx}] {c} {y} #{tk}: {st} {d.get('gross', '')} {book} {d.get('error', '')}"[:200], flush=True)
+            elif kind == "hist":
+                a = j["account"]
+                have = set(int(x) for x in (j.get("have") or []))
+                st, rows, tickets = _og_hist_fetch(c, a, bool(j.get("exact")), have, pause)
+                _fz_rpc("og_hist_save", {"p": {"county": c, "account": a, "status": st, "rows": rows, "tickets": tickets}})
+                print(f"[oghist w{widx}] {c} {a}: {st} years={[r['year'] for r in rows]} exact={len(tickets)}"[:200], flush=True)
+            elif kind == "own":
+                o = j["owner"]
+                st, rows, pages = _og_own_fetch(c, o, j.get("name_q") or o, j.get("tickets") or [], set(j.get("have") or []), pause)
+                _fz_rpc("og_own_save", {"p": {"county": c, "owner": o, "status": st, "rows": rows, "pages": pages}})
+                print(f"[ogown w{widx}] {c} {o}: {st} accounts={len(rows)} pages={len(pages)}"[:200], flush=True)
+            pause()
+        except Exception as e:
+            print(f"[ogtax w{widx}] " + str(e)[:300], flush=True)
+            _t.sleep(300)
+
+
+def _og_tax_loop_old():
+    """the single-worker loop before 11/20 (kept for reference, not started)"""
     import time as _t, random as _r
     _t.sleep(300)
     while True:
